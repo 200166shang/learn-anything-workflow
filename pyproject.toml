@@ -1,0 +1,50 @@
+[project]
+name = "video-extract"
+version = "0.2.0"
+description = "Deterministic acquisition, evidence preparation, and validation for authorized video learning"
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "playwright>=1.40.0",
+    "yt-dlp>=2025.1.15",
+    "httpx[socks]>=0.27.0",
+    "pillow>=10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["video_extract"]
+include = [
+    "video_extract/**/*.py",
+    "batch_process.py",
+    "bilibili_collection.py",
+    "bilibili_source.py",
+    "convert_voice_to_article.py",
+    "download_youtube.py",
+    "output_paths.py",
+    "prefetch_bilibili.py",
+    "prepare_bilibili_learning_package.py",
+    "prepare_learning_package.py",
+    "scan_course.py",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"batch_process.py" = "batch_process.py"
+"bilibili_collection.py" = "bilibili_collection.py"
+"bilibili_source.py" = "bilibili_source.py"
+"convert_voice_to_article.py" = "convert_voice_to_article.py"
+"download_youtube.py" = "download_youtube.py"
+"output_paths.py" = "output_paths.py"
+"prefetch_bilibili.py" = "prefetch_bilibili.py"
+"prepare_bilibili_learning_package.py" = "prepare_bilibili_learning_package.py"
+"prepare_learning_package.py" = "prepare_learning_package.py"
+"scan_course.py" = "scan_course.py"
+"schemas/manifest-v3.schema.json" = "schemas/manifest-v3.schema.json"
+"schemas/manifest-v4.schema.json" = "schemas/manifest-v4.schema.json"
+"schemas/manifest-v5.schema.json" = "schemas/manifest-v5.schema.json"
+
+[project.scripts]
+video-extract = "video_extract.cli:main"

@@ -1,0 +1,14 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>音频本地化生命周期原型</title>
+<style>body{font:16px system-ui;max-width:900px;margin:40px auto;color:#17202a}button{margin:5px;padding:9px 14px}.panel{background:#f4f7f9;padding:18px;border-left:4px solid #1769aa;margin:18px 0}.bad{color:#a33}</style>
+<h1>音频本地化生命周期原型</h1><p>问题：16GB Mac 上，ASR、翻译、常驻 0.6B TTS、卸载后中文 ASR 回听与局部重试，是否能形成可恢复且不允许跳过 QA 的状态机？这是可丢弃原型，不是生产实现。</p>
+<div id="state" class="panel"></div><div id="buttons"></div>
+<h2>引导场景</h2><button onclick="scenario('happy')">完整通过</button><button onclick="scenario('retry')">局部重试</button><button onclick="scenario('illegal')">阻止跳过 QA</button>
+<script>
+const initial=()=>({stage:'inspect',models:[],segments:0,failed:[],audio:false,verified:false,message:'等待 inspect'});
+let state=initial();
+const transitions={inspect:s=>({...s,stage:'asr',models:['source-asr'],message:'未发现原生中文音轨'}),asr:s=>s.stage==='asr'?({...s,stage:'translate',models:[],message:'源转写完成并卸载 ASR'}):illegal(s),translate:s=>s.stage==='translate'?({...s,stage:'tts',models:['qwen-0.6b-8bit'],segments:8,message:'中文稿完整覆盖源片段'}):illegal(s),tts:s=>s.stage==='tts'?({...s,stage:'qa',models:['zh-asr'],failed:[3],message:'卸载 TTS 后批量回听'}):illegal(s),retry:s=>s.stage==='qa'?({...s,failed:[],message:'只重生成失败段 3，再次回听'}):illegal(s),verify:s=>s.stage==='qa'&&!s.failed.length?({...s,stage:'complete',models:[],audio:true,verified:true,message:'QA 通过，原子发布最终音频'}):illegal(s)};
+function illegal(s){return {...s,message:'非法转换：不能跳过当前阶段或带失败段发布'}}
+function dispatch(a){state=(transitions[a]||illegal)(state);render()}
+function render(){document.querySelector('#state').innerHTML=Object.entries(state).map(([k,v])=>`<b>${k}</b>: ${JSON.stringify(v)}<br>`).join('');document.querySelector('#buttons').innerHTML=['inspect','asr','translate','tts','retry','verify'].map(a=>`<button onclick="dispatch('${a}')">${a}</button>`).join('')}
+function scenario(name){state=initial();const steps={happy:['inspect','asr','translate','tts','retry','verify'],retry:['inspect','asr','translate','tts','retry','verify'],illegal:['verify']}[name];steps.forEach(dispatch)}render();
+</script></html>

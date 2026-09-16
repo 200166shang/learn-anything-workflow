@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/manifest-v5.schema.json",
+  "title": "Video Extract Media Package v5",
+  "type": "object",
+  "required": ["schema_version", "platform", "identity", "request", "artifacts"],
+  "properties": {
+    "schema_version": {"const": 5},
+    "platform": {"enum": ["youtube", "bilibili", "xiaoe", "local"]},
+    "identity": {"type": ["string", "object"]},
+    "request": {
+      "type": "object",
+      "required": ["type", "kinds", "language"],
+      "properties": {"type": {"const": "media"}, "kinds": {"type": "array"}, "language": {"type": "string"}}
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "source_video": {"type": "string"},
+        "source_audio": {"type": "string"},
+        "source_subtitle": {"type": "string"},
+        "localized_audio": {"const": "media/audio.zh-CN.m4a"}
+      },
+      "additionalProperties": {"type": "string"}
+    },
+    "provenance": {"type": "object"},
+    "pause": {"type": "object"}
+  }
+}

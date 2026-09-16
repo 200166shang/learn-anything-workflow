@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+work/browser_session/
+work/**/browser*/
+work/**/checkout*/
+outputs/xet_video/
+.lark-vc-auth.png
+*.pem
+*.key
+workspace.toml
+migration-reports/
+media/
+学习系统/

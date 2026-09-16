@@ -1,0 +1,12 @@
+schema_version = 1
+
+[paths]
+project = "video-extract-core"
+media = "media"
+obsidian = "学习系统"
+
+[obsidian]
+generated = "资料库/网站视频转录"
+threads = "threads"
+concepts = "concepts"
+review = "REVIEW.md"

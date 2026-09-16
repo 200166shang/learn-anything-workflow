@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/manifest-v4.schema.json",
+  "title": "video-extract manifest v4",
+  "type": "object",
+  "required": ["schema_version", "platform", "identity", "artifacts"],
+  "properties": {
+    "schema_version": {"const": 4},
+    "platform": {"enum": ["youtube", "bilibili", "xiaoe", "local"]},
+    "identity": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "object"}]},
+    "title": {"type": "string"},
+    "request": {
+      "type": "object",
+      "required": ["goals", "keep_video", "audio_quality", "video_quality", "voice"],
+      "properties": {
+        "goals": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["podcast_zh", "notes_zh"]}},
+        "keep_video": {"enum": ["auto", "yes", "no"]},
+        "audio_quality": {"enum": ["standard", "high"]},
+        "video_quality": {"type": "integer", "minimum": 144},
+        "voice": {"type": "string", "minLength": 1}
+      }, "additionalProperties": true
+    },
+    "artifacts": {"type": "object", "additionalProperties": {"type": "string"}},
+    "stages": {"type": "object"},
+    "retention": {
+      "type": "object",
+      "properties": {
+        "keep_video": {"enum": ["auto", "yes", "no"]},
+        "source_video_preexisted": {"type": "boolean"},
+        "source_video_acquired_by_ensure": {"type": "boolean"},
+        "proxy_removed_after_verification": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "provenance": {"type": "object"},
+    "pause": {"type": "object"},
+    "errors": {"type": "array"}
+  },
+  "additionalProperties": true
+}
