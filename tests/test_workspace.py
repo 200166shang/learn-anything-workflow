@@ -61,3 +61,15 @@ def test_missing_config_is_clear_and_read_only(tmp_path: Path) -> None:
     before = list(tmp_path.iterdir())
     with pytest.raises(WorkspaceError, match="workspace.toml not found"): discover_workspace(None, tmp_path, {}, tmp_path / "missing.toml")
     assert list(tmp_path.iterdir()) == before
+
+
+def test_learning_artifact_boundaries_are_root_level_and_review_is_lazy(tmp_path: Path) -> None:
+    config = discover_workspace(write(tmp_path))
+    config.threads.mkdir(parents=True); config.concepts.mkdir(parents=True)
+    thread = config.threads / "fixture-thread.md"; concept = config.concepts / "fixture-concept.md"
+    thread.write_text("# Fixture thread\n", encoding="utf-8")
+    concept.write_text("# Fixture concept\n", encoding="utf-8")
+    assert thread.parent == config.obsidian / "threads"
+    assert concept.parent == config.obsidian / "concepts"
+    assert not config.review.exists()
+    assert not config.generated.exists()

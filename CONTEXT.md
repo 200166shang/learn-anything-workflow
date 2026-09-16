@@ -87,6 +87,8 @@ _Avoid_: 媒体包、输出、结果
 
 ## Architecture
 
+The portable workspace is rooted by `workspace.toml`: code, authoritative Media, and the independent Obsidian Vault are siblings. Media packages remain the fact source; `学习系统/资料库/网站视频转录` is a marker-protected, rebuildable reading layer. `threads/`, `concepts/`, `REVIEW.md`, and `收件箱/` are protected learning boundaries and must never be replaced by video-extract.
+
 `video-extract` 是媒体包确定性处理与状态验证的深模块，也是顶层 `manifest.json` 的唯一写入者。`extract-media` 负责媒体提取与中文听觉版编排，`video-learning` 只负责中文学习笔记；二者都调用普通项目 CLI，不互相调用。缺少原生中文轨时，仅英文源可由 `extract-media` 直接调用 pyVideoTrans podcast CLI；pyVideoTrans 独立拥有 `listening/zh-CN/`，不把内部产物登记进 video-extract manifest。
 
 Schema v5 的新请求使用媒体请求或 `notes_zh`；`podcast_zh` 仅作为旧请求别名。Schema v1–v4 媒体包原地可读且不会被普通 ensure 搬迁。完成状态始终从 artifacts 推导。模型自动审阅显式记为 `model_only`；只有用户明确审阅才记为 `human`。确定性规则唯一事实源是 [docs/package-contract.md](docs/package-contract.md)，CLI 参数唯一事实源是 `video-extract <command> --help`。

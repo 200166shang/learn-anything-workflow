@@ -1,5 +1,7 @@
 # Video-learning package contract
 
+> Current path convention: discover `workspace.toml` through `WorkspaceConfig`. Package artifact paths inside manifests remain package-relative. Media is authoritative; Obsidian export, SQLite, and playback are rebuildable derivatives. Machine-specific absolute paths may appear only as convenience fields in generated output and must never be used as identity keys.
+
 This document and the v4/v5 schemas are the authoritative deterministic package contract. `video_extract.validate` implements artifact-derived semantics. Schema 1–4 manifests remain readable; stored status labels are hints only.
 
 ## Public goals

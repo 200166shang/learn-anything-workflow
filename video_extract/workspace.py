@@ -161,9 +161,38 @@ def _manifest(root: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def normalize_export_manifests(media: Path, generated: Path) -> dict[str, Any]:
+    """Point package export metadata at the activated generated root."""
+    from .manifest import atomic_write_json, read_json
+    notes: dict[str, list[Path]] = {}
+    for note in generated.rglob("*.md"):
+        for parent in note.parents:
+            if "__" in parent.name:
+                notes.setdefault(parent.name.rsplit("__", 1)[-1], []).append(note)
+                break
+    updated = ambiguous = 0
+    for export_path in sorted((media / "items").glob("*/*/export-manifest.json")):
+        package = export_path.parent; manifest = read_json(package / "manifest.json")
+        item_id = str(manifest.get("identity") or package.name); matches = notes.get(item_id, [])
+        data = read_json(export_path)
+        if len(matches) != 1:
+            recorded = Path(str(data.get("note", "")))
+            parts = recorded.parts
+            marker_index = next((index for index, part in enumerate(parts) if part.startswith(".video-extract-generated-")), None)
+            if marker_index is not None:
+                candidate = generated.joinpath(*parts[marker_index + 1:])
+                if candidate.is_file(): matches = [candidate]
+        if len(matches) != 1:
+            ambiguous += 1; continue
+        data["package"] = str(package); data["note"] = str(matches[0])
+        atomic_write_json(export_path, data); updated += 1
+    return {"ok": ambiguous == 0, "updated": updated, "ambiguous": ambiguous}
+
+
 def rebuild(config: WorkspaceConfig, apply: bool) -> dict[str, Any]:
     from .library import audit_library_packages, rebuild_library
     from .obsidian_export import export_all_verified
+    from .playlists import build_playback_views, verify_playback
     preflight = audit_library_packages(config.media)
     plan = {"sqlite": str(config.media / "catalog/library.sqlite"), "obsidian": str(config.generated), "playback": str(config.media / "playback")}
     if not apply:
@@ -189,8 +218,35 @@ def rebuild(config: WorkspaceConfig, apply: bool) -> dict[str, Any]:
     after_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for base in (config.threads, config.concepts) if base.exists() for p in base.rglob("*") if p.is_file()}
     if config.review.is_file(): after_hashes[str(config.review)] = hashlib.sha256(config.review.read_bytes()).hexdigest()
     if protected_hashes != after_hashes: raise WorkspaceError("rebuild changed protected learning artifacts")
+    normalized_exports = normalize_export_manifests(config.media, config.generated)
+    if not normalized_exports["ok"]: raise WorkspaceError(f"ambiguous activated exports: {normalized_exports}")
+    library = rebuild_library(config.media)
+    playback_live = config.media / "playback"
+    playback_quarantine = config.media / "migration-quarantine/workspace-refactor-2026-09-16/playback-pre-rebuild"
+    if playback_quarantine.exists(): raise WorkspaceError(f"playback quarantine target already exists: {playback_quarantine}")
+    real_media = [str(path) for path in playback_live.rglob("*") if path.is_file() and not path.is_symlink() and path.suffix.lower() in {".mp4", ".mov", ".mkv", ".wav", ".m4a", ".mp3"}]
+    if real_media: raise WorkspaceError(f"refusing playback transaction containing real media: {real_media}")
+    staged_playback = Path(tempfile.mkdtemp(prefix=".playback-rebuild-", dir=config.media))
+    playlists = []
+    for catalog in sorted((config.media / "collections").glob("*/*/catalog.json")):
+        playlists.append(build_playback_views(catalog, config.media, staged_playback))
+    playback_check = verify_playback(staged_playback)
+    if not all(item.get("ok") for item in playlists) or not playback_check.get("ok"):
+        raise WorkspaceError(f"staged playback validation failed: {playback_check}")
+    journal = config.root / "migration-journal.jsonl"
+    def journal_event(event: dict[str, Any]) -> None:
+        with journal.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), **event}, ensure_ascii=False) + "\n")
+            stream.flush(); os.fsync(stream.fileno())
+    playback_quarantine.parent.mkdir(parents=True, exist_ok=True)
+    before = playback_live.stat(); journal_event({"event": "planned", "kind": "playback-quarantine", "source": str(playback_live), "target": str(playback_quarantine), "dev": before.st_dev, "inode": before.st_ino, "mtime_ns": before.st_mtime_ns})
+    os.rename(playback_live, playback_quarantine)
+    after = playback_quarantine.stat(); journal_event({"event": "completed", "kind": "playback-quarantine", "source": str(playback_live), "target": str(playback_quarantine), "dev": after.st_dev, "inode": after.st_ino, "mtime_ns": after.st_mtime_ns})
+    staged_before = staged_playback.stat(); journal_event({"event": "planned", "kind": "playback-activate", "source": str(staged_playback), "target": str(playback_live), "dev": staged_before.st_dev, "inode": staged_before.st_ino, "mtime_ns": staged_before.st_mtime_ns})
+    os.rename(staged_playback, playback_live)
+    staged_after = playback_live.stat(); journal_event({"event": "completed", "kind": "playback-activate", "source": str(staged_playback), "target": str(playback_live), "dev": staged_after.st_dev, "inode": staged_after.st_ino, "mtime_ns": staged_after.st_mtime_ns})
     final = doctor(config)
-    return {"ok": bool(exported.get("ok")) and final["ok"], "dry_run": False, "written": True, "library": library, "export": exported, "doctor": final}
+    return {"ok": bool(exported.get("ok")) and all(item.get("ok") for item in playlists) and final["ok"], "dry_run": False, "written": True, "library": library, "export": exported, "normalized_exports": normalized_exports, "playlists": playlists, "doctor": final}
 
 
 def prepare_migration(config: WorkspaceConfig, full_hash: bool = False) -> dict[str, Any]:

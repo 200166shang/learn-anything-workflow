@@ -53,6 +53,19 @@ class PlaybackViewTests(unittest.TestCase):
             result = build_playback_views(catalog, library, library / "playback")
             self.assertTrue(result["ok"])
             self.assertTrue(next((library / "playback/bilibili/课程/第一章/播放目录").iterdir()).is_symlink())
+            self.assertFalse((library / "playback/xiaoe/课程").exists())
+
+    def test_two_platforms_with_different_catalogs_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw); library = root / "library"; output = root / "playback"
+            for platform, identity, title in (("bilibili", "b1", "同名课程"), ("xiaoe", "x1", "小鹅课程")):
+                video = library / f"items/{platform}/{identity}/source/source.mp4"; video.parent.mkdir(parents=True); video.write_bytes(b"video")
+                catalog = library / f"collections/{platform}/course/catalog.json"; catalog.parent.mkdir(parents=True)
+                catalog.write_text(json.dumps({"platform": platform, "title": title, "items": [{"id": identity, "title": "第一课"}]}, ensure_ascii=False), encoding="utf-8")
+                result = build_playback_views(catalog, library, output)
+                self.assertTrue(result["ok"])
+            self.assertTrue((output / "bilibili/同名课程").is_dir())
+            self.assertTrue((output / "xiaoe/小鹅课程").is_dir())
 
     def test_verify_detects_broken_and_non_mp4_entries(self):
         with tempfile.TemporaryDirectory() as raw:

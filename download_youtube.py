@@ -57,7 +57,7 @@ def extract_info(args: argparse.Namespace) -> dict[str, Any]:
     try:
         import yt_dlp
     except ImportError as exc:
-        raise RuntimeError("缺少 yt-dlp；请先在 /Users/syz/code/video-extract-core 执行 uv sync") from exc
+        raise RuntimeError("缺少 yt-dlp；请先在 WorkspaceConfig 报告的 project 目录执行 uv sync") from exc
     options = {**ydl_base_options(args), "skip_download": True}
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(args.url, download=False)

@@ -1,5 +1,9 @@
 # video-extract
 
+> Current operations use a portable WorkspaceConfig. Run `video-extract workspace show --json` to locate the code, Media library, and Obsidian Vault. Older absolute paths later in this document describe historical workflows and are not current operating instructions.
+
+Create `workspace.toml` from `workspace.example.toml`, or point `~/.config/video-extract/config.toml` at its absolute location. Then use `video-extract workspace doctor --json` and `video-extract workspace rebuild --dry-run --json` before any rebuild.
+
 `video-extract` 是授权视频学习 package 的稳定 interface。项目内 validator 是状态的唯一事实源；旧 Python 脚本保留为兼容入口，新调用从统一 CLI 开始：
 
 ```bash

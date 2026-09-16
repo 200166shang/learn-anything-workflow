@@ -47,6 +47,7 @@ def build_xiaoe_playback_views(
     library_root: Path,
     output_root: Path,
     sections: list[str] | None = None,
+    platform_namespace: str = "xiaoe",
 ) -> dict[str, Any]:
     catalog_path = catalog_path.expanduser().resolve()
     source_root = source_root.expanduser().resolve()
@@ -60,7 +61,7 @@ def build_xiaoe_playback_views(
     if unknown:
         raise ValueError(f"unknown section: {', '.join(sorted(unknown))}")
     selected = requested or available
-    course_root = output_root / "xiaoe" / course
+    course_root = output_root / platform_namespace / course
     course_root.mkdir(parents=True, exist_ok=True)
     results = []
     for section in sorted(selected, key=lambda name: min(int(x.get("sort_value") or x.get("index") or 0) for x in catalog["lessons"] if x.get("section") == name)):
@@ -113,12 +114,7 @@ def build_playback_views(catalog_path: Path, library_root: Path, output_root: Pa
     temporary = catalog_path.parent / ".playback-catalog.json"
     temporary.write_text(json.dumps(converted, ensure_ascii=False), encoding="utf-8")
     try:
-        result = build_xiaoe_playback_views(temporary, Path("/__no_legacy_source__"), library_root, output_root, sections)
-        old = Path(result["output"]); desired = output_root.expanduser().resolve() / platform / safe_name(str(converted["course_title"]))
-        if old != desired:
-            desired.parent.mkdir(parents=True, exist_ok=True); os.replace(old, desired); result["output"] = str(desired)
-            for section in result["sections"]:
-                section_root = desired / safe_name(section["section"]); section["playback_directory"] = str(section_root / "播放目录"); section["playlist"] = str(section_root / "章节播放列表.m3u8")
+        result = build_xiaoe_playback_views(temporary, Path("/__no_legacy_source__"), library_root, output_root, sections, platform_namespace=platform)
         result["catalog_missing_or_unreadable"] = skipped
         return result
     finally:
