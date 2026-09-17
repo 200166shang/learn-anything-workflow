@@ -33,6 +33,26 @@ keeps the original idempotency token and query handle unchanged, remains
 `uncertain`, and offers only another `operation reconcile` command; it never
 falls through to acquisition resume.
 
+Before invoking an adapter, the operation store durably records an intent that
+pins the capability/contract version, source version, effective parameters,
+adapter identity, authorization category, and (when supplied) a non-sensitive
+authorization reference. Adapters that declare authorization as required stop
+at `awaiting_user` until that reference is present; credentials are never an
+accepted request field. Resume and reconcile reject adapter identity drift, so
+replacing an implementation cannot silently send an old uncertain request to a
+different provider. Completion writes a sanitized operation receipt below the
+results role so future result-only snapshots and backups retain reconciliation
+evidence without copying leases, process details, or diagnostics. The local
+operation record is committed first with a monotonic authoritative revision and
+digest; the results receipt is a rebuildable projection carrying that pair.
+An interruption between those writes can therefore omit a receipt but cannot
+create a results-only success that lacks an authoritative completion. A later
+execution of the same capability validates the authoritative digest and repairs
+the projection; read-only `operation show` does not write it.
+Receipts for `not_submitted`, `committed` (unknown), and `available` preserve
+all sanitized attempt/query handles and structured remote receipt identifiers,
+ledger digests, and fact summaries; free-form provider evidence is excluded.
+
 ## Current public workflows and retained validation goals
 
 - New acquisition uses `plan/ensure --media`; it never synthesizes a missing language track.

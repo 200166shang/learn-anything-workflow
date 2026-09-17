@@ -1,8 +1,12 @@
 import json
 import multiprocessing
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from video_extract.cli import parser
 from video_extract.source_registry import register
@@ -21,6 +25,10 @@ local = "local"
 
 
 class FixtureAdapter:
+    adapter_identity = "fixture.media-v1/local-test"
+    authorization_category = "local_fixture"
+    requires_authorization = False
+
     def __init__(self, *, fail=False, reconcile_state="retry_safe", counter=None, delay=0, on_acquire=None):
         self.fail = fail
         self.reconcile_state = reconcile_state
@@ -74,6 +82,46 @@ def _process_worker(request_path: str, counter_path: str, queue) -> None:
             return super().acquire(item, kinds, target, **kwargs)
     operations.register_media_adapter("fixture.media-v1", ProcessAdapter(delay=0.25))
     queue.put(operations.ensure_request(json.loads(Path(request_path).read_text())))
+
+
+def reconcile_in_fresh_interpreter(workspace: Path, operation_id: str, ledger: Path) -> dict:
+    script = r'''
+import json, sys
+from pathlib import Path
+from video_extract.media_operations import register_media_adapter, reconcile_operation
+from video_extract.workspace import discover_workspace
+class LedgerAdapter:
+    adapter_identity = "fixture.media-v1/independent-ledger-v1"
+    authorization_category = "local_fixture"
+    requires_authorization = False
+    def acquire(self, *args, **kwargs):
+        raise AssertionError("recovery must not acquire")
+    def reconcile(self, attempt, target):
+        ledger = json.loads(Path(sys.argv[3]).read_text())
+        receipt = {"receipt_id": ledger["receipt_id"], "ledger_digest": ledger["ledger_digest"],
+                   "facts": {"artifact_count": len(ledger.get("artifacts", {}))}}
+        if ledger["state"] == "available":
+            target.mkdir(parents=True, exist_ok=True)
+            outputs = {}
+            for kind, content in ledger["artifacts"].items():
+                path = target / f"{kind}.fixture"
+                path.write_text(content)
+                outputs[kind] = path
+            return {"state": "available", "query_handle": ledger["token"],
+                    "artifacts": outputs, "receipt": receipt}
+        if ledger["state"] == "not_submitted":
+            return {"state": "not_submitted", "query_handle": ledger["token"], "receipt": receipt}
+        return {"state": "committed", "query_handle": ledger["token"], "receipt": receipt}
+register_media_adapter("fixture.media-v1", LedgerAdapter())
+print(json.dumps(reconcile_operation(discover_workspace(Path(sys.argv[1])), sys.argv[2])))
+'''
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(workspace), operation_id, str(ledger)],
+        capture_output=True, text=True, check=True, env=env,
+    )
+    return json.loads(completed.stdout)
 
 
 def request_fixture(tmp_path: Path) -> tuple[Path, dict]:
@@ -222,6 +270,10 @@ def test_unsupported_reconciliation_stays_uncertain_and_requires_user_action(tmp
     from video_extract.media_operations import MEDIA_ADAPTERS
     MEDIA_ADAPTERS.pop("fixture.media-v1", None)
     _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    operation_path = tmp_path / "local" / "operations" / f"{failed['operation_id']}.json"
+    assert json.loads(operation_path.read_text())["intent"]["adapter_identities"] == {
+        "chapter-2": "fixture.media-v1"
+    }
     code, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"],
                               "--workspace", str(tmp_path / "workspace.toml"))
     assert code == 3
@@ -338,6 +390,207 @@ def test_stale_running_lease_becomes_uncertain_instead_of_permanent_busy(tmp_pat
     assert code == 3
     assert result["status"] == "uncertain"
     assert result["next_action"]["type"] == "reconcile"
+
+
+def test_authorized_adapter_persists_sanitized_intent_before_submit(tmp_path, capsys):
+    request_path, request = request_fixture(tmp_path)
+
+    class AuthorizedAdapter(FixtureAdapter):
+        adapter_identity = "fixture.media-v1/remote-ledger-v1"
+        authorization_category = "fixture_remote_write"
+        requires_authorization = True
+
+    adapter = use_adapter(AuthorizedAdapter())
+    code, missing = invoke(capsys, "ensure", "--request", str(request_path))
+    assert code == 3
+    assert missing["status"] == "awaiting_user"
+    assert adapter.counter == []
+
+    request["authorization_ref"] = "consent-fixture-2026-09-17"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    code, completed = invoke(capsys, "ensure", "--request", str(request_path))
+    assert code == 0
+    assert completed["operation_id"] == missing["operation_id"]
+    operation_path = tmp_path / "local" / "operations" / f"{completed['operation_id']}.json"
+    persisted = json.loads(operation_path.read_text())
+    intent = persisted["intent"]
+    assert {key: value for key, value in intent.items() if key != "requires_authorization"} == {
+        "capability_id": "media.acquire",
+        "capability_contract_version": 1,
+        "adapter_identities": {"chapter-2": "fixture.media-v1/remote-ledger-v1"},
+        "authorization_category": "fixture_remote_write",
+        "authorization_ref": "consent-fixture-2026-09-17",
+        "effective_parameters": {"language": "en", "media": ["audio", "subtitles"], "quality": "standard", "scope": ["chapter-2"]},
+        "source_id": request["source_id"],
+        "source_version": request["source_version"],
+    }
+    serialized = operation_path.read_text()
+    assert "credential" not in serialized and "secret" not in serialized
+
+
+def test_recovery_refuses_adapter_identity_drift_and_never_resubmits(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+    original = use_adapter(FixtureAdapter(fail=True, reconcile_state="retry_safe"))
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    _, safe = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                     "--workspace", str(tmp_path / "workspace.toml"))
+    assert safe["status"] == "recoverable_failure"
+
+    class Replacement(FixtureAdapter):
+        adapter_identity = "fixture.media-v1/replacement-provider"
+
+    replacement = use_adapter(Replacement())
+    code, blocked = invoke(capsys, "operation", "resume", failed["operation_id"],
+                           "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 3
+    assert blocked["status"] == "uncertain"
+    assert blocked["next_action"]["type"] == "reconcile"
+    assert original.counter == ["chapter-2"]
+    assert replacement.counter == []
+
+
+def test_unavailable_adapter_pins_declared_identity_for_later_reconciliation(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+    from video_extract.media_operations import MEDIA_ADAPTERS
+    MEDIA_ADAPTERS.pop("fixture.media-v1", None)
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+
+    class RestoredLegacyAdapter(FixtureAdapter):
+        # Older adapters without explicit metadata retain their registered ID.
+        adapter_identity = None
+
+    restored = RestoredLegacyAdapter(reconcile_state="not_submitted")
+    use_adapter(restored)
+    code, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                              "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 1
+    assert reconciled["status"] == "recoverable_failure"
+
+
+def test_reconciled_receipt_is_copied_into_results_snapshot(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+
+    class LostResponse(FixtureAdapter):
+        def acquire(self, *args, **kwargs):
+            super().acquire(*args, **kwargs)
+            raise RuntimeError("response lost after remote commit")
+
+    use_adapter(LostResponse(reconcile_state="available"))
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    code, completed = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                             "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 0
+    receipt = tmp_path / "results" / "operation-receipts" / f"{completed['operation_id']}.json"
+    saved = json.loads(receipt.read_text())
+    assert saved["operation_id"] == completed["operation_id"]
+    assert saved["status"] == "completed"
+    assert saved["intent"]["adapter_identities"] == {"chapter-2": "fixture.media-v1/local-test"}
+    assert saved["receipt"]["state"] == "reconciled_available"
+    assert saved["receipt"]["idempotency_token"]
+    assert saved["attempts"][0]["query_handle"]
+    assert saved["reconciliation"][0]["state"] == "available"
+    assert "lease" not in saved and "diagnostics" not in saved
+
+
+def test_completed_authority_precedes_derived_receipt_and_show_repairs_interrupted_projection(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+    use_adapter(FixtureAdapter())
+    with patch("video_extract.media_operations._write_result_receipt", side_effect=OSError("injected receipt interruption")):
+        code, interrupted = invoke(capsys, "ensure", "--request", str(request_path))
+    assert code == 0 and interrupted["status"] == "completed"
+    operation_path = tmp_path / "local" / "operations" / f"{interrupted['operation_id']}.json"
+    authority = json.loads(operation_path.read_text())
+    receipt_path = tmp_path / "results" / "operation-receipts" / f"{interrupted['operation_id']}.json"
+    assert authority["status"] == "completed"
+    assert authority["commit"]["revision"] >= 1
+    assert len(authority["commit"]["digest"]) == 64
+    assert not receipt_path.exists()
+
+    code, repaired = invoke(capsys, "ensure", "--request", str(request_path))
+    assert code == 0 and repaired["status"] == "completed"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["authoritative_revision"] == authority["commit"]["revision"]
+    assert receipt["authoritative_digest"] == authority["commit"]["digest"]
+
+    authority["progress"]["tampered"] = {"completed": ["video"]}
+    operation_path.write_text(json.dumps(authority))
+    code, rejected = invoke(capsys, "ensure", "--request", str(request_path))
+    assert code == 3 and rejected["status"] == "uncertain"
+    assert rejected["validation"]["authoritative_record"] == "failed"
+
+
+def test_independent_service_ledger_drives_three_way_recovery_without_blind_resubmit(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+    ledger = tmp_path.parent / f"{tmp_path.name}-remote-ledger.json"
+
+    class LedgerAdapter(FixtureAdapter):
+        adapter_identity = "fixture.media-v1/independent-ledger-v1"
+
+        def acquire(self, item, kinds, target, **kwargs):
+            result = super().acquire(item, kinds, target, **kwargs)
+            ledger.write_text(json.dumps({"state": "available", "token": kwargs["idempotency_token"],
+                                          "receipt_id": "remote-receipt-1", "ledger_digest": "a" * 64,
+                                          "submissions": 1,
+                                          "artifacts": {kind: path.read_text() for kind, path in result["artifacts"].items()}}))
+            raise RuntimeError("process stopped after service commit")
+
+    adapter = use_adapter(LedgerAdapter())
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    local_state = tmp_path / "local" / "operations" / f"{failed['operation_id']}.json"
+    assert ledger.is_file() and local_state.is_file()
+
+    remote = json.loads(ledger.read_text())
+    remote["state"] = "unknown"
+    ledger.write_text(json.dumps(remote))
+    unknown = reconcile_in_fresh_interpreter(tmp_path / "workspace.toml", failed["operation_id"], ledger)
+    assert unknown["status"] == "uncertain"
+    _, still_blocked = invoke(capsys, "operation", "resume", failed["operation_id"],
+                              "--workspace", str(tmp_path / "workspace.toml"))
+    assert still_blocked["status"] == "uncertain" and adapter.counter == ["chapter-2"]
+
+    target = next((tmp_path / "results" / "media" / failed["operation_id"]).iterdir())
+    for artifact in target.glob("*.fixture"):
+        artifact.unlink()
+    remote["state"] = "available"
+    ledger.write_text(json.dumps(remote))
+    recovered = reconcile_in_fresh_interpreter(tmp_path / "workspace.toml", failed["operation_id"], ledger)
+    assert recovered["status"] == "completed"
+    assert all(Path(ref).read_text().startswith("chapter-2:") for ref in recovered["artifact_refs"])
+    assert adapter.counter == ["chapter-2"]
+    assert json.loads(ledger.read_text())["submissions"] == 1
+
+    ledger.unlink()
+    absent_root = tmp_path / "not-submitted"
+    absent_root.mkdir()
+    absent_request, _ = request_fixture(absent_root)
+
+    class NotSubmittedLedgerAdapter(LedgerAdapter):
+        def acquire(self, *args, **kwargs):
+            self.counter.append(args[0]["id"])
+            self.tokens.append(kwargs["idempotency_token"])
+            raise RuntimeError("transport failed before service accepted request")
+
+    absent_adapter = use_adapter(NotSubmittedLedgerAdapter())
+    _, absent_failed = invoke(capsys, "ensure", "--request", str(absent_request))
+    ledger.write_text(json.dumps({"state": "not_submitted", "token": absent_adapter.tokens[0],
+                                  "receipt_id": "remote-receipt-2", "ledger_digest": "b" * 64,
+                                  "submissions": 1, "artifacts": {}}))
+    not_submitted = reconcile_in_fresh_interpreter(absent_root / "workspace.toml",
+                                                   absent_failed["operation_id"], ledger)
+    assert not_submitted["status"] == "recoverable_failure"
+    assert not_submitted["next_action"]["type"] == "resume"
+    assert absent_adapter.counter == ["chapter-2"]
+    uncertain_receipt = json.loads((tmp_path / "results" / "operation-receipts" /
+                                    f"{failed['operation_id']}.json").read_text())
+    assert [entry["state"] for entry in uncertain_receipt["reconciliation"]] == ["committed", "available"]
+    assert uncertain_receipt["reconciliation"][0]["receipt"] == {
+        "receipt_id": "remote-receipt-1", "ledger_digest": "a" * 64,
+        "facts": {"artifact_count": 2},
+    }
+    not_submitted_receipt = json.loads((absent_root / "results" / "operation-receipts" /
+                                        f"{absent_failed['operation_id']}.json").read_text())
+    assert not_submitted_receipt["status"] == "recoverable_failure"
+    assert not_submitted_receipt["reconciliation"][0]["state"] == "not_submitted"
 
 
 def test_request_schema_rejects_wrong_version_and_extra_fields_for_every_entry(tmp_path, capsys):

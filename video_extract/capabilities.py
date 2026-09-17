@@ -73,7 +73,11 @@ def _resolve(entry: Capability) -> Callable[[dict[str, Any]], dict[str, Any]] | 
 
 
 def _operation_id(entry: Capability, request: dict[str, Any]) -> str:
-    logical_request = {key: value for key, value in request.items() if key not in {"workspace", "package"}}
+    # Authorization references prove permission for an already identified
+    # operation; renewing or supplying one must not create a second external
+    # request identity.
+    logical_request = {key: value for key, value in request.items()
+                       if key not in {"workspace", "package", "authorization_ref"}}
     package = request.get("package")
     if isinstance(package, str):
         manifest = Path(package) / "manifest.json"
