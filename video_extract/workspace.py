@@ -302,6 +302,16 @@ def rebuild(config: WorkspaceConfig, apply: bool) -> dict[str, Any]:
         return {"ok": preflight.get("counts", {}).get("migration_regression", 0) == 0, "dry_run": True,
                 "written": False, "plan": plan, "packages": preflight.get("counts", {}),
                 "card_schedules": card_schedules, "learning_views": learning_view_modules}
+    if config.schema_version == PORTABLE_SCHEMA_VERSION:
+        from .learning_view import build_view
+        from .source_registry import audit
+        learning_views = [build_view(config, module_id) for module_id in learning_view_modules]
+        views_ok = all(item["status"] == "completed" for item in learning_views)
+        snapshot = audit(config)
+        return {"ok": views_ok, "dry_run": False, "written": views_ok,
+                "source_snapshot": snapshot, "card_schedules": card_schedules,
+                "learning_views": learning_views,
+                "legacy_media_rebuild": "not_applicable_for_workspace_v2"}
     config.generated.parent.mkdir(parents=True, exist_ok=True)
     protected_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for base in (config.threads, config.concepts) if base.exists() for p in base.rglob("*") if p.is_file()}
     if config.review.is_file(): protected_hashes[str(config.review)] = hashlib.sha256(config.review.read_bytes()).hexdigest()

@@ -38,6 +38,20 @@ def test_generation_publishes_local_overview_and_search_catalog_together(tmp_pat
     assert planned["plan"]["learning_views"]["module_ids"] == [module_id]
 
 
+def test_portable_workspace_rebuilds_views_without_legacy_playback_tree(tmp_path: Path) -> None:
+    config, module_id, _, _ = navigation_fixture(tmp_path)
+
+    rebuilt = rebuild(config, True)
+
+    assert rebuilt["ok"] is True
+    assert rebuilt["written"] is True
+    assert rebuilt["legacy_media_rebuild"] == "not_applicable_for_workspace_v2"
+    assert rebuilt["learning_views"][0]["result"]["generation_id"].startswith("view-generation-")
+    assert rebuilt["source_snapshot"]["sources"] == 1
+    assert not (config.sources / "playback").exists()
+    assert status_view(config, module_id)["status"] == "completed"
+
+
 def test_feedback_change_republishes_all_views_and_modified_overview_is_unsynced(tmp_path: Path) -> None:
     config, module_id, _, current_id = navigation_fixture(tmp_path)
     first = build_view(config, module_id)
