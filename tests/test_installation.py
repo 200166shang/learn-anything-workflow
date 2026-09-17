@@ -44,12 +44,12 @@ class InstallationContractTests(unittest.TestCase):
         self.assertEqual(result["api_version"], 1)
         self.assertEqual(set(result), {"api_version", "workspace_id", "operation_id", "status", "observed_revision", "result", "artifact_refs", "validation", "provenance", "next_action", "diagnostics"})
         details = result["result"]
-        self.assertEqual(details["source"]["contract_version"], 2)
+        self.assertEqual(details["source"]["contract_version"], 3)
         self.assertRegex(details["source"]["revision"], r"^[0-9a-f]{40}$")
         self.assertRegex(details["source"]["content_fingerprint"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             [item["id"] for item in details["entries"]],
-            ["agent.mandarin-netease", "agent.source-notes", "skill.extract-media", "skill.mandarin-audio", "skill.source-notes"],
+            ["agent.mandarin-netease", "agent.source-notes", "skill.extract-media", "skill.mandarin-audio", "skill.practice", "skill.source-notes"],
         )
         self.assertFalse(self.agents_root.exists())
         self.assertFalse(self.codex_root.exists())

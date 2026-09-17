@@ -1,0 +1,193 @@
+import json
+import os
+import subprocess
+import sys
+import importlib.util
+from pathlib import Path
+
+
+def write_workspace(root: Path) -> Path:
+    root.mkdir(parents=True)
+    config = root / "workspace.toml"
+    config.write_text('''schema_version = 2
+workspace_id = "11111111-1111-4111-8111-111111111111"
+[paths]
+project = "project"
+results = "results"
+sources = "sources"
+derived = "derived"
+local = "local"
+''', encoding="utf-8")
+    return config
+
+
+def cli(*args: object, env: dict[str, str] | None = None) -> tuple[int, dict]:
+    completed = subprocess.run(
+        [sys.executable, "-m", "video_extract.cli", *map(str, args)],
+        cwd=Path(__file__).parents[1], env={**os.environ, **(env or {})},
+        capture_output=True, text=True,
+    )
+    assert completed.stdout, completed.stderr
+    return completed.returncode, json.loads(completed.stdout)
+
+
+def prepare_request(path: Path) -> Path:
+    request = {
+        "schema_version": 1,
+        "practice_id": "practice-11111111-1111-4111-8111-111111111111",
+        "question_id": "question-22222222-2222-4222-8222-222222222222",
+        "title": "丢弃过期识别结果",
+        "scope": "只实现按时间戳过滤一个模拟识别结果",
+        "effort_minutes": 20,
+        "completion_criteria": ["正常结果保留", "过期结果丢弃", "恰好等于期限时保留"],
+        "simulation_scope": "只验证模拟时钟和识别结果，不代表机器人硬件时序或可靠性",
+        "files": {
+            "example": {"example.py": "def is_fresh(age, limit):\n    return age <= limit\n"},
+            "task": {"solution.py": "def keep(result, now, max_age):\n    # TODO: user writes this\n    raise NotImplementedError\n"},
+            "tests": {"test_solution.py": "# fixture tests: normal, expired, boundary\n"},
+            "reference": {"solution.py": "def keep(result, now, max_age):\n    return now - result['at'] <= max_age\n"},
+        },
+        "test_command": ["python", "-m", "pytest", "tests/test_solution.py"],
+    }
+    path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_prepare_separates_one_small_simulated_mechanism_without_touching_learning(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+
+    code, prepared = cli("practice", "prepare", "--request", request,
+                         "--workspace", config, "--json")
+
+    assert code == 0
+    assert prepared["status"] == "completed"
+    practice = prepared["result"]["practice"]
+    assert practice["effort_minutes"] == 20
+    assert practice["simulation_scope"].startswith("只验证模拟时钟")
+    assert practice["test_command"] == ["python", "-m", "pytest", "tests/test_solution.py"]
+    root = Path(prepared["result"]["workspace"])
+    assert (root / "example/example.py").is_file()
+    assert "TODO" in (root / "task/solution.py").read_text()
+    assert (root / "tests/test_solution.py").is_file()
+    assert (root / "reference/solution.py").is_file()
+    assert not (config.parent / "results/learning/current.json").exists()
+
+
+def test_prepare_replay_never_overwrites_user_code_and_rejects_unsafe_paths(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    task = Path(prepared["result"]["workspace"]) / "task/solution.py"
+    task.write_text("# my work\n", encoding="utf-8")
+
+    code, replayed = cli("practice", "prepare", "--request", request,
+                         "--workspace", config, "--json")
+    assert code == 0
+    assert replayed["result"]["reused"] is True
+    assert task.read_text() == "# my work\n"
+
+    value = json.loads(request.read_text()); value["practice_id"] = "practice-33333333-3333-4333-8333-333333333333"
+    value["files"]["task"] = {"../escape.py": "bad"}
+    request.write_text(json.dumps(value), encoding="utf-8")
+    code, rejected = cli("practice", "prepare", "--request", request,
+                         "--workspace", config, "--json")
+    assert code != 0
+    assert rejected["validation"]["request"] == "failed"
+    assert not (config.parent / "results/practices/workspaces/escape.py").exists()
+
+
+def test_checkpoint_captures_stable_user_code_and_preserves_revision_conflicts(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    practice_id = prepared["result"]["practice"]["practice_id"]
+    task = Path(prepared["result"]["workspace"]) / "task/solution.py"
+    task.write_text("def keep(result, now, max_age):\n    return now - result['at'] <= max_age\n")
+
+    code, checkpoint = cli("practice", "checkpoint", "--practice-id", practice_id,
+                           "--expected-revision", 1, "--workspace", config, "--json")
+    assert code == 0
+    assert checkpoint["result"]["checkpoint"]["files"][0]["path"] == "solution.py"
+    assert checkpoint["result"]["checkpoint"]["object_sha256"]
+
+    attempt = tmp_path / "attempt.json"
+    attempt.write_text(json.dumps({"event_id": "event-1", "kind": "attempt", "summary": "先写了 < 而非 <="}), encoding="utf-8")
+    code, conflict = cli("practice", "record", "--practice-id", practice_id,
+                         "--request", attempt, "--expected-revision", 1,
+                         "--workspace", config, "--json")
+    assert code == 3
+    assert conflict["status"] == "awaiting_user"
+    assert Path(conflict["result"]["candidate"]).is_file()
+    assert task.read_text().startswith("def keep")
+
+
+def test_record_keeps_hint_attempt_and_test_facts_without_executing_or_changing_learning(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    practice_id = prepared["result"]["practice"]["practice_id"]
+    marker = tmp_path / "must-not-run"
+    revision = 1
+    events = [
+        {"event_id": "hint-1", "kind": "hint", "level": 1, "summary": "先比较时间差"},
+        {"event_id": "attempt-1", "kind": "attempt", "summary": "修正边界条件"},
+        {"event_id": "test-1", "kind": "test", "command": ["touch", str(marker)],
+         "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
+         "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00"},
+        {"event_id": "outcome-1", "kind": "outcome", "completion": "with_hint",
+         "next_step": "尝试改变过期阈值"},
+    ]
+    for event in events:
+        event_path = tmp_path / f'{event["event_id"]}.json'
+        event_path.write_text(json.dumps(event, ensure_ascii=False), encoding="utf-8")
+        code, recorded = cli("practice", "record", "--practice-id", practice_id,
+                             "--request", event_path, "--expected-revision", revision,
+                             "--workspace", config, "--json")
+        assert code == 0
+        revision = recorded["result"]["revision"]
+    assert not marker.exists()
+    assert recorded["result"]["practice"]["completion"] == "with_hint"
+    assert len(recorded["result"]["practice"]["events"]) == 4
+    assert not (config.parent / "results/learning/current.json").exists()
+
+
+def test_checkpoint_reports_continuously_changing_code_without_false_snapshot(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    practice_id = prepared["result"]["practice"]["practice_id"]
+
+    code, result = cli("practice", "checkpoint", "--practice-id", practice_id,
+                       "--expected-revision", 1, "--workspace", config, "--json",
+                       env={"VIDEO_EXTRACT_PRACTICE_TEST_FAULT": "unstable_read"})
+    assert code != 0
+    assert result["status"] == "recoverable_failure"
+    assert result["validation"]["stable_code"] == "failed"
+    assert result["result"]["revision"] == 1
+
+
+def test_stale_recognition_fixture_covers_normal_expired_and_boundary() -> None:
+    solution = Path(__file__).parent / "fixtures/practice/stale_recognition/reference/solution.py"
+    spec = importlib.util.spec_from_file_location("fixture_solution", solution)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    assert module.keep({"observed_at": 98.0}, 100.0, 5.0) is True
+    assert module.keep({"observed_at": 94.0}, 100.0, 5.0) is False
+    assert module.keep({"observed_at": 95.0}, 100.0, 5.0) is True
+
+
+def test_backup_entries_pin_checkpointed_code_and_exclude_editable_workspace(tmp_path: Path) -> None:
+    from video_extract.practice import backup_entries
+    from video_extract.workspace import WorkspaceConfig
+    config_path = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config_path, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+    _, checked = cli("practice", "checkpoint", "--practice-id", pid, "--expected-revision", 1,
+                     "--workspace", config_path, "--json")
+
+    entries = backup_entries(WorkspaceConfig.load(config_path))["entries"]
+    assert any("/objects/" in item for item in entries)
+    assert all("/workspaces/" not in item for item in entries)
+    assert checked["result"]["checkpoint"]["object_sha256"] in " ".join(entries)

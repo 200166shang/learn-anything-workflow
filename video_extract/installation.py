@@ -18,7 +18,7 @@ from .command_response import response
 
 
 PROJECT = Path(__file__).resolve().parent.parent
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 API_VERSION = 1
 RECEIPT_PARTS = ("video-extract", "install-receipt.json")
 
@@ -40,6 +40,7 @@ ENTRIES = (
     InstallEntry("agent.source-notes", PROJECT / ".codex/agents/source-notes-operator.toml", ("agents", "source-notes-operator.toml"), "codex"),
     InstallEntry("skill.extract-media", PROJECT / "integrations/skills/extract-media", ("skills", "extract-media"), "agents"),
     InstallEntry("skill.mandarin-audio", PROJECT / "integrations/skills/mandarin-audio", ("skills", "mandarin-audio"), "agents"),
+    InstallEntry("skill.practice", PROJECT / "integrations/skills/practice", ("skills", "practice"), "agents"),
     InstallEntry("skill.source-notes", PROJECT / "integrations/skills/source-notes", ("skills", "source-notes"), "agents"),
 )
 
