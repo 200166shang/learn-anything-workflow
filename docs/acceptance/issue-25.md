@@ -18,11 +18,19 @@ question with `parked` feedback, one complete explanation with a stable section,
 one pending explanation, and one broken locator.
 
 If no such workspace exists, acceptance is **blocked on fixture preparation**.
-The repository currently has no public command that creates this complete manual
-fixture or prints these four IDs from a clean checkout. Tests, browser HTML, and
-static demo data remain automated evidence, not a pass. This is the current
-reason a new operator cannot start the complete acceptance from the production
-workspace; it should be fixed in #25 rather than worked around in that Vault.
+The repository includes a one-step visual-review fixture builder:
+
+```bash
+PYTHONPATH=. ./.venv/bin/python tools/prepare_issue25_vault.py \
+  /absolute/path/to/new-empty-acceptance-directory
+```
+
+It creates the schema-v2 workspace, generated view, plugin installation, and an
+`acceptance.json` containing the IDs. Open its `obsidian-vault` directory in
+Obsidian. This starter covers the real plugin, available/pending nodes, route,
+position, parked feedback, and exact-section navigation. A reproducible broken
+locator plus cross-root fixture is still required for the complete ticket; do
+not turn this partial visual review into a full pass.
 
 ## 1. Preflight and build
 

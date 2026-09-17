@@ -25,7 +25,7 @@ class LearningMapView extends ItemView {
       if (!href || href.startsWith("#")) return;
       event.preventDefault(); this.app.workspace.openLinkText(href, graphPath, false);
     }));
-    frame.src = this.app.vault.adapter.getResourcePath(graphPath);
+    frame.srcdoc = await this.app.vault.adapter.read(graphPath);
   }
   async onClose() { this.containerEl.empty(); }
 }
