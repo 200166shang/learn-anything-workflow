@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from .command_response import response
 from .manifest import atomic_write_json, read_json
 from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
@@ -79,24 +81,91 @@ def _id(kind: str, workspace_id: str, batch: str, legacy_id: str) -> str:
     return f"{kind}-{value}"
 
 
-def _load_legacy(package: Path, thread_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_thread(thread_path: Path) -> tuple[dict[str, Any], list[Path]]:
+    if thread_path.suffix.lower() not in {".yaml", ".yml"}:
+        thread = read_json(thread_path)
+        if not isinstance(thread, dict):
+            raise ValueError("legacy thread must be a JSON or YAML object")
+        return thread, []
+    try:
+        raw = yaml.safe_load(thread_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"invalid legacy YAML thread: {exc}") from exc
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise ValueError("legacy YAML thread must use version 1")
+    thread_raw, nodes, edges = raw.get("thread"), raw.get("nodes"), raw.get("edges", [])
+    if not isinstance(thread_raw, dict) or not isinstance(nodes, dict) or not nodes:
+        raise ValueError("legacy YAML thread requires thread metadata and nodes")
+    relationships = []
+    for index, edge in enumerate(edges):
+        if not isinstance(edge, dict) or edge.get("from") not in nodes or edge.get("to") not in nodes:
+            raise ValueError("legacy YAML edge references an unknown node")
+        relationships.append({"id": str(edge.get("id") or index), "from": str(edge["from"]),
+                              "to": str(edge["to"]),
+                              "type": str(edge.get("type") or "deepens")})
+    questions, assets = [], []
+    for identity, node in nodes.items():
+        if not isinstance(node, dict):
+            raise ValueError(f"legacy YAML node must be an object: {identity}")
+        relative = node.get("file")
+        if not isinstance(relative, str):
+            raise ValueError(f"legacy YAML node is missing its question document: {identity}")
+        document = (thread_path.parent / relative).resolve(strict=False)
+        root = thread_path.parent.resolve(strict=False)
+        if root not in document.parents or not document.is_file() or document.is_symlink():
+            raise ValueError(f"legacy YAML question document is missing or unsafe: {relative}")
+        assets.append(document)
+        for target in re.findall(r"!\[[^]]*\]\(([^)]+)\)", document.read_text(encoding="utf-8")):
+            if "://" in target:
+                continue
+            referenced = (document.parent / target).resolve(strict=False)
+            if root not in referenced.parents or not referenced.is_file() or referenced.is_symlink():
+                raise ValueError(f"legacy YAML question image is missing or unsafe: {target}")
+            assets.append(referenced)
+        first_heading = next((line[2:].strip() for line in document.read_text(
+            encoding="utf-8").splitlines() if line.startswith("# ")), None)
+        question = {"id": str(identity), "title": str(node.get("title") or identity),
+                    "locator": {"path": f"legacy-thread/{Path(relative).as_posix()}",
+                                "heading": first_heading or str(node.get("title") or identity)}}
+        questions.append(question)
+    root_question = str(thread_raw.get("root"))
+    current_question = str(thread_raw.get("current"))
+    assets = list(dict.fromkeys(assets))
+    owned_files = {thread_path.resolve(), *(path.resolve() for path in assets)}
+    actual_files = {path.resolve() for path in root.rglob("*") if path.is_file() and not path.is_symlink()}
+    if actual_files != owned_files:
+        extras = sorted(str(path.relative_to(root)) for path in actual_files - owned_files)
+        raise ValueError(f"legacy YAML thread directory contains unowned files: {extras}")
+    return {"schema_version": 1,
+            "module": {"goal": str(thread_raw.get("title") or "Legacy course"),
+                       "scope": str(thread_raw.get("title") or "Migrated legacy scope")},
+            "thread": {"id": thread_path.parent.name, "root_question_id": root_question,
+                       "current_question_id": current_question},
+            "questions": questions, "relationships": relationships,
+            "_legacy_format": "yaml"}, assets
+
+
+def _load_legacy(package: Path, thread_path: Path) -> tuple[dict[str, Any], dict[str, Any], list[Path]]:
     manifest_path = package / "manifest.json"
     if not manifest_path.is_file():
         raise ValueError("legacy package is missing manifest.json")
-    manifest, thread = read_json(manifest_path), read_json(thread_path)
+    manifest = read_json(manifest_path)
+    thread, assets = _load_thread(thread_path)
     if not isinstance(manifest, dict) or not isinstance(thread, dict):
         raise ValueError("legacy manifest and thread must be JSON objects")
     if not isinstance(thread.get("questions"), list) or not thread["questions"]:
         raise ValueError("legacy thread must contain at least one question")
-    return manifest, thread
+    return manifest, thread, assets
 
 
-def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any]) -> dict[str, Any]:
+def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any],
+               thread_assets: list[Path]) -> dict[str, Any]:
     files = _tree(package)
     notes = [item for item in files if Path(item["path"]).suffix.lower() in {".md", ".txt"}]
     images = [item for item in files if Path(item["path"]).suffix.lower() in IMAGE_SUFFIXES]
     questions = thread["questions"]
-    relations = [item for item in questions if item.get("parent_id")]
+    relations = list(thread.get("relationships") or
+                     [item for item in questions if item.get("parent_id")])
     image_references: list[dict[str, Any]] = []
     for note in notes:
         note_path = package / note["path"]
@@ -115,6 +184,17 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any]) 
     if not feedbacks: missing.append("feedbacks")
     if not receipts: missing.append("operation_receipts")
     if not manifest.get("source_version"): missing.append("source_version")
+    if thread.get("_legacy_format") == "yaml":
+        missing.extend(["return_route", "entry_history"])
+    question_documents = [item for item in thread_assets if item.suffix.lower() in {".md", ".txt"}]
+    thread_images = [item for item in thread_assets if item.suffix.lower() in IMAGE_SUFFIXES]
+    counts = {"notes": len(notes), "images": len(images), "questions": len(questions),
+              "relationships": len(relations), "feedbacks": len(feedbacks),
+              "operation_receipts": len(receipts), "return_route": len(routes),
+              "entry_history": len(entries), "locators": len(locators)}
+    if thread_assets:
+        counts["question_documents"] = len(question_documents)
+        counts["thread_images"] = len(thread_images)
     return {"title": manifest.get("title"), "legacy_identity": manifest.get("identity"),
             "legacy_schema_version": manifest.get("schema_version"),
             "source_version": manifest.get("source_version"), "files": files,
@@ -122,10 +202,7 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any]) 
             "image_references": image_references,
             "question_ids": [str(item.get("id")) for item in questions],
             "current_question_id": thread.get("thread", {}).get("current_question_id"),
-            "counts": {"notes": len(notes), "images": len(images), "questions": len(questions),
-                       "relationships": len(relations), "feedbacks": len(feedbacks),
-                       "operation_receipts": len(receipts), "return_route": len(routes),
-                       "entry_history": len(entries), "locators": len(locators)},
+            "counts": counts,
             "missing_facts": missing}
 
 
@@ -135,12 +212,13 @@ def plan(config: WorkspaceConfig, batch: str, package: Path, thread_path: Path) 
     if root.exists():
         raise ValueError(f"migration batch already exists: {batch}")
     package, thread_path = package.expanduser().resolve(), thread_path.expanduser().resolve()
-    manifest, thread = _load_legacy(package, thread_path)
-    inventory = _inventory(package, manifest, thread)
+    manifest, thread, thread_assets = _load_legacy(package, thread_path)
+    inventory = _inventory(package, manifest, thread, thread_assets)
     value = {"schema_version": 1, "batch": batch, "status": "planned", "created_at": _now(),
              "workspace_id": config.workspace_id, "legacy_package": str(package),
              "legacy_thread": str(thread_path), "package_snapshot": inventory["files"],
              "thread_snapshot": _file_fact(thread_path), "inventory": inventory,
+             "thread_assets": [_file_fact(path) for path in thread_assets],
              "engineering_basis": _git_basis(config.project),
              "acceptance": {"automated_fixture": "pending", "real_pilot": "pending_authorization"},
              "events": [_event("migration plan", "passed", "inventory one authorized pilot",
@@ -162,7 +240,9 @@ def _state(config: WorkspaceConfig, batch: str) -> tuple[Path, dict[str, Any]]:
 def _unchanged(value: dict[str, Any]) -> bool:
     try:
         return (_tree(Path(value["legacy_package"])) == value["package_snapshot"]
-                and _file_fact(Path(value["legacy_thread"])) == value["thread_snapshot"])
+                and _file_fact(Path(value["legacy_thread"])) == value["thread_snapshot"]
+                and [_file_fact(Path(item["path"])) for item in value.get("thread_assets", [])]
+                    == value.get("thread_assets", []))
     except (OSError, ValueError):
         return False
 
@@ -206,14 +286,20 @@ def _converted_record(config: WorkspaceConfig, batch: str, legacy: dict[str, Any
         "unresolved_confusions": list(item.get("unresolved_confusions") or []), "explanation_refs": [],
     } for item in questions_raw}
     relationships = {}
-    for item in questions_raw:
-        if not item.get("parent_id"): continue
-        child_old, parent_old = str(item["id"]), str(item["parent_id"])
+    legacy_relationships = legacy.get("relationships")
+    relation_items = legacy_relationships if legacy_relationships is not None else [
+        {"id": item.get("id"), "from": item.get("parent_id"), "to": item["id"],
+         "type": item.get("relation", "deepens"), "created_at": item.get("created_at")}
+        for item in questions_raw if item.get("parent_id")]
+    for index, item in enumerate(relation_items):
+        child_old, parent_old = str(item["to"]), str(item["from"])
         if parent_old not in mapping: raise ValueError(f"unknown legacy parent question: {parent_old}")
-        relation_id = _id("relationship", config.workspace_id or "", batch, f"{parent_old}:{child_old}")
+        if child_old not in mapping: raise ValueError(f"unknown legacy child question: {child_old}")
+        relation_id = _id("relationship", config.workspace_id or "", batch,
+                          str(item.get("id") or f"{parent_old}:{child_old}:{index}"))
         relationships[relation_id] = {"relationship_id": relation_id, "thread_id": thread_id,
             "from_question_id": mapping[parent_old], "to_question_id": mapping[child_old],
-            "type": item.get("relation", "deepens"), "created_at": str(item.get("created_at") or created)}
+            "type": item.get("type", "deepens"), "created_at": str(item.get("created_at") or created)}
     feedbacks = {}
     for index, item in enumerate(legacy.get("feedbacks") or []):
         old_question = str(item.get("question_id"))
@@ -247,10 +333,16 @@ def convert(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     staging = root / "converted"; course = staging / "course"
     if staging.exists(): shutil.rmtree(staging)
     course.parent.mkdir(parents=True); shutil.copytree(value["legacy_package"], course)
+    legacy_thread, thread_assets = _load_thread(Path(value["legacy_thread"]))
+    for asset in thread_assets:
+        destination = course / "legacy-thread" / asset.relative_to(Path(value["legacy_thread"]).parent)
+        if destination.exists():
+            raise ValueError(f"legacy thread asset collides with course content: {destination.relative_to(course)}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(asset, destination)
     content_digest, _ = _directory_manifest(course)
     source_id = _id("source", config.workspace_id or "", batch, "course")
     source_version = "source-version-" + content_digest
-    legacy_thread = read_json(Path(value["legacy_thread"]))
     record, identity_map = _converted_record(config, batch, legacy_thread, source_id, source_version)
     converted = {"schema_version": 1, "batch": batch, "created_at": _now(),
                  "source_id": source_id, "source_version": source_version,
@@ -279,7 +371,9 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     if not conversion_path.is_file(): raise ValueError("batch has not been converted")
     converted = read_json(conversion_path)
     target_source_digest, _ = _directory_manifest(root / "converted/course")
-    source_files = value["package_snapshot"]; target_files = _tree(root / "converted/course")
+    source_files = value["package_snapshot"]
+    all_target_files = {item["path"]: item for item in _tree(root / "converted/course")}
+    target_files = [all_target_files.get(item["path"]) for item in source_files]
     locator_checks = []
     for locator in converted["legacy_locators"].values():
         relative = locator.get("path")
@@ -288,13 +382,32 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
         present = bool(document and course_root in document.parents and document.is_file())
         heading = locator.get("heading")
         locator_checks.append(present and (not heading or f"# {heading}" in document.read_text(encoding="utf-8")))
+    legacy_thread, _ = _load_thread(Path(value["legacy_thread"]))
+    legacy_relations = legacy_thread.get("relationships")
+    relation_items = legacy_relations if legacy_relations is not None else [
+        {"from": item.get("parent_id"), "to": item["id"],
+         "type": item.get("relation", "deepens")}
+        for item in legacy_thread["questions"] if item.get("parent_id")]
+    expected_relationships = sorted(
+        (converted["identity_map"][str(item["from"])],
+         converted["identity_map"][str(item["to"])], str(item.get("type") or "deepens"))
+        for item in relation_items)
+    actual_relationships = sorted(
+        (item["from_question_id"], item["to_question_id"], item["type"])
+        for item in converted["record"]["relationships"].values())
+    expected_thread_assets = {f"legacy-thread/{Path(item['path']).relative_to(Path(value['legacy_thread']).parent).as_posix()}":
+                              {"path": f"legacy-thread/{Path(item['path']).relative_to(Path(value['legacy_thread']).parent).as_posix()}",
+                               "size": item["size"], "sha256": item["sha256"]}
+                              for item in value.get("thread_assets", [])}
     checks = {"content": source_files == target_files,
               "notes": len(value["inventory"]["notes"]) == value["inventory"]["counts"]["notes"],
               "images": len(value["inventory"]["images"]) == value["inventory"]["counts"]["images"],
               "image_references": all(item["external"] or item["present"]
                                       for item in value["inventory"]["image_references"]),
               "questions": len(converted["record"]["questions"]) == value["inventory"]["counts"]["questions"],
-              "relationships": len(converted["record"]["relationships"]) == value["inventory"]["counts"]["relationships"],
+              "relationships": (len(converted["record"]["relationships"])
+                                == value["inventory"]["counts"]["relationships"]
+                                and actual_relationships == expected_relationships),
               "feedbacks": len(converted["record"]["feedbacks"]) == value["inventory"]["counts"]["feedbacks"],
               "operation_receipts": len(converted["legacy_operation_receipts"])
                   == value["inventory"]["counts"]["operation_receipts"],
@@ -310,7 +423,9 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
                   == value["inventory"].get("source_version"),
               "target_source_version": converted["source_version"]
                   == "source-version-" + target_source_digest,
-              "current_question": converted["record"]["threads"][converted["identity_map"][read_json(Path(value["legacy_thread"]))["thread"]["id"]]]["current_question_id"]
+              "thread_documents": all(all_target_files.get(path) == fact
+                                      for path, fact in expected_thread_assets.items()),
+              "current_question": converted["record"]["threads"][converted["identity_map"][legacy_thread["thread"]["id"]]]["current_question_id"]
                   == converted["identity_map"][value["inventory"]["current_question_id"]],
               "source_unchanged": _unchanged(value)}
     snapshot = {"schema_version": 2, "commit_id": "learning-commit-" + "0" * 64,
@@ -352,24 +467,44 @@ def _ownership(config: WorkspaceConfig) -> dict[str, Any]:
     return read_json(path) if path.is_file() else {"schema_version": 1, "batches": {}}
 
 
-def _legacy_modes(package: Path, thread_path: Path) -> dict[str, Any]:
+def _legacy_modes(package: Path, thread_path: Path, thread_assets: list[dict[str, Any]]) -> dict[str, Any]:
     modes: dict[str, int] = {}
     for path in sorted((package, *package.rglob("*"))):
         if path.is_symlink(): continue
         relative = "." if path == package else path.relative_to(package).as_posix()
         modes[relative] = path.stat().st_mode & 0o777
-    return {"package": modes, "thread": thread_path.stat().st_mode & 0o777}
+    owned_files = [thread_path, *(Path(item["path"]) for item in thread_assets)]
+    thread_directories = {}
+    if thread_path.suffix.lower() in {".yaml", ".yml"}:
+        thread_directories = {str(path): path.stat().st_mode & 0o777
+                              for path in (thread_path.parent, *thread_path.parent.rglob("*"))
+                              if path.is_dir() and not path.is_symlink()}
+    return {"package": modes,
+            "thread_files": {str(path): path.stat().st_mode & 0o777
+                             for path in dict.fromkeys(owned_files)},
+            "thread_directories": thread_directories}
 
 
 def _set_legacy_read_only(package: Path, thread_path: Path, modes: dict[str, Any]) -> None:
     for relative, mode in modes["package"].items():
         path = package if relative == "." else package / relative
         if path.exists() and not path.is_symlink(): path.chmod(int(mode) & ~0o222)
-    thread_path.chmod(int(modes["thread"]) & ~0o222)
+    for raw_path, mode in modes["thread_files"].items():
+        path = Path(raw_path)
+        if path.exists() and not path.is_symlink(): path.chmod(int(mode) & ~0o222)
+    for raw_path, mode in modes.get("thread_directories", {}).items():
+        path = Path(raw_path)
+        if path.exists() and not path.is_symlink(): path.chmod(int(mode) & ~0o222)
 
 
 def _restore_legacy_modes(package: Path, thread_path: Path, modes: dict[str, Any]) -> None:
-    thread_path.chmod(int(modes["thread"]))
+    for raw_path, mode in modes["thread_files"].items():
+        path = Path(raw_path)
+        if path.exists() and not path.is_symlink(): path.chmod(int(mode))
+    for raw_path, mode in sorted(modes.get("thread_directories", {}).items(),
+                                 key=lambda item: item[0].count(os.sep), reverse=True):
+        path = Path(raw_path)
+        if path.exists() and not path.is_symlink(): path.chmod(int(mode))
     for relative, mode in sorted(modes["package"].items(), key=lambda item: item[0].count("/"), reverse=True):
         path = package if relative == "." else package / relative
         if path.exists() and not path.is_symlink(): path.chmod(mode)
@@ -471,7 +606,7 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
     package_path, thread_path = Path(value["legacy_package"]), Path(value["legacy_thread"])
     legacy_modes = value.get("legacy_modes_before_cutover")
     if legacy_modes is None:
-        legacy_modes = _legacy_modes(package_path, thread_path)
+        legacy_modes = _legacy_modes(package_path, thread_path, value.get("thread_assets", []))
         value["legacy_modes_before_cutover"] = legacy_modes
         value["authorization_sha256"] = authorization_sha256
         value["acceptance"]["real_pilot"] = "authorized_for_cutover"

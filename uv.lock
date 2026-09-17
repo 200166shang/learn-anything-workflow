@@ -1418,6 +1418,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "pillow" },
     { name = "playwright" },
+    { name = "pyyaml" },
     { name = "yt-dlp" },
 ]
 
@@ -1433,6 +1434,7 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.23" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "playwright", specifier = ">=1.40.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "yt-dlp", specifier = ">=2025.1.15" },
 ]
 

@@ -70,6 +70,95 @@ def legacy_pilot(root: Path) -> Path:
     return root
 
 
+def legacy_yaml_pilot(root: Path) -> Path:
+    root = legacy_pilot(root)
+    (root / "course/legacy-thread").mkdir()
+    (root / "course/legacy-thread/original.bin").write_bytes(b"course-owned")
+    thread = root / "learning-thread"
+    (thread / "questions/images").mkdir(parents=True)
+    (thread / "questions/images/evidence.png").write_bytes(b"thread-image")
+    (thread / "questions/q001.md").write_text(
+        "# 根问题\n\n正文一 ![证据](images/evidence.png)\n", encoding="utf-8")
+    (thread / "questions/q002.md").write_text("# 续学问题\n\n正文二\n", encoding="utf-8")
+    (thread / "thread.yaml").write_text(
+        """version: 1
+thread:
+  title: 真实旧线程
+  root: q001
+  current: q002
+nodes:
+  q001:
+    title: 根问题
+    file: questions/q001.md
+  q002:
+    title: 续学问题
+    file: questions/q002.md
+edges:
+  - from: q001
+    to: q002
+    type: deepens
+  - from: q001
+    to: q002
+    type: applies
+""",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_real_legacy_yaml_thread_is_migrated_with_its_question_documents(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "workspace")
+    legacy = legacy_yaml_pilot(tmp_path / "legacy")
+    batch = "yaml-pilot"
+    common = ("--batch", batch, "--workspace", config, "--json")
+
+    code, planned = cli(
+        "migration", "plan", "--legacy-package", legacy / "course",
+        "--legacy-thread", legacy / "learning-thread/thread.yaml", *common,
+    )
+    assert code == 0
+    assert planned["result"]["inventory"]["counts"]["questions"] == 2
+    assert planned["result"]["inventory"]["counts"]["question_documents"] == 2
+    assert planned["result"]["inventory"]["counts"]["thread_images"] == 1
+    assert planned["result"]["inventory"]["counts"]["relationships"] == 2
+    assert cli("migration", "convert", *common)[0] == 0
+    verify_code, verified = cli("migration", "verify", *common)
+    assert verify_code == 0, json.dumps(verified, ensure_ascii=False, indent=2)
+    assert verified["validation"]["thread_documents"] == "passed"
+    conversion = json.loads(
+        (config.parent / "local/migration-batches" / batch / "converted/conversion.json").read_text()
+    )
+    mapped = conversion["identity_map"]["q001"]
+    assert conversion["legacy_locators"][mapped] == {
+        "path": "legacy-thread/questions/q001.md", "heading": "根问题"
+    }
+    assert (
+        config.parent / "local/migration-batches" / batch /
+        "converted/course/legacy-thread/questions/q001.md"
+    ).read_text(encoding="utf-8").startswith("# 根问题")
+    assert (
+        config.parent / "local/migration-batches" / batch /
+        "converted/course/legacy-thread/questions/images/evidence.png"
+    ).read_bytes() == b"thread-image"
+    assert (
+        config.parent / "local/migration-batches" / batch /
+        "converted/course/legacy-thread/original.bin"
+    ).read_bytes() == b"course-owned"
+    authorization = tmp_path / "yaml-authorization.json"
+    authorization.write_text(json.dumps({
+        "batch": batch,
+        "legacy_package": str((legacy / "course").resolve()),
+        "legacy_thread": str((legacy / "learning-thread/thread.yaml").resolve()),
+        "approved": True,
+    }), encoding="utf-8")
+    assert cli("migration", "cutover", *common, "--authorization", authorization)[0] == 0
+    assert (legacy / "learning-thread/questions/q001.md").stat().st_mode & 0o222 == 0
+    assert (legacy / "learning-thread/questions").stat().st_mode & 0o222 == 0
+    assert cli("migration", "rollback", *common)[0] == 0
+    assert (legacy / "learning-thread/questions/q001.md").stat().st_mode & 0o200
+    assert (legacy / "learning-thread/questions").stat().st_mode & 0o200
+
+
 def authorize(root: Path, batch: str, legacy: Path) -> Path:
     path = root / f"{batch}-authorization.json"
     path.write_text(json.dumps({"batch": batch, "legacy_package": str((legacy / "course").resolve()),
