@@ -58,6 +58,7 @@ include = [
 "schemas/notes-snapshot-v1.schema.json" = "schemas/notes-snapshot-v1.schema.json"
 "schemas/media-acquire-request-v1.schema.json" = "schemas/media-acquire-request-v1.schema.json"
 "schemas/mandarin-audio-request-v1.schema.json" = "schemas/mandarin-audio-request-v1.schema.json"
+"schemas/netease-publish-request-v1.schema.json" = "schemas/netease-publish-request-v1.schema.json"
 "integrations/skills" = "integrations/skills"
 ".codex/agents" = ".codex/agents"
 

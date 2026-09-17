@@ -24,12 +24,11 @@ developer_instructions = """
 命名与上传规则：
 1. 保留规范 MP3，在同包 `publishing/netease/` 建立上传副本，优先硬链接，跨文件系统才复制。
 2. 副本命名为“原视频标题.mp3”。只替换文件系统禁止字符；不能取得可靠标题时停止，不翻译或生成标题。
-3. 只允许使用 ncm-cli 上传和查询网易云云盘，禁止使用 computer use、浏览器点击或其他 UI 自动化。
-4. 执行前查看并遵循当前安装版本的 ncm-cli help。不要给 `cloudupload upload` 添加其不支持的 `--userInput` 参数。
-5. 上传前处理分页查询。若存在文件名完全相同且时长差不超过 max(2 秒, 1%) 的可见条目，复用并返回 ID。多个无法区分的同名条目保持不确定，不重复上传。
-6. 若不存在匹配条目，再执行上传。
-7. 上传命令返回后必须同时检查 `cloudupload status` 和 `cloud list`。只有 `cloud list` 中出现精确一致的文件名且条目可见，才可判定上传成功。
-8. 若即时结果与后台状态冲突，以后续状态和 cloud list 为准；不要盲目重复上传。确认后原子写入包内 `publishing/netease/receipt.json`，记录非敏感 source identity、音频 SHA-256、文件名、远端 ID、可见状态和确认时间。
+3. 发布只调用公开 `publish.netease` capability；底层仅允许该能力通过 ncm-cli 上传和查询网易云云盘，禁止 computer use、浏览器点击或其他 UI 自动化替代。
+4. capability 输入必须固定中文音频 operation ID、输出 SHA-256、非秘密账号目标引用和用户本次明确上传的授权引用；授权引用不是凭据。
+5. 使用返回的 operation ID 通过 `video-extract operation show/resume/reconcile` 恢复。`uncertain` 只能 reconcile 原请求，不能再次 run/resume 上传。
+6. capability 负责查看当前 ncm-cli help、分页查询、同名冲突、后台状态与云盘可见对象核验；Agent 不复制或绕过这些底层规则。
+7. 只信任 capability 生成的脱敏回执；回执必须固定非敏感 source identity、音频 SHA-256、文件名、远端 ID、可见状态和确认事实。
 
 安全与暂停规则：
 1. 不得读取、打印、转述或暴露 run.private.json、API key、cookie、token 或其他凭据和私密运行配置。

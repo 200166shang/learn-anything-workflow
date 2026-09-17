@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thin Skill helper for the public audio.mandarin capability."""
 from __future__ import annotations
-import argparse, hashlib, json, subprocess, tempfile
+import argparse, hashlib, json, subprocess, sys, tempfile
 from pathlib import Path
 
 def _source_version(package: Path) -> str:
@@ -26,7 +26,7 @@ def main() -> int:
                "source_id": manifest.get("identity"), "source_version": _source_version(package),
                "profile": "alibaba-podcast-tts-throughput"}
     if args.check:
-        dependency = subprocess.run(["video-extract", "capability", "check", "audio.mandarin", "--json"], text=True, capture_output=True)
+        dependency = subprocess.run([sys.executable, "-m", "video_extract.cli", "capability", "check", "audio.mandarin", "--json"], text=True, capture_output=True)
         if dependency.returncode:
             print(dependency.stdout, end=""); return dependency.returncode
         request["check_only"] = True
@@ -38,7 +38,7 @@ def main() -> int:
     temporary = tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False)
     try:
         json.dump(request, temporary); temporary.close()
-        completed = subprocess.run(["video-extract", "capability", "run", "audio.mandarin", "--request", temporary.name, "--json"], text=True, capture_output=True)
+        completed = subprocess.run([sys.executable, "-m", "video_extract.cli", "capability", "run", "audio.mandarin", "--request", temporary.name, "--json"], text=True, capture_output=True)
     finally: Path(temporary.name).unlink(missing_ok=True)
     print(completed.stdout, end="")
     return completed.returncode
