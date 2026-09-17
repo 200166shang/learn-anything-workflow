@@ -97,6 +97,17 @@ def _deep_validate(value: dict[str, Any]) -> None:
             question = questions.get(thread[field])
             if question is None or question["thread_id"] != thread_id:
                 raise WorkspaceError(f"thread {field} is not owned by thread: {thread_id}")
+        reachable = {thread["root_question_id"]}; pending = [thread["root_question_id"]]
+        while pending:
+            current = pending.pop()
+            for relation in record["relationships"].values():
+                if relation["thread_id"] == thread_id and relation["from_question_id"] == current \
+                        and relation["to_question_id"] not in reachable:
+                    reachable.add(relation["to_question_id"]); pending.append(relation["to_question_id"])
+        owned_questions = {question_id for question_id, question in questions.items()
+                           if question["thread_id"] == thread_id}
+        if reachable != owned_questions:
+            raise WorkspaceError(f"thread contains questions unreachable from its root: {thread_id}")
     for question_id, question in questions.items():
         if question["question_id"] != question_id or question["thread_id"] not in threads:
             raise WorkspaceError(f"question identity or thread reference is invalid: {question_id}")
@@ -198,17 +209,26 @@ def _revision_conflict(config: WorkspaceConfig, snapshot: dict[str, Any], expect
                        operation: str, proposal: dict[str, Any]) -> dict[str, Any] | None:
     if expected == snapshot["revision"]:
         return None
-    candidates = _roots(config)[3]; candidates.mkdir(parents=True, exist_ok=True)
+    candidates = _roots(config)[3]
+    created = not candidates.exists()
+    candidates.mkdir(parents=True, exist_ok=True)
+    if created:
+        if os.environ.get("VIDEO_EXTRACT_LEARNING_TEST_FAULT") == "candidate_parent_sync":
+            raise OSError("injected candidate parent directory sync failure")
+        _sync_directory(candidates.parent)
     path = candidates / f"candidate-{uuid.uuid4()}.json"
     atomic_write_json(path, {"schema_version": 2, "operation": operation,
                              "expected_revision": expected, "observed_revision": snapshot["revision"],
                              "proposal": proposal})
     try:
-        if os.environ.get("VIDEO_EXTRACT_LEARNING_TEST_FAULT") == "candidate_sync":
+        if os.environ.get("VIDEO_EXTRACT_LEARNING_TEST_FAULT") in {"candidate_sync", "candidate_cleanup_sync"}:
             raise OSError("injected candidate directory sync failure")
         _sync_directory(candidates)
     except OSError:
         path.unlink(missing_ok=True)
+        if os.environ.get("VIDEO_EXTRACT_LEARNING_TEST_FAULT") == "candidate_cleanup_sync":
+            raise OSError("injected candidate cleanup directory sync failure")
+        _sync_directory(candidates)
         raise
     return response(status="awaiting_user", workspace=str(config.config_path), result={
         "candidate": str(path), "observed_revision": snapshot["revision"]},
@@ -279,13 +299,22 @@ def _sources_blocked(config: WorkspaceConfig, question: dict[str, Any] | None,
 
 
 def create_module(config: WorkspaceConfig, goal: str, scope: str, source_id: str,
-                  source_version: str, expected_revision: int | None = None) -> dict[str, Any]:
+                  source_version: str, expected_revision: int | None = None,
+                  source_role: str | None = None) -> dict[str, Any]:
     if not goal.strip() or not scope.strip():
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=["confirmed module goal and scope must be non-empty"])
     context, source_errors = _source_context(config, [{"source_id": source_id, "source_version": source_version}])
     if source_errors:
         return _sources_blocked(config, None, context, source_errors)
+    role = source_role or ("current_code" if context[0]["kind"] == "code" else "course_fact")
+    if role not in {"course_fact", "current_code", "supplemental_source"}:
+        return response(status="missing_input", workspace=str(config.config_path),
+                        validation={"source_role": "failed"}, diagnostics=[f"invalid source role: {role}"])
+    if (role == "current_code") != (context[0]["kind"] == "code") and role != "supplemental_source":
+        return response(status="missing_input", workspace=str(config.config_path),
+                        validation={"source_role": "failed"},
+                        diagnostics=[f"source role {role} does not match source kind {context[0]['kind']}"])
     module_id = "module-" + str(uuid.uuid4())
     with package_lock(_roots(config)[2].parent):
         snapshot = _load(config)
@@ -293,7 +322,7 @@ def create_module(config: WorkspaceConfig, goal: str, scope: str, source_id: str
             conflict = _revision_conflict(config, snapshot, expected_revision, "module.create", {"goal": goal, "scope": scope})
             if conflict: return conflict
         module = {"module_id": module_id, "goal": goal.strip(), "scope": scope.strip(),
-                  "source_refs": [{"source_id": source_id, "source_version": source_version}],
+                  "source_refs": [{"source_id": source_id, "source_version": source_version, "role": role}],
                   "thread_ids": [], "last_active_thread_id": None, "created_at": _now()}
         record = {**snapshot["record"], "modules": {**snapshot["record"]["modules"], module_id: module}}
         published = _publish(config, snapshot, record)
@@ -525,7 +554,7 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
             return response(status="failed", workspace=str(config.config_path),
                             validation={"preparation": "failed"},
                             diagnostics=["preparation token is missing, stale, consumed, cross-question, or marker-mismatched"])
-        allowed_refs = {(item["source_id"], item["source_version"]) for item in module["source_refs"]}
+        allowed_refs = {(item["source_id"], item["source_version"]): item["role"] for item in module["source_refs"]}
         evidence_errors: list[str] = []
         for item in evidence:
             if (not isinstance(item, dict)
@@ -539,9 +568,9 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
             context, source_errors = _source_context(config, [{"source_id": identity[0], "source_version": identity[1]}])
             if source_errors:
                 evidence_errors.extend(source_errors); continue
-            expected_type = "current_code" if context[0]["kind"] == "code" else "course_fact"
+            expected_type = allowed_refs[identity]
             if item["claim_type"] not in {expected_type, "inference"}:
-                evidence_errors.append(f"claim_type {item['claim_type']} does not match source kind {context[0]['kind']}")
+                evidence_errors.append(f"claim_type {item['claim_type']} does not match confirmed source role {expected_type}")
         if evidence_errors:
             return response(status="failed", workspace=str(config.config_path),
                             validation={"source_scope": "failed"}, diagnostics=evidence_errors)

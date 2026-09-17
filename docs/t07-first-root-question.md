@@ -4,7 +4,7 @@ Issue: `learn-anything-workflow#19`.
 
 The public seams are `learning module create/show`, `learning recommend`, `learning thread create/show`, `learning pursue/locate`, and `explanation prepare/commit`. `learning.learn` is the stable capability ID with `learning-request-v1`; the shared data-driven capability checker validates it alongside `source.notes` and `media.acquire`.
 
-Learning facts use an independent `learning-snapshot-v2` store below the workspace-v2 results role. It has immutable Markdown objects, complete manifests, a single atomic current pointer, revision conflict candidates, and a future backup-enumeration boundary. It references source-v6 identities and versions but does not modify source snapshot-v1.
+Learning facts use an independent `learning-snapshot-v2` store below the workspace-v2 results role. It has immutable Markdown objects, complete manifests, a single atomic current pointer, revision conflict candidates, and a future backup-enumeration boundary. It references source-v6 identities and versions but does not modify source snapshot-v1. Each module source reference records its evidence role (`course_fact`, `current_code`, or explicit `supplemental_source`); `inference` is a claim classification grounded in one of those confirmed references.
 
 Root recommendations are model pauses and are not persisted. Creating a thread records the selected root with opaque UUIDv4 module/thread/question identities before any explanation exists. `pursue` likewise records the original follow-up before explanation. Thread ownership is singular and module/thread current position is updated in the same learning commit.
 

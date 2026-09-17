@@ -57,7 +57,8 @@ def test_create_and_show_module_with_confirmed_goal_scope_and_source_version(tmp
     assert module["goal"] == "理解线性变换"
     assert module["scope"] == "矩阵如何作用于二维向量"
     assert module["source_refs"] == [{"source_id": source["source_id"],
-                                      "source_version": source["source_version"]}]
+                                      "source_version": source["source_version"],
+                                      "role": "course_fact"}]
     assert module["thread_ids"] == []
     assert created["result"]["learning_schema_version"] == 2
     assert created["result"]["revision"] == 1
@@ -322,8 +323,55 @@ def test_code_source_can_prepare_learning_without_media_or_source_notes(tmp_path
     assert status == 3
     context = prepared["result"]["source_context"][0]
     assert context["kind"] == "code"
+    assert context["role"] == "current_code"
     assert context["availability"] == "available_at_location"
     assert context["location"] == str(code_root.resolve())
+
+
+def test_current_code_and_inference_evidence_follow_confirmed_source_role(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    code_root = tmp_path / "code"; code_root.mkdir(); (code_root / "pipeline.py").write_text("def entry(frame): return frame\n")
+    _, registered = cli("source", "register", code_root, "--workspace", config, "--json"); source = registered["result"]
+    _, question_id = create_root(tmp_path, config, source, "一帧链路如何工作？")
+    _, prepared = cli("explanation", "prepare", "--question-id", question_id,
+                      "--profile", "frame_pipeline", "--workspace", config, "--json")
+    draft = tmp_path / "code.md"; draft.write_text(
+        f'# Code\n{prepared["result"]["required_marker"]}\n直觉因果机制：入口 entry 后 producer 放 queue，consumer 在线程 async 边界处理并从 output 出口返回；例子覆盖慢、满、退出 shutdown，说明条件边界。\n')
+    evidence = tmp_path / "code-evidence.json"; evidence.write_text(json.dumps([
+        {"source_id": source["source_id"], "source_version": source["source_version"],
+         "locator": {"kind": "symbol", "value": "entry"}, "claim_type": "current_code", "claim": "actual entry"},
+        {"source_id": source["source_id"], "source_version": source["source_version"],
+         "locator": {"kind": "symbol", "value": "entry"}, "claim_type": "inference", "claim": "likely boundary"}]))
+    review = tmp_path / "code-review.json"; review.write_text(json.dumps({
+        "intuition": True, "causality": True, "mechanism": True, "worked_example": True,
+        "conditions": True, "source_alignment": True, "actual_entry_verified": True,
+        "concurrency_verified": True, "backpressure_shutdown": True}))
+    code, committed = cli("explanation", "commit", "--question-id", question_id, "--draft", draft,
+                          "--evidence", evidence, "--teaching-review", review, "--profile", "frame_pipeline",
+                          "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
+    assert code == 0
+    assert {item["claim_type"] for item in committed["result"]["explanation"]["evidence_refs"]} == {"current_code", "inference"}
+
+
+def test_explicit_supplemental_source_role_allows_supplemental_evidence(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    _, module = cli("learning", "module", "create", "--goal", "补充理解", "--scope", "外部解释",
+                    "--source-id", source["source_id"], "--source-version", source["source_version"],
+                    "--source-role", "supplemental_source", "--workspace", config, "--json")
+    assert module["result"]["module"]["source_refs"][0]["role"] == "supplemental_source"
+    _, rooted = cli("learning", "thread", "create", "--module-id", module["result"]["module"]["module_id"],
+                    "--root-question", "补充资料如何解释？", "--workspace", config, "--json")
+    question_id = rooted["result"]["question"]["question_id"]
+    _, prepared = cli("explanation", "prepare", "--question-id", question_id,
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    draft, evidence, review = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    values = json.loads(evidence.read_text()); values[0]["claim_type"] = "supplemental_source"
+    evidence.write_text(json.dumps(values))
+    code, committed = cli("explanation", "commit", "--question-id", question_id, "--draft", draft,
+                          "--evidence", evidence, "--teaching-review", review, "--profile", "linear_transform",
+                          "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
+    assert code == 0
+    assert committed["result"]["explanation"]["evidence_refs"][0]["claim_type"] == "supplemental_source"
 
 
 def test_learning_store_rejects_a_symlink_escape_from_results(tmp_path: Path) -> None:
@@ -384,6 +432,23 @@ def test_deep_validation_rejects_cross_owned_thread_even_when_json_schema_is_val
     assert "ownership" in rejected["diagnostics"][0] or "module reference" in rejected["diagnostics"][0]
 
 
+def test_deep_validation_rejects_question_orphaned_from_thread_root(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根问题")
+    results = config.parent / "results"; pointer_path = results / "learning/current.json"
+    pointer = json.loads(pointer_path.read_text()); manifest_path = results / "learning/commits" / f'{pointer["commit_id"]}.json'
+    manifest = json.loads(manifest_path.read_text()); orphan_id = "question-22222222-2222-4222-8222-222222222222"
+    manifest["record"]["questions"][orphan_id] = {
+        **manifest["record"]["questions"][root_id], "question_id": orphan_id,
+        "original_question": "孤儿", "title": "孤儿"}
+    manifest_path.write_text(json.dumps(manifest)); pointer["manifest_sha256"] = __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer))
+
+    code, rejected = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert code == 1
+    assert "unreachable from its root" in rejected["diagnostics"][0]
+
+
 def test_missing_code_source_blocks_only_its_module_with_failed_source_validation(tmp_path: Path) -> None:
     config = write_workspace(tmp_path / "workspace")
     code_root = tmp_path / "code"; code_root.mkdir(); (code_root / "main.py").write_text("x = 1\n")
@@ -434,15 +499,16 @@ def test_capability_forwards_expected_revision_and_normalizes_publish_recovery(t
     assert uncertain["operation_id"].startswith("operation-")
 
 
-def test_candidate_sync_failure_does_not_claim_a_preserved_candidate(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fault", ["candidate_parent_sync", "candidate_sync", "candidate_cleanup_sync"])
+def test_candidate_sync_failure_does_not_claim_a_preserved_candidate(tmp_path: Path, fault: str) -> None:
     config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
     thread_id, root_id = create_root(tmp_path, config, source, "根")
     code, failed = cli("learning", "pursue", "--thread-id", thread_id,
                        "--from-question-id", root_id, "--relation", "deepens", "--question", "追问",
                        "--expected-revision", 0, "--workspace", config, "--json",
-                       env={"VIDEO_EXTRACT_LEARNING_TEST_FAULT": "candidate_sync"})
+                       env={"VIDEO_EXTRACT_LEARNING_TEST_FAULT": fault})
     assert code == 1 and failed["status"] == "failed"
-    assert "candidate directory sync failure" in failed["diagnostics"][0]
+    assert "candidate" in failed["diagnostics"][0] and "sync failure" in failed["diagnostics"][0]
     candidates = config.parent / "results/learning/candidates"
     assert not list(candidates.glob("candidate-*.json"))
 

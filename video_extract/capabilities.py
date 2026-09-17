@@ -250,7 +250,8 @@ def run_learning(request: dict[str, Any]) -> dict[str, Any]:
     try:
         if action == "module.create":
             return create_module(workspace, request["goal"], request["scope"], request["source_id"],
-                                 request["source_version"], request.get("expected_revision"))
+                                 request["source_version"], request.get("expected_revision"),
+                                 request.get("source_role"))
         if action == "module.show": return show_module(workspace, request["module_id"])
         if action == "recommend": return recommend_roots(workspace, request["module_id"])
         if action == "thread.create":

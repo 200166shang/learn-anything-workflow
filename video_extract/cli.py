@@ -219,7 +219,8 @@ def cmd_learning(args: argparse.Namespace) -> int:
     workspace = discover_workspace(args.workspace)
     try:
         if args.learning_entity == "module" and args.learning_action == "create":
-            result = create_module(workspace, args.goal, args.scope, args.source_id, args.source_version, args.expected_revision)
+            result = create_module(workspace, args.goal, args.scope, args.source_id, args.source_version,
+                                   args.expected_revision, args.source_role)
         elif args.learning_entity == "module" and args.learning_action == "show":
             result = show_module(workspace, args.module_id)
         elif args.learning_entity == "recommend":
@@ -630,7 +631,7 @@ def parser() -> argparse.ArgumentParser:
     learning = commands.add_parser("learning", help="manage authoritative learning modules, threads, and questions")
     learning_entities = learning.add_subparsers(dest="learning_entity", required=True)
     module = learning_entities.add_parser("module"); module_actions = module.add_subparsers(dest="learning_action", required=True)
-    module_create = module_actions.add_parser("create"); module_create.add_argument("--goal", required=True); module_create.add_argument("--scope", required=True); module_create.add_argument("--source-id", required=True); module_create.add_argument("--source-version", required=True); module_create.add_argument("--expected-revision", type=int); module_create.add_argument("--workspace", type=Path); module_create.add_argument("--json", action="store_true"); module_create.set_defaults(func=cmd_learning)
+    module_create = module_actions.add_parser("create"); module_create.add_argument("--goal", required=True); module_create.add_argument("--scope", required=True); module_create.add_argument("--source-id", required=True); module_create.add_argument("--source-version", required=True); module_create.add_argument("--source-role", choices=("course_fact", "current_code", "supplemental_source")); module_create.add_argument("--expected-revision", type=int); module_create.add_argument("--workspace", type=Path); module_create.add_argument("--json", action="store_true"); module_create.set_defaults(func=cmd_learning)
     module_show = module_actions.add_parser("show"); module_show.add_argument("module_id"); module_show.add_argument("--workspace", type=Path); module_show.add_argument("--json", action="store_true"); module_show.set_defaults(func=cmd_learning)
     recommend = learning_entities.add_parser("recommend", help="prepare source-grounded root question recommendations without persisting candidates"); recommend.add_argument("--module-id", required=True); recommend.add_argument("--workspace", type=Path); recommend.add_argument("--json", action="store_true"); recommend.set_defaults(func=cmd_learning)
     thread = learning_entities.add_parser("thread"); thread_actions = thread.add_subparsers(dest="learning_action", required=True)
