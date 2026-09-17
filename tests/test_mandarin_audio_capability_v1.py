@@ -1,6 +1,8 @@
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import pytest
 
 from video_extract.cli import parser
 from video_extract.mandarin_audio import MandarinAdapter, register_mandarin_adapter
@@ -30,12 +32,14 @@ def fixture(tmp_path: Path, language: str) -> tuple[Path, Path, Path]:
     audio = package / "media/audio.source.m4a"
     audio.parent.mkdir(parents=True)
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                    "sine=frequency=440:duration=0.25", "-c:a", "aac", str(audio)], check=True)
-    manifest = {"schema_version": 5, "identity": "fixture-audio", "artifacts": {"source_audio": "media/audio.source.m4a"},
+                    "aevalsrc=0.12*sin(2*PI*(180+35*sin(2*PI*3*t))*t)+0.07*sin(2*PI*360*t):d=2.5:s=48000",
+                    "-c:a", "aac", str(audio)], check=True)
+    transcript = package / "media/transcript.txt"; transcript.write_text("This is a short spoken listening quality fixture with several useful words.")
+    manifest = {"schema_version": 5, "identity": "fixture-audio", "artifacts": {"source_audio": "media/audio.source.m4a", "source_transcript": "media/transcript.txt"},
                 "provenance": {"source_audio": {"language": language, "kind": "native_chinese_track" if language == "zh-CN" else "source_track"}}}
     (package / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     request = tmp_path / "request.json"
-    request.write_text(json.dumps({"contract_version": 1, "workspace": str(workspace), "package": str(package),
+    request.write_text(json.dumps({"contract_version": 1, "workspace": str(workspace), "package": str(package), "source_id": "fixture-audio",
                                    "source_version": "source-version-1", "profile": "alibaba-podcast-tts-throughput"}), encoding="utf-8")
     return workspace, package, request
 
@@ -92,6 +96,15 @@ class RecoverableInterruptedAdapter(InterruptedAdapter):
                 "receipt": {"receipt_id": "recovered-receipt"}}
 
 
+class CrashAdapter(FakePaidAdapter):
+    adapter_identity = "fixture.mandarin-crash-v1"
+    def localize(self, source, target, *, profile, idempotency_token):
+        self.calls.append(idempotency_token)
+        raise SystemExit("simulated process death")
+    def reconcile(self, attempt, target):
+        return {"state": "committed", "query_handle": attempt["query_handle"]}
+
+
 def test_native_chinese_normalizes_locally_and_reuses_only_verified_fingerprint(tmp_path, capsys):
     workspace, package, request = fixture(tmp_path, "zh-CN")
     adapter = FakePaidAdapter()
@@ -103,7 +116,7 @@ def test_native_chinese_normalizes_locally_and_reuses_only_verified_fingerprint(
     assert code == code2 == 0
     assert adapter.calls == []
     assert reused["result"]["reuse"] == "verified_operation"
-    assert reused["validation"] == {"source": "passed", "audio_spec": "passed", "output_digest": "passed"}
+    assert reused["validation"]["listening_quality"] == "passed"
     output = package / "listening/zh-CN/podcast.zh-CN.mp3"
     assert output.is_file()
     report = json.loads((output.parent / "production-report.json").read_text())
@@ -112,7 +125,7 @@ def test_native_chinese_normalizes_locally_and_reuses_only_verified_fingerprint(
 
     # A format-valid replacement source must not cause reuse of old content.
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-                    "sine=frequency=880:duration=0.25", "-c:a", "aac", str(package / "media/audio.source.m4a")], check=True)
+                    "sine=frequency=880:duration=2.5", "-c:a", "aac", str(package / "media/audio.source.m4a")], check=True)
     changed_code, changed = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
     assert changed_code == 3
     assert changed["status"] == "missing_input"
@@ -157,6 +170,9 @@ def test_unknown_language_is_rejected_before_adapter_call(tmp_path, capsys):
     assert result["status"] == "unsupported"
     assert adapter.calls == []
     assert result["validation"]["source_language"] == "failed"
+    _, shown = invoke(capsys, "operation", "show", result["operation_id"], "--workspace", str(tmp_path / "workspace.toml"))
+    assert shown["api_version"] == 1 and shown["status"] == "unsupported"
+    assert shown["provenance"]["capability_id"] == "audio.mandarin"
 
 
 def test_parameter_change_has_distinct_operation_and_does_not_reuse_old_mp3(tmp_path, capsys):
@@ -179,12 +195,14 @@ def test_uncertain_paid_submission_is_shown_and_resumed_without_resubmission(tmp
     request.write_text(json.dumps(data))
 
     _, uncertain = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    _, repeated = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
     _, shown = invoke(capsys, "operation", "show", uncertain["operation_id"], "--workspace", str(workspace))
     _, resumed = invoke(capsys, "operation", "resume", uncertain["operation_id"], "--workspace", str(workspace))
     _, reconciled = invoke(capsys, "operation", "reconcile", uncertain["operation_id"], "--workspace", str(workspace))
 
     assert uncertain["status"] == shown["status"] == resumed["status"] == reconciled["status"] == "uncertain"
-    assert adapter.calls == [adapter.calls[0]]
+    assert repeated["status"] == "uncertain"
+    assert len(adapter.calls) == 1
     assert reconciled["next_action"]["type"] == "reconcile"
     receipt = json.loads((tmp_path / "results/operation-receipts" / f'{uncertain["operation_id"]}.json').read_text())
     assert receipt["reconciliation"][-1]["state"] == "committed"
@@ -203,3 +221,53 @@ def test_reconcile_verified_paid_result_completes_without_resubmission(tmp_path,
     assert recovered["status"] == "completed"
     assert len(adapter.calls) == 1
     assert recovered["validation"]["audio_spec"] == "passed"
+
+
+def test_engineering_is_not_misparsed_as_english(tmp_path, capsys):
+    _, _, request = fixture(tmp_path, "engineering")
+    code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 1 and result["status"] == "unsupported"
+
+
+def test_package_identity_prevents_cross_package_operation_collision(tmp_path, capsys):
+    _, package, request = fixture(tmp_path, "zh-CN")
+    _, first = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    other = tmp_path / "other"; __import__("shutil").copytree(package, other)
+    manifest = json.loads((other / "manifest.json").read_text()); manifest["identity"] = "fixture-other"
+    (other / "manifest.json").write_text(json.dumps(manifest))
+    data = json.loads(request.read_text()); data.update(package=str(other), source_id="fixture-other")
+    request.write_text(json.dumps(data))
+    _, second = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert first["operation_id"] != second["operation_id"]
+
+
+def test_pure_sine_is_not_accepted_as_natural_listening_audio(tmp_path, capsys):
+    _, package, request = fixture(tmp_path, "zh-CN")
+    source = package / "media/audio.source.m4a"
+    source.unlink()
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=2.5", "-c:a", "aac", str(source)], check=True)
+    code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 1
+    assert result["status"] == "recoverable_failure"
+    assert result["validation"]["listening_quality"] == "failed"
+
+
+def test_crashed_paid_worker_never_submits_again_before_reconcile(tmp_path, capsys):
+    workspace, _, request = fixture(tmp_path, "en")
+    adapter = CrashAdapter(); register_mandarin_adapter("crash", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="crash", authorization_ref="approved-crash")
+    request.write_text(json.dumps(data))
+    with pytest.raises(SystemExit):
+        invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    operation = next((tmp_path / "local/operations").glob("operation-*.json"))
+    record = json.loads(operation.read_text())
+    record["lease"]["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    operation.write_text(json.dumps(record))
+
+    _, uncertain = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    _, resumed = invoke(capsys, "operation", "resume", uncertain["operation_id"], "--workspace", str(workspace))
+
+    assert uncertain["status"] == resumed["status"] == "uncertain"
+    assert len(adapter.calls) == 1
+    assert uncertain["next_action"]["type"] == "reconcile"
