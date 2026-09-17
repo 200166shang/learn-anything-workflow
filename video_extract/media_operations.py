@@ -30,6 +30,10 @@ LEASE_SECONDS = 30
 
 
 class MediaAdapter(Protocol):
+    adapter_identity: str
+    authorization_category: str
+    requires_authorization: bool
+
     def acquire(self, item: dict[str, Any], kinds: list[str], target: Path, *, language: str,
                 quality: str, idempotency_token: str) -> dict[str, Any]: ...
 
@@ -38,6 +42,10 @@ class MediaAdapter(Protocol):
 
 class BuiltinMediaAdapter:
     """Read-only media adapter with a durable local receipt query protocol."""
+
+    adapter_identity = "builtin.media-v1/local-read-v1"
+    authorization_category = "user_authorized_media_source"
+    requires_authorization = False
 
     def acquire(self, item: dict[str, Any], kinds: list[str], target: Path, *, language: str,
                 quality: str, idempotency_token: str) -> dict[str, Any]:
@@ -76,6 +84,13 @@ def _adapter(item: dict[str, Any]) -> tuple[str, MediaAdapter | None]:
     return adapter_id, MEDIA_ADAPTERS.get(adapter_id)
 
 
+def _adapter_identity(adapter_id: str, adapter: MediaAdapter | None) -> str | None:
+    if adapter is None:
+        return adapter_id
+    value = getattr(adapter, "adapter_identity", adapter_id)
+    return value if isinstance(value, str) and value else adapter_id
+
+
 def _validate_request(request: Any) -> dict[str, Any]:
     try:
         Draft202012Validator(SCHEMA).validate(request)
@@ -105,10 +120,13 @@ def _normalized(request: dict[str, Any]) -> dict[str, Any]:
     for key in ("source_id", "source_version"):
         if not isinstance(request.get(key), str) or not request[key]:
             raise ValueError(f"{key} is required")
-    return {"contract_version": CONTRACT_VERSION,
+    normalized = {"contract_version": CONTRACT_VERSION,
             "source_id": request["source_id"], "source_version": request["source_version"],
             "scope": sorted(set(scope)), "media": sorted(set(media)),
             "language": language, "quality": quality}
+    if "authorization_ref" in request:
+        normalized["authorization_ref"] = request["authorization_ref"]
+    return normalized
 
 
 def operation_identity(request: dict[str, Any]) -> str:
@@ -250,6 +268,112 @@ def _record_outputs(config: WorkspaceConfig, record: dict[str, Any], item_id: st
         }
 
 
+def _intent(items: list[dict[str, Any]], normalized: dict[str, Any]) -> dict[str, Any]:
+    identities: dict[str, str] = {}
+    categories: set[str] = set()
+    requires_authorization = False
+    for item in items:
+        adapter_id, adapter = _adapter(item)
+        identity = _adapter_identity(adapter_id, adapter)
+        if identity is not None:
+            identities[str(item["id"])] = identity
+        category = getattr(adapter, "authorization_category", "user_authorized_media_source") if adapter else "user_authorized_media_source"
+        categories.add(str(category))
+        requires_authorization = requires_authorization or bool(getattr(adapter, "requires_authorization", False))
+    category_value = next(iter(categories)) if len(categories) == 1 else "+".join(sorted(categories))
+    return {
+        "capability_id": "media.acquire",
+        "capability_contract_version": CONTRACT_VERSION,
+        "adapter_identities": identities,
+        "authorization_category": category_value,
+        **({"authorization_ref": normalized["authorization_ref"]} if normalized.get("authorization_ref") else {}),
+        "source_id": normalized["source_id"],
+        "source_version": normalized["source_version"],
+        "effective_parameters": {key: normalized[key] for key in ("scope", "media", "language", "quality")},
+        "requires_authorization": requires_authorization,
+    }
+
+
+def _adapter_drift(record: dict[str, Any], items: list[dict[str, Any]]) -> list[str]:
+    expected = record.get("intent", {}).get("adapter_identities", {})
+    drift = []
+    for item in items:
+        adapter_id, adapter = _adapter(item)
+        actual = _adapter_identity(adapter_id, adapter)
+        item_id = str(item["id"])
+        if expected.get(item_id) != actual:
+            drift.append(item_id)
+    return drift
+
+
+def _persist_adapter_drift(config: WorkspaceConfig, path: Path, record: dict[str, Any],
+                           items: list[dict[str, Any]], *, next_type: str) -> dict[str, Any] | None:
+    drift = _adapter_drift(record, items)
+    if not drift:
+        return None
+    record["status"] = "uncertain"
+    record["diagnostics"] = ["pinned adapter identity is unavailable or changed for: " + ", ".join(drift)]
+    record["next_action"] = {
+        "type": next_type,
+        "reason": "restore an implementation for the pinned adapter identity; do not resubmit",
+        **({"operation_id": record["operation_id"]} if next_type == "reconcile" else {}),
+    }
+    atomic_write_json(path, record)
+    return _public(config, record)
+
+
+def _write_result_receipt(config: WorkspaceConfig, record: dict[str, Any], receipt_state: str) -> None:
+    assert config.results is not None
+    projected_attempts = list(record.get("attempts", []))
+    if isinstance(record.get("current_attempt"), dict):
+        projected_attempts.append(record["current_attempt"])
+    last_attempt = (projected_attempts or [{}])[-1]
+    receipt = {
+        "schema_version": 1,
+        "operation_id": record["operation_id"],
+        "status": record["status"],
+        "authoritative_revision": record["commit"]["revision"],
+        "authoritative_digest": record["commit"]["digest"],
+        "intent": {key: value for key, value in record["intent"].items() if key != "requires_authorization"},
+        "artifact_facts": record.get("artifact_facts", {}),
+        "attempts": [{key: attempt.get(key) for key in
+                      ("item_id", "media", "adapter_id", "idempotency_token", "query_handle", "result")}
+                     for attempt in projected_attempts],
+        "reconciliation": [{key: entry.get(key) for key in
+                            ("state", "adapter_id", "query_handle", "queried_at", "receipt") if entry.get(key) is not None}
+                           for entry in record.get("reconciliation", [])],
+        "receipt": {"state": receipt_state, "recorded_at": _now().isoformat(),
+                    "adapter_id": last_attempt.get("adapter_id"),
+                    "idempotency_token": last_attempt.get("idempotency_token"),
+                    "result": last_attempt.get("result")},
+    }
+    atomic_write_json(config.results / "operation-receipts" / f"{record['operation_id']}.json", receipt)
+
+
+def _authority_digest(record: dict[str, Any]) -> str:
+    authoritative = dict(record)
+    commit = dict(record.get("commit", {}))
+    commit.pop("digest", None)
+    authoritative["commit"] = commit
+    encoded = json.dumps(authoritative, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _commit_authority(path: Path, record: dict[str, Any]) -> None:
+    previous = record.get("commit", {}).get("revision", 0)
+    record["commit"] = {"revision": int(previous) + 1, "committed_at": _now().isoformat()}
+    record["commit"]["digest"] = _authority_digest(record)
+    atomic_write_json(path, record)
+
+
+def _project_receipt(config: WorkspaceConfig, record: dict[str, Any], state: str) -> str | None:
+    try:
+        _write_result_receipt(config, record, state)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
 def _public(config: WorkspaceConfig, record: dict[str, Any], reuse: str | None = None) -> dict[str, Any]:
     result = {"progress": record.get("progress", {}), "reuse": reuse,
               "source_id": record["request"]["source_id"], "source_version": record["request"]["source_version"]}
@@ -289,9 +413,34 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
         items, source = _catalog(config, normalized)
         if record is None:
             record = {"schema_version": 1, "operation_id": operation_id, "request": normalized,
-                      "status": "running", "artifacts": {}, "artifact_facts": {}, "progress": {}}
+                      "status": "prepared", "artifacts": {}, "artifact_facts": {}, "progress": {},
+                      "intent": _intent(items, normalized)}
+            atomic_write_json(path, record)
+        elif (record.get("status") == "awaiting_user" and normalized.get("authorization_ref")
+              and not record.get("intent", {}).get("authorization_ref")):
+            record["request"]["authorization_ref"] = normalized["authorization_ref"]
+            record["intent"]["authorization_ref"] = normalized["authorization_ref"]
+            record["diagnostics"] = []
+            record["next_action"] = None
+            atomic_write_json(path, record)
+        drift_response = _persist_adapter_drift(config, path, record, items, next_type="reconcile")
+        if drift_response is not None:
+            return drift_response
+        if record["intent"].get("requires_authorization") and not record["intent"].get("authorization_ref"):
+            record["status"] = "awaiting_user"
+            record["diagnostics"] = [f"{record['intent']['authorization_category']} requires a non-sensitive authorization_ref"]
+            record["next_action"] = {"type": "user", "reason": "provide an authorization reference; never place credentials in the request"}
+            atomic_write_json(path, record)
+            return _public(config, record)
         missing_any = any(_missing(config, record, str(item["id"]), normalized["media"]) for item in items)
         if record.get("status") == "completed" and not missing_any:
+            if record.get("commit", {}).get("digest") != _authority_digest(record):
+                record["status"] = "uncertain"
+                record["validation"] = {**record.get("validation", {}), "authoritative_record": "failed"}
+                record["diagnostics"] = ["completed operation authority digest is missing or invalid"]
+                record["next_action"] = {"type": "maintenance", "reason": "verify the authoritative operation record"}
+                return _public(config, record)
+            _project_receipt(config, record, "verified_authoritative_record")
             return _public(config, record, "verified_operation")
         record["status"] = "running"
         fencing = int(record.get("fencing", 0)) + 1
@@ -342,6 +491,14 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
                                     "capability_contract_version": CONTRACT_VERSION,
                                     "effective_parameters": {key: normalized[key] for key in ("scope", "media", "language", "quality")}}
             record.pop("lease", None)
+            if record["status"] == "completed":
+                _commit_authority(path, record)
+                projection_error = _project_receipt(config, record, "verified_adapter_result")
+                public = _public(config, record)
+                if projection_error:
+                    public["validation"] = {**public["validation"], "operation_receipt": "not_synced"}
+                    public["diagnostics"] = [f"operation receipt projection interrupted: {projection_error}"]
+                return public
             atomic_write_json(path, record)
             return _public(config, record)
         except Exception as exc:
@@ -370,6 +527,11 @@ def show_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]
             record["status"] = "recoverable_failure"
             record["validation"] = {**record.get("validation", {}), "artifacts": "failed"}
             record["next_action"] = {"type": "resume", "operation_id": operation_id}
+        elif record.get("commit", {}).get("digest") != _authority_digest(record):
+            record["status"] = "uncertain"
+            record["validation"] = {**record.get("validation", {}), "authoritative_record": "failed"}
+            record["diagnostics"] = ["completed operation authority digest is missing or invalid"]
+            record["next_action"] = {"type": "maintenance", "reason": "verify the authoritative operation record before trusting its receipt"}
     return _public(config, record)
 
 
@@ -419,6 +581,27 @@ def _check_adapter_result(config: WorkspaceConfig, record: dict[str, Any]) -> di
     return {"adapter_id": adapter_id, **result}
 
 
+def _safe_reconciliation(checked: dict[str, Any]) -> dict[str, Any]:
+    receipt = checked.get("receipt")
+    safe_receipt = None
+    if isinstance(receipt, dict):
+        facts = receipt.get("facts")
+        safe_receipt = {
+            key: receipt[key] for key in ("receipt_id", "ledger_digest")
+            if isinstance(receipt.get(key), str) and receipt[key]
+        }
+        if isinstance(facts, dict):
+            safe_receipt["facts"] = {
+                str(key): value for key, value in facts.items()
+                if isinstance(value, (str, int, float, bool)) or value is None
+            }
+    return {
+        "state": checked.get("state"), "adapter_id": checked.get("adapter_id"),
+        "query_handle": checked.get("query_handle"), "queried_at": _now().isoformat(),
+        **({"receipt": safe_receipt} if safe_receipt else {}),
+    }
+
+
 def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
     path = _path(config, operation_id)
     if not path.is_file():
@@ -427,6 +610,10 @@ def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str,
         if not acquired:
             record = read_json(path); record["status"] = "busy"; return _public(config, record)
         record = read_json(path)
+        items, _ = _catalog(config, record["request"])
+        drift_response = _persist_adapter_drift(config, path, record, items, next_type="user")
+        if drift_response is not None:
+            return drift_response
         try:
             checked = _check_adapter_result(config, record)
         except Exception as exc:
@@ -445,8 +632,7 @@ def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str,
             atomic_write_json(path, record)
             return _public(config, record)
         state = checked.get("state")
-        record.setdefault("reconciliation", []).append({key: value for key, value in checked.items()
-                                                         if key != "artifacts"})
+        record.setdefault("reconciliation", []).append(_safe_reconciliation(checked))
         if state in {"not_submitted", "retry_safe"}:
             record["status"] = "recoverable_failure"
             record["next_action"] = {"type": "resume", "operation_id": operation_id}
@@ -477,7 +663,10 @@ def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str,
             record["status"] = "uncertain"
             record["next_action"] = {"type": "reconcile", "operation_id": operation_id}
         record.pop("lease", None)
-        atomic_write_json(path, record)
+        # Reconciliation history is authoritative even when the effect is
+        # absent or still unknown, and must survive result-only backup.
+        _commit_authority(path, record)
+        _project_receipt(config, record, "reconciled_available" if record["status"] == "completed" else f"reconciled_{state}")
         return _public(config, record)
 
 
