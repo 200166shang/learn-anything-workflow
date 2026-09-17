@@ -1,6 +1,6 @@
 # ADR 0004: Direct pyVideoTrans Chinese listening capability
 
-Status: accepted
+Status: superseded by the mandarin-audio skill (2026-09-17)
 
 Schema-v5 Chinese listening audio is orchestrated by the public `extract-media` Skill, which directly invokes the ordinary pyVideoTrans project CLI. pyVideoTrans is not a Skill, and neither public Skill invokes another Skill.
 

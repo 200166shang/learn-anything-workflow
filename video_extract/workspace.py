@@ -51,6 +51,8 @@ class WorkspaceConfig:
     threads: Path
     concepts: Path
     review: Path
+    pyvideotrans_python: Path | None = None
+    pyvideotrans_cli: Path | None = None
 
     @classmethod
     def load(cls, path: Path, source: str = "explicit") -> "WorkspaceConfig":
@@ -69,15 +71,24 @@ class WorkspaceConfig:
         threads = _contained(vault / _required(obs, "threads"), vault, "threads")
         concepts = _contained(vault / _required(obs, "concepts"), vault, "concepts")
         review = _contained(vault / _required(obs, "review"), vault, "review")
+        tools = raw.get("tools", {})
+        pyvideotrans = tools.get("pyvideotrans", {}) if isinstance(tools, dict) else {}
+        pyvideotrans_python = _optional_tool_path(root, pyvideotrans, "python")
+        pyvideotrans_cli = _optional_tool_path(root, pyvideotrans, "cli")
         if generated == vault or any(generated == item or generated in item.parents for item in (threads, concepts, review, vault / "收件箱")):
             raise WorkspaceError("generated path overlaps a protected Vault boundary")
-        return cls(path, source, root, project, media, vault, generated, threads, concepts, review)
+        return cls(path, source, root, project, media, vault, generated, threads, concepts, review,
+                   pyvideotrans_python, pyvideotrans_cli)
 
     def as_dict(self) -> dict[str, Any]:
         return {"ok": True, "schema_version": SCHEMA_VERSION, "config_source": self.source,
                 "config": str(self.config_path), "root": str(self.root), "project": str(self.project),
                 "media": str(self.media), "obsidian": str(self.obsidian), "generated": str(self.generated),
-                "threads": str(self.threads), "concepts": str(self.concepts), "review": str(self.review)}
+                "threads": str(self.threads), "concepts": str(self.concepts), "review": str(self.review),
+                "tools": {"pyvideotrans": {
+                    "python": str(self.pyvideotrans_python) if self.pyvideotrans_python else None,
+                    "cli": str(self.pyvideotrans_cli) if self.pyvideotrans_cli else None,
+                }}}
 
 
 def _required(mapping: dict[str, Any], key: str) -> str:
@@ -85,6 +96,19 @@ def _required(mapping: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise WorkspaceError(f"missing required workspace setting: {key}")
     return value
+
+
+def _optional_tool_path(root: Path, mapping: Any, key: str) -> Path | None:
+    if not isinstance(mapping, dict):
+        return None
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise WorkspaceError(f"invalid optional workspace setting: tools.pyvideotrans.{key}")
+    path = Path(value).expanduser()
+    candidate = path if path.is_absolute() else root / path
+    return Path(os.path.abspath(candidate))
 
 
 def discover_workspace(explicit: Path | None = None, cwd: Path | None = None, env: dict[str, str] | None = None,
@@ -122,7 +146,7 @@ def _broken_images(root: Path) -> list[str]:
 def _old_path_refs(config: WorkspaceConfig) -> dict[str, list[str]]:
     needles = ("/Users/syz/Media/video-extract", "/Users/syz/code/obsidian_本地知识库", "/Users/syz/code/video-extract-core")
     groups = {"live": [], "historical": []}
-    roots = [config.project, Path.home() / ".agents/skills/video-learning"]
+    roots = [config.project, Path.home() / ".agents/skills/extract-media", Path.home() / ".agents/skills/source-notes", Path.home() / ".agents/skills/mandarin-audio"]
     for root in roots:
         if not root.exists(): continue
         for path in root.rglob("*"):
@@ -146,10 +170,16 @@ def doctor(config: WorkspaceConfig) -> dict[str, Any]:
     marker_ok = marker.is_file() if config.generated.exists() else True
     protected = {name: str(path) for name, path in (("threads", config.threads), ("concepts", config.concepts), ("review", config.review), ("inbox", config.obsidian / "收件箱"))}
     refs = _old_path_refs(config)
+    podcast = {
+        "configured": bool(config.pyvideotrans_python and config.pyvideotrans_cli),
+        "python_exists": bool(config.pyvideotrans_python and config.pyvideotrans_python.is_file()),
+        "cli_exists": bool(config.pyvideotrans_cli and config.pyvideotrans_cli.is_file()),
+    }
+    podcast["available"] = podcast["configured"] and podcast["python_exists"] and podcast["cli_exists"]
     result = {"ok": packages.get("counts", {}).get("migration_regression", 0) == 0 and library.get("missing_paths", 0) == 0 and playback.get("ok", False) and not broken_images and marker_ok,
               "workspace": config.as_dict(), "packages": packages.get("counts", {}), "library": library,
               "playback": playback, "obsidian": {"managed_marker": marker_ok, "broken_images": len(broken_images), "broken_image_details": broken_images, "protected": protected},
-              "old_path_references": refs, "migration_regression": packages.get("counts", {}).get("migration_regression", 0)}
+              "podcast_capability": podcast, "old_path_references": refs, "migration_regression": packages.get("counts", {}).get("migration_regression", 0)}
     return result
 
 

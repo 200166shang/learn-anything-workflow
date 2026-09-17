@@ -253,8 +253,12 @@ def _localized_script(package: Path, manifest: dict[str, Any]) -> list[str]:
 
 def _notes_goal(package: Path, manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    source_kind = manifest.get("source_kind") or "video"
     transcript = _artifact(package, manifest, "transcript_srt")
-    if not _file(transcript): errors.append("transcript SRT is required")
+    document = _artifact(package, manifest, "source_document")
+    if source_kind == "document":
+        if not _file(document): errors.append("source document is required")
+    elif not _file(transcript): errors.append("transcript SRT is required")
     elif not SRT_TIME.search(transcript.read_text(encoding="utf-8-sig")): errors.append("transcript SRT has no valid timed cue")
     approved_path = _artifact(package, manifest, "approved_json"); approved = None
     if not _file(approved_path): errors.append("approved visual evidence is required")
@@ -275,7 +279,9 @@ def _notes_goal(package: Path, manifest: dict[str, Any]) -> list[str]:
     else:
         text = notes.read_text(encoding="utf-8")
         if not re.search(r"[\u3400-\u9fff]", text): errors.append("notes contain no Chinese text")
-        if not TIMESTAMP.search(text): errors.append("notes contain no timestamp evidence")
+        if source_kind == "document":
+            if not re.search(r"(?:^|\n)#{1,6}\s|(?:章节|段落|来源)[:：#]", text): errors.append("document notes contain no heading or paragraph source locator")
+        elif not TIMESTAMP.search(text): errors.append("notes contain no timestamp evidence")
         errors.extend(_resolve_markdown_links(notes, package))
         for entry in (approved or {}).get("approved", []):
             name = Path(entry.get("image", "")).name
@@ -319,8 +325,9 @@ def validate_media_request(package: Path) -> dict[str, Any]:
     request = manifest.get("request", {}); kinds = request.get("kinds", []); language = request.get("language", "original")
     if manifest.get("schema_version") != 5: errors.append("media request requires schema v5")
     for kind, artifact, stream in (("video", "source_video", "v"), ("audio", "source_audio", "a")):
-        if kind in kinds and not (kind == "audio" and str(language).startswith("zh")):
-            if not _media(_artifact(package, manifest, artifact), stream): errors.append(f"{kind} artifact is not ffprobe-readable")
+        if kind in kinds:
+            unavailable = manifest.get("results", {}).get(kind, {}).get("available") is False
+            if not unavailable and not _media(_artifact(package, manifest, artifact), stream): errors.append(f"{kind} artifact is not ffprobe-readable")
     if "subtitles" in kinds and not manifest.get("results", {}).get("subtitles", {}).get("available") is False:
         path = _artifact(package, manifest, "source_subtitle")
         if not _file(path) or not SRT_TIME.search(path.read_text(encoding="utf-8-sig")): errors.append("subtitle has no valid timed cue")
@@ -369,4 +376,3 @@ def validate_media_package_state(package: Path) -> dict[str, Any]:
     else:
         errors.append(f"unsupported media pause status: {pause.get('status')}")
     return {"ok": not errors, "complete": False, "state": pause.get("status"), "package": str(package), "schema_version": manifest.get("schema_version"), "request": request, "pause": pause, "errors": errors}
-

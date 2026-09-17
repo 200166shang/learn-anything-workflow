@@ -36,22 +36,21 @@ class MediaRequestV5Tests(unittest.TestCase):
                 actual = {x["name"] for x in build_media_plan(self.inventory, normalize_media_request(output))["planned_stages"]}
                 self.assertEqual(actual, stages)
 
-    def test_chinese_audio_uses_native_or_external_pyvideotrans(self):
+    def test_chinese_audio_only_uses_an_existing_native_track(self):
         request = normalize_media_request("audio", "zh-CN")
         foreign = [x["name"] for x in build_media_plan(self.inventory, request)["planned_stages"]]
-        self.assertEqual(foreign, ["resolve_source", "materialize_source_audio"])
+        self.assertEqual(foreign, ["resolve_source"])
         plan = build_media_plan(self.inventory, request)
-        self.assertEqual(plan["mandarin_audio"], {"mode": "external_pyvideotrans", "source_language": "en", "input_artifact": "media/audio.source.m4a"})
-        self.assertEqual(build_media_plan(self.inventory, request)["selected_audio"]["language"], "en")
+        self.assertEqual(plan["audio"]["reason"], "missing_requested_language_track")
         native_inventory = MediaInventory("youtube", "x", "x", 1, (MediaStream("zh", "audio", "zh-Hans", url="z"),))
         native = [x["name"] for x in build_media_plan(native_inventory, request)["planned_stages"]]
-        self.assertEqual(native, ["resolve_source", "normalize_native_chinese_audio"])
+        self.assertEqual(native, ["resolve_source", "materialize_requested_audio"])
 
     def test_non_english_chinese_audio_is_unsupported(self):
         inventory = MediaInventory("youtube", "pt", "pt", 1, (MediaStream("pt", "audio", "pt-BR", url="a"),), original_language="pt-BR")
         plan = build_media_plan(inventory, normalize_media_request("audio", "zh-CN"))
         self.assertEqual([x["name"] for x in plan["planned_stages"]], ["resolve_source"])
-        self.assertEqual(plan["mandarin_audio"]["mode"], "unsupported")
+        self.assertEqual(plan["audio"]["reason"], "missing_requested_language_track")
 
     def test_both_workflows_resolve_same_canonical_item(self):
         with tempfile.TemporaryDirectory() as raw:

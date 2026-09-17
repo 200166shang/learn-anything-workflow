@@ -72,31 +72,25 @@ def build_media_plan(inventory: MediaInventory, request: MediaRequest, existing:
     wants_video = MediaKind.VIDEO in request.kinds
     wants_audio = MediaKind.AUDIO in request.kinds
     wants_subtitles = MediaKind.SUBTITLES in request.kinds
-    native = select_audio_stream(inventory, request.quality, "zh") if request.language.casefold().startswith("zh") else None
+    requested_chinese = request.language.casefold().startswith("zh")
+    native = select_audio_stream(inventory, request.quality, "zh") if requested_chinese else None
     source_audio = select_audio_stream(inventory, request.quality)
     if wants_video: add("materialize_source_video", "source_video_ready", "requested video")
     if wants_audio:
-        if native: add("normalize_native_chinese_audio", "localized_audio_ready", "native Chinese audio satisfies request")
-        elif request.language.casefold().startswith("zh"):
-            source_language = inventory.original_language or (source_audio.language if source_audio else None) or next((x.language for x in inventory.audio_streams if x.language), None)
-            if source_language and source_language.casefold().replace("_", "-").split("-")[0] == "en":
-                add("materialize_source_audio", "source_audio_ready", "provide original English audio to external pyVideoTrans")
-        else:
+        if native:
+            add("materialize_requested_audio", "source_audio_ready", "requested Chinese audio track")
+        elif not requested_chinese:
             add("materialize_source_audio", "source_audio_ready", "requested original audio")
     if wants_subtitles: add("materialize_best_subtitle", "source_subtitle_ready", "best official subtitle, or explicit unavailable result")
-    mandarin_audio = None
-    if wants_audio and request.language.casefold().startswith("zh"):
-        source_language = inventory.original_language or (source_audio.language if source_audio else None) or next((x.language for x in inventory.audio_streams if x.language), None) or "unknown"
-        if native:
-            mandarin_audio = {"mode": "native_chinese", "source_language": native.language}
-        elif source_language.casefold().replace("_", "-").split("-")[0] == "en":
-            mandarin_audio = {"mode": "external_pyvideotrans", "source_language": source_language,
-                              "input_artifact": "media/audio.source.m4a"}
-        else:
-            mandarin_audio = {"mode": "unsupported", "source_language": source_language,
-                              "reason": "Chinese listening audio currently supports English source audio only"}
+    audio_result = None
+    if wants_audio:
+        selected = native if requested_chinese else source_audio
+        source_language = inventory.original_language or (source_audio.language if source_audio else None) or "unknown"
+        audio_result = ({"available": True, "language": selected.language, "stream_id": selected.id}
+                        if selected else {"available": False, "reason": "missing_requested_language_track",
+                                          "requested_language": request.language, "source_language": source_language})
     return {"schema_version": 5, "platform": inventory.platform, "identity": inventory.identity,
             "request": request.to_dict(), "planned_stages": [asdict(x) for x in stages],
             "selected_audio": ({"id": source_audio.id, "language": source_audio.language} if source_audio and not native else None),
-            "mandarin_audio": mandarin_audio,
+            "audio": audio_result,
             "blockers": ["persistent browser authorization is required"] if inventory.authorization_context == "persistent_browser_required" else []}

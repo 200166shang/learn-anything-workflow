@@ -8,6 +8,7 @@ from .media import MediaMaterializer, resolve_inventory, select_audio_stream
 from .media_request import MediaRequest
 from .package_paths import canonical_package
 from .planner import build_media_plan
+from .package_lock import package_lock
 
 def plan(source: str, request: MediaRequest, package: Path | None = None):
     inventory = resolve_inventory(source); result = build_media_plan(inventory, request)
@@ -15,9 +16,15 @@ def plan(source: str, request: MediaRequest, package: Path | None = None):
     # performs no writes. Ensure resolves the canonical destination before writing.
     result["package"] = str(package) if package else None; return result
 
-def ensure(source: str, request: MediaRequest, package: Path | None = None):
+def ensure(source: str, request: MediaRequest, package: Path | None = None, media_root: Path | None = None):
     inventory = resolve_inventory(source, allow_browser=True)
-    package = (package or canonical_package(inventory)).expanduser().resolve(); package.mkdir(parents=True, exist_ok=True)
+    package = (package or canonical_package(inventory, media_root)).expanduser().resolve()
+    with package_lock(package):
+        return _ensure_locked(source, request, inventory, package)
+
+
+def _ensure_locked(source: str, request: MediaRequest, inventory, package: Path):
+    package.mkdir(parents=True, exist_ok=True)
     manifest_path = package / "manifest.json"; data = read_json(manifest_path) if manifest_path.exists() else {}
     data.update({"schema_version":5,"platform":inventory.platform,"identity":inventory.identity,"title":inventory.title,
       "source_url":sanitize(source),"request":{"type":"media",**request.to_dict()},"artifacts":data.get("artifacts",{}),
@@ -49,24 +56,23 @@ def ensure(source: str, request: MediaRequest, package: Path | None = None):
                 target=package/"subtitles"/f"source.{track.language}.srt"; materializer.subtitle_from_url(track,target)
                 _record(data,"source_subtitle",target,package,{"track_id":track.id,"language":track.language,"automatic":track.automatic},started)
             else: data.setdefault("results",{})["subtitles"]={"available":False,"reason":"platform reported no subtitle track"}
-        elif name=="normalize_native_chinese_audio":
-            stream=select_audio_stream(inventory,request.quality,"zh"); target=package/V5_ARTIFACTS["localized_audio"]
+        elif name=="materialize_requested_audio":
+            stream=select_audio_stream(inventory,request.quality,"zh"); target=package/V5_ARTIFACTS["source_audio"]
             materializer.audio_from_url(
                 inventory.source if inventory.platform=="youtube" else stream,
                 target,
                 format_id=stream.id if inventory.platform=="youtube" else None,
             )
-            _record(data,"localized_audio",target,package,{"kind":"native_chinese_track","language":stream.language,"stream_id":stream.id},started)
-    mode=(planned.get("mandarin_audio") or {}).get("mode")
-    if mode=="external_pyvideotrans":
-        data["pause"]={"status":"awaiting_external","capability":"pyvideotrans_podcast","input_artifact":V5_ARTIFACTS["source_audio"],"message":"Run pyVideoTrans podcast mode through the extract-media workflow."}; atomic_write_json(manifest_path,data)
-        return {"status":"awaiting_external","package":str(package),"mandarin_audio":planned["mandarin_audio"],"blocker":data["pause"]["message"]}
-    if mode=="unsupported":
-        data["pause"]={"status":"unsupported",**planned["mandarin_audio"]}; atomic_write_json(manifest_path,data)
-        return {"status":"unsupported","package":str(package),"mandarin_audio":planned["mandarin_audio"],"blocker":planned["mandarin_audio"]["reason"]}
+            _record(data,"source_audio",target,package,{"kind":"native_chinese_track","language":stream.language,"stream_id":stream.id},started)
+    if planned.get("audio") and not planned["audio"].get("available"):
+        data.setdefault("results", {})["audio"] = planned["audio"]
+    elif planned.get("audio"):
+        data.setdefault("results", {})["audio"] = planned["audio"]
     data.pop("pause",None); atomic_write_json(manifest_path,data)
     from .validate import validate_media_request
-    checked=validate_media_request(package); return {"status":"complete" if checked["ok"] else "failed","package":str(package),"validation":checked}
+    checked=validate_media_request(package)
+    unavailable = [kind for kind, result in data.get("results", {}).items() if result.get("available") is False]
+    return {"status":"complete" if checked["ok"] else "failed","package":str(package),"validation":checked,"unavailable":unavailable}
 
 def _record(data,key,path,package,provenance,started):
     data["artifacts"][key]=path.resolve().relative_to(package).as_posix(); data["provenance"][key]=provenance

@@ -22,7 +22,7 @@ PTS_RE = re.compile(r"pts_time:(?P<value>\d+(?:\.\d+)?)")
 ANCHOR_RE = re.compile(
     r"看这里|看一下|可以看到|如图|这张图|这段代码|代码|流程|参数|配置|终端|命令|函数|公式|注意|坐标|数据结构|解析"
 )
-DEFAULT_NOTE_TEMPLATE = Path("/Users/syz/.agents/skills/video-learning/assets/note-template.md")
+DEFAULT_NOTE_TEMPLATE = Path("/Users/syz/.agents/skills/source-notes/assets/note-template.md")
 
 
 @dataclass
@@ -56,7 +56,7 @@ def load_note_template() -> str:
         template = path.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise RuntimeError(
-            f"无法读取笔记模板：{path}。请恢复 video-learning skill 的 assets/note-template.md，"
+            f"无法读取笔记模板：{path}。请恢复 source-notes skill 的 assets/note-template.md，"
             "或设置 VIDEO_LEARNING_NOTE_TEMPLATE。"
         ) from exc
     if not template:

@@ -127,14 +127,11 @@ class EnsureEndToEndTests(unittest.TestCase):
         planned = plan("https://youtube.invalid/native", normalize_request(["podcast_zh"]), package, lambda _: inventory)
         self.assertNotIn("normalize_native_chinese_audio", [stage["name"] for stage in planned["planned_stages"]])
 
-    def test_native_podcast_completes_through_cli_seam(self):
-        inventory = MediaInventory("youtube", "cli-native", "CLI Native", 1, (MediaStream("zh", "audio", "zh-CN", url="audio"),))
-        package = self.root / "cli-native"; deps = self.dependencies(inventory); output = io.StringIO()
-        def injected(source, destination, request): return ensure(source, destination, request, deps)
-        argv = ["video-extract", "ensure", "https://youtube.invalid/cli-native", "--goal", "podcast_zh", "--output", str(package), "--json"]
-        with patch("video_extract.cli.ensure_goals", side_effect=injected), patch("sys.argv", argv), contextlib.redirect_stdout(output):
-            self.assertEqual(main(), 0)
-        self.assertEqual(json.loads(output.getvalue())["status"], "complete")
+    def test_goal_workflow_remains_internal_after_public_cli_removal(self):
+        inventory = MediaInventory("youtube", "internal-native", "Internal Native", 1, (MediaStream("zh", "audio", "zh-CN", url="audio"),))
+        package = self.root / "internal-native"
+        result = ensure("https://youtube.invalid/internal-native", package, normalize_request(["podcast_zh"]), self.dependencies(inventory))
+        self.assertEqual(result["status"], "complete")
 
     def test_existing_capabilities_rejects_escaping_artifact_paths(self):
         package = self.root / "unsafe"; package.mkdir()

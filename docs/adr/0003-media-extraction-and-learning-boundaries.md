@@ -1,6 +1,6 @@
 # Separate media extraction from evidence-backed learning
 
-**Status: accepted; supersedes ADR 0002 for new public workflows**
+**Status: superseded by the source-notes and mandarin-audio split (2026-09-17)**
 
 New work exposes `extract-media` for video, audio, subtitles, and standard media packages, while `video-learning` produces only Chinese evidence-backed notes. Both resolve a source to one canonical schema-v5 media package; audio localization is an internal, resumable project capability rather than a public Skill or a Skill-to-Skill call. This keeps large durable media in the canonical library and treats Obsidian as an export target for notes and adopted images only, while schema v1–v4 packages and the `podcast_zh` alias remain non-destructively compatible.
 

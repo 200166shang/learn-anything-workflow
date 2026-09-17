@@ -10,3 +10,8 @@ generated = "资料库/网站视频转录"
 threads = "threads"
 concepts = "concepts"
 review = "REVIEW.md"
+
+# Optional. Only mandarin-audio requires these machine-local paths.
+[tools.pyvideotrans]
+python = "/absolute/path/to/pyvideotrans/.venv/bin/python"
+cli = "/absolute/path/to/pyvideotrans-runtime/cli.py"

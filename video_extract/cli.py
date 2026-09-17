@@ -13,10 +13,9 @@ from typing import Any
 
 from .contracts import SCHEMA_VERSION
 from .manifest import atomic_write_json, fingerprint, read_json, relative_path, sanitize
-from .goals import normalize_request
 from .media_request import normalize_media_request
 from . import media_workflow
-from .orchestrator import ensure as ensure_goals, existing_capabilities, plan as plan_goals
+from .orchestrator import existing_capabilities
 from .playlists import build_playback_views, build_xiaoe_playback_views, verify_playback
 from .validate import validate, validate_goals, validate_media_request
 from .workspace import discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
@@ -93,23 +92,31 @@ def cmd_status(args: argparse.Namespace) -> int:
     emit(result, args.json); return 0
 
 
-def _request(args: argparse.Namespace):
-    return normalize_request(args.goal, args.keep_video, args.audio_quality, args.video_quality, args.voice)
-
-
 def cmd_plan(args: argparse.Namespace) -> int:
-    if args.media:
-        result = media_workflow.plan(args.source, normalize_media_request(args.media, args.language, args.quality), args.output)
-    else:
-        result = plan_goals(args.source, _request(args), args.output)
+    result = media_workflow.plan(args.source, normalize_media_request(args.media, args.language, args.quality), args.output)
     emit(result, args.json); return 0 if not result.get("blockers") else 1
 
 
 def cmd_ensure(args: argparse.Namespace) -> int:
-    if args.media: result = media_workflow.ensure(args.source, normalize_media_request(args.media, args.language, args.quality), args.output)
-    else: result = ensure_goals(args.source, args.output, _request(args))
+    workspace = discover_workspace(args.workspace)
+    result = media_workflow.ensure(args.source, normalize_media_request(args.media, args.language, args.quality), args.output, workspace.media)
     emit(result, args.json)
-    return 0 if result.get("status") in {"complete", "awaiting_ai", "awaiting_external"} else 1
+    return 0 if result.get("status") == "complete" else 1
+
+
+def cmd_source(args: argparse.Namespace) -> int:
+    from .source_import import import_source
+    result = import_source(args.input, discover_workspace(args.workspace), args.package, args.title)
+    emit(result, args.json)
+    return 0 if result.get("status") == "ready" else 1
+
+
+def cmd_notes(args: argparse.Namespace) -> int:
+    from .notes_workflow import finalize, prepare
+    workspace = discover_workspace(args.workspace)
+    result = prepare(args.package, workspace) if args.notes_action == "prepare" else finalize(args.package, workspace)
+    emit(result, args.json)
+    return 0 if result.get("status") in {"ready", "complete", "awaiting_ai"} else 1
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -144,7 +151,7 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         return run_legacy("prefetch_bilibili.py", forwarded, args.json)
     from convert_voice_to_article import capture_media, download_video
     started = time.monotonic(); output = args.output.expanduser().resolve(); source_dir = output / "source"; source_dir.mkdir(parents=True, exist_ok=True)
-    captured = capture_media(args.source, args.session_dir, args.wait_seconds or 30, args.headless)
+    captured = capture_media(args.source, args.session_dir, args.wait_seconds or 30, args.headless, getattr(args, "cdp_url", None))
     if not captured:
         emit({"ok": False, "error": "No authorized media request was captured; retry visibly after login and playback."}, args.json); return 1
     downloaded = download_video(captured[0], source_dir); canonical = source_dir / "source.mp4"
@@ -154,6 +161,20 @@ def cmd_acquire(args: argparse.Namespace) -> int:
     atomic_write_json(output / "manifest.json", {"schema_version": SCHEMA_VERSION, "platform": "xiaoe", "identity": identity, "title": captured[0].title, "artifacts": {"video": "source/source.mp4", "metadata": "source/metadata.json"}, "stages": {"media_ready": {"duration_ms": round((time.monotonic()-started)*1000), "input_fingerprint": identity, "parameters": {}, "cache_hit": False, "result": "passed"}}})
     checked = validate(output); ok = "media_ready" in checked.passed
     emit({"ok": ok, "package": str(output), "validation": checked.to_dict()}, args.json); return 0 if ok else 1
+
+
+def cmd_xiaoe(args: argparse.Namespace) -> int:
+    from .xiaoe_download import download, login, parse_chapters, status
+
+    config = discover_workspace(args.workspace)
+    if args.xiaoe_action == "login":
+        result = login(config, args.course_url, args.wait_seconds)
+    elif args.xiaoe_action == "download":
+        result = download(config, args.course_url, parse_chapters(args.chapters), args.wait_seconds, args.visible)
+    else:
+        result = status(config, args.course_url)
+    emit(result, args.json)
+    return 0 if result.get("ok") else 1
 
 
 def cmd_transcribe(args: argparse.Namespace) -> int:
@@ -320,21 +341,31 @@ def parser() -> argparse.ArgumentParser:
     for name, func in (("verify", cmd_verify), ("status", cmd_status)):
         p = commands.add_parser(name, help=f"{name} package state from actual artifacts"); p.add_argument("path", type=Path); p.add_argument("--catalog", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=func)
         if name == "verify": p.add_argument("--goal", action="append", choices=("podcast_zh", "notes_zh"))
-    def goal_arguments(p: argparse.ArgumentParser) -> None:
-        group = p.add_mutually_exclusive_group(required=True)
-        group.add_argument("--goal", action="append", choices=("podcast_zh", "notes_zh"))
-        group.add_argument("--media", choices=("video", "audio", "subtitles", "all"))
+    def media_arguments(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--media", choices=("video", "audio", "subtitles", "all"), default="all")
         p.add_argument("--language", default="original")
         p.add_argument("--quality", choices=("standard", "balanced", "high"), default="high")
-        p.add_argument("--keep-video", choices=("auto", "yes", "no"), default="auto")
-        p.add_argument("--audio-quality", choices=("standard", "high"), default="high")
-        p.add_argument("--video-quality", type=int)
-        p.add_argument("--voice", default="Tingting")
+        p.add_argument("--workspace", type=Path)
         p.add_argument("--json", action="store_true")
-    planning = commands.add_parser("plan", help="read-only goal plan from normalized source inventory"); planning.add_argument("source"); planning.add_argument("--output", type=Path, help="existing package whose validated artifacts may be reused"); goal_arguments(planning); planning.set_defaults(func=cmd_plan)
-    ensuring = commands.add_parser("ensure", help="advance deterministic work until complete or an explicit AI pause"); ensuring.add_argument("source"); ensuring.add_argument("--output", type=Path); goal_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
+    planning = commands.add_parser("plan", help="read-only media extraction plan"); planning.add_argument("source"); planning.add_argument("--output", type=Path, help="existing package whose validated artifacts may be reused"); media_arguments(planning); planning.set_defaults(func=cmd_plan)
+    ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
+    source = commands.add_parser("source", help="import local source material into a managed package")
+    source_actions = source.add_subparsers(dest="source_action", required=True)
+    source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
+    notes = commands.add_parser("notes", help="prepare or finalize source-grounded notes")
+    notes_actions = notes.add_subparsers(dest="notes_action", required=True)
+    for action in ("prepare", "finalize"):
+        p = notes_actions.add_parser(action); p.add_argument("package", type=Path); p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
     scan = commands.add_parser("scan", help="scan a homogeneous collection inventory"); scan.add_argument("source"); scan.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); scan.add_argument("--output", type=Path, required=True); scan.add_argument("--visible", action="store_true"); scan.add_argument("--wait-seconds", type=int); scan.add_argument("--json", action="store_true"); scan.set_defaults(func=cmd_scan)
-    acquire = commands.add_parser("acquire", help="acquire authorized media for one platform scope"); acquire.add_argument("source", nargs="?", default=""); acquire.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); acquire.add_argument("--urls-file", type=Path); acquire.add_argument("--output", type=Path, required=True); acquire.add_argument("--media", choices=("video", "audio", "both"), default="video"); acquire.add_argument("--quality", type=int); acquire.add_argument("--workers", type=int); acquire.add_argument("--session-dir", type=Path, default=Path("work/browser_session")); acquire.add_argument("--wait-seconds", type=int); acquire.add_argument("--headless", action="store_true"); acquire.add_argument("--json", action="store_true"); acquire.set_defaults(func=cmd_acquire)
+    acquire = commands.add_parser("acquire", help="acquire authorized media for one platform scope"); acquire.add_argument("source", nargs="?", default=""); acquire.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); acquire.add_argument("--urls-file", type=Path); acquire.add_argument("--output", type=Path, required=True); acquire.add_argument("--media", choices=("video", "audio", "both"), default="video"); acquire.add_argument("--quality", type=int); acquire.add_argument("--workers", type=int); acquire.add_argument("--session-dir", type=Path, default=Path("work/browser_session")); acquire.add_argument("--wait-seconds", type=int); acquire.add_argument("--headless", action="store_true"); acquire.add_argument("--cdp-url", help="连接已打开的 Chrome CDP 地址"); acquire.add_argument("--json", action="store_true"); acquire.set_defaults(func=cmd_acquire)
+    xiaoe = commands.add_parser("xiaoe", help="persistent, resumable Xiaoe course downloads")
+    xiaoe_actions = xiaoe.add_subparsers(dest="xiaoe_action", required=True)
+    xiaoe_login = xiaoe_actions.add_parser("login", help="authorize the persistent Xiaoe download profile once")
+    xiaoe_login.add_argument("course_url"); xiaoe_login.add_argument("--wait-seconds", type=int, default=300); xiaoe_login.add_argument("--workspace", type=Path); xiaoe_login.add_argument("--json", action="store_true"); xiaoe_login.set_defaults(func=cmd_xiaoe)
+    xiaoe_download = xiaoe_actions.add_parser("download", help="download selected course chapters with resume")
+    xiaoe_download.add_argument("course_url"); xiaoe_download.add_argument("--chapters", required=True, help="comma-separated numbers or ranges, e.g. 17,18,19 or 17-19"); xiaoe_download.add_argument("--wait-seconds", type=int, default=12); xiaoe_download.add_argument("--visible", action="store_true"); xiaoe_download.add_argument("--workspace", type=Path); xiaoe_download.add_argument("--json", action="store_true"); xiaoe_download.set_defaults(func=cmd_xiaoe)
+    xiaoe_status = xiaoe_actions.add_parser("status", help="show resumable Xiaoe download status")
+    xiaoe_status.add_argument("course_url"); xiaoe_status.add_argument("--workspace", type=Path); xiaoe_status.add_argument("--json", action="store_true"); xiaoe_status.set_defaults(func=cmd_xiaoe)
     transcribe = commands.add_parser("transcribe", help="reuse formal subtitles or transcribe media"); transcribe.add_argument("--video", type=Path); transcribe.add_argument("--catalog", type=Path); transcribe.add_argument("--output", type=Path, required=True); transcribe.add_argument("--section"); transcribe.add_argument("--limit", type=int); transcribe.add_argument("--workers", type=int); transcribe.add_argument("--model", default="small"); transcribe.add_argument("--language", default="zh"); transcribe.add_argument("--task", choices=("transcribe", "translate"), default="transcribe"); transcribe.add_argument("--visible", action="store_true"); transcribe.add_argument("--json", action="store_true"); transcribe.set_defaults(func=cmd_transcribe)
     prep = commands.add_parser("prepare-evidence", help="prepare reusable low-resolution evidence candidates"); prep.add_argument("--video", type=Path, required=True); prep.add_argument("--transcript", type=Path); prep.add_argument("--output", type=Path, required=True); prep.add_argument("--review-json", type=Path); prep.add_argument("--interval", type=float, default=15); prep.add_argument("--scene-threshold", type=float, default=.30); prep.add_argument("--max-candidates", type=int, default=40); prep.add_argument("--no-ocr", action="store_true"); prep.add_argument("--json", action="store_true"); prep.set_defaults(func=cmd_prepare)
     return root

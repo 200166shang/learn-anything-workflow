@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .manifest import read_json
-from .validate import validate, validate_media_package_state
+from .validate import validate, validate_goals, validate_media_package_state
 
 
 SCHEMA = """
@@ -65,7 +65,7 @@ def _srt_chunks(text: str) -> list[tuple[float, float, str]]:
 
 def _sources(package: Path, manifest: dict[str, Any]) -> list[Path]:
     artifacts = manifest.get("artifacts", {})
-    paths = [path for key in ("notes", "transcript_srt", "source_subtitle") if (path := package / str(artifacts.get(key, ""))).is_file()]
+    paths = [path for key in ("notes", "transcript_srt", "source_subtitle", "source_document") if (path := package / str(artifacts.get(key, ""))).is_file()]
     paths.extend(path for path in package.glob("pyvideotrans-full/sts/*zh-cn.complete.srt") if path.is_file())
     return list(dict.fromkeys(paths))
 
@@ -82,6 +82,8 @@ def _index(connection: sqlite3.Connection, package: Path) -> None:
     connection.execute("DELETE FROM documents WHERE item_id=?", (item_id,)); connection.execute("DELETE FROM items WHERE item_id=?", (item_id,))
     if manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "media":
         checked = validate_media_package_state(package); validation_status = "valid_complete" if checked.get("ok") and checked.get("complete") else "valid_partial" if checked.get("ok") else "preexisting_invalid"
+    elif manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "source":
+        checked = validate_goals(package, ["notes_zh"]); validation_status = "valid_complete" if checked.get("ok") else "valid_partial"
     else:
         checked = validate(package).to_dict(); validation_status = "legacy_preserved_invalid" if checked.get("invalid") else "valid_complete" if checked.get("observed_gate") in {"notes_complete", "summary_complete"} else "valid_partial"
     export_manifest = package / "export-manifest.json"; exported = read_json(export_manifest).get("note") if export_manifest.is_file() else manifest.get("obsidian_path")
@@ -94,6 +96,11 @@ def _index(connection: sqlite3.Connection, package: Path) -> None:
         source_hash = _hash(transcript)
         for index, (start, end, body) in enumerate(_srt_chunks(transcript.read_text(encoding="utf-8-sig"))):
             connection.execute("INSERT INTO documents VALUES(?,?,?,?,?,?,?,?,?,?)", (f"{item_id}:transcript:{index}", item_id, "transcript", manifest.get("title"), "", start, end, body, str(transcript), source_hash))
+    document = package / str(artifacts.get("source_document", ""))
+    if document.is_file():
+        source_hash = _hash(document)
+        for index, (heading, body) in enumerate(_note_chunks(document.read_text(encoding="utf-8-sig"))):
+            connection.execute("INSERT INTO documents VALUES(?,?,?,?,?,?,?,?,?,?)", (f"{item_id}:source:{index}", item_id, "source", manifest.get("title"), heading, None, None, body, str(document), source_hash))
     for extra in (path for path in _sources(package, manifest) if path.suffix.lower() == ".srt" and path != transcript):
         source_hash = _hash(extra)
         for index, (start, end, body) in enumerate(_srt_chunks(extra.read_text(encoding="utf-8-sig"))):

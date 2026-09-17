@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import os
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
@@ -75,7 +76,7 @@ def media_score(url: str) -> int:
     return score
 
 
-def capture_media(url: str, session_dir: Path, wait_seconds: int, headless: bool) -> list[MediaCandidate]:
+def capture_media(url: str, session_dir: Path, wait_seconds: int, headless: bool, cdp_url: str | None = None) -> list[MediaCandidate]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -85,14 +86,21 @@ def capture_media(url: str, session_dir: Path, wait_seconds: int, headless: bool
     fallback_title = Path(urlparse(url).path).name or "xet_video"
 
     with sync_playwright() as playwright:
-        session_dir.mkdir(parents=True, exist_ok=True)
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(session_dir),
-            headless=headless,
-            args=["--no-sandbox"],
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.pages[0] if context.pages else context.new_page()
+        cdp_url = cdp_url or os.environ.get("VIDEO_EXTRACT_CDP_URL")
+        attached = bool(cdp_url)
+        if attached:
+            browser = playwright.chromium.connect_over_cdp(cdp_url)
+            context = browser.contexts[0] if browser.contexts else browser.new_context(viewport={"width": 1280, "height": 800})
+        else:
+            session_dir.mkdir(parents=True, exist_ok=True)
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(session_dir),
+                headless=headless,
+                args=["--no-sandbox"],
+                viewport={"width": 1280, "height": 800},
+            )
+        page = next((p for p in context.pages if "xet." in p.url or "xiaoe" in p.url), None)
+        page = page or (context.pages[0] if context.pages else context.new_page())
 
         def on_request(request) -> None:
             request_url = request.url
@@ -132,7 +140,8 @@ def capture_media(url: str, session_dir: Path, wait_seconds: int, headless: bool
                 except Exception:
                     page.wait_for_timeout(1000)
         finally:
-            context.close()
+            if not attached:
+                context.close()
 
     return sorted(candidates.values(), key=lambda item: item.score, reverse=True)
 
@@ -397,6 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bilibili-session", type=Path, default=Path("work/bilibili_browser_session"))
     parser.add_argument("--wait-seconds", type=int, default=30, help="浏览器打开后等待时间，默认 30 秒")
     parser.add_argument("--headless", action="store_true", help="不显示浏览器；首次登录不要使用")
+    parser.add_argument("--cdp-url", help="连接已打开的 Chrome CDP 地址，例如 http://127.0.0.1:9222；也可用 VIDEO_EXTRACT_CDP_URL")
     parser.add_argument("--model", default="small", help="Whisper 模型名，如 tiny/base/small/medium 或本地模型目录")
     parser.add_argument("--language", default="zh", help="音频语言；自动检测可用 --language auto")
     parser.add_argument("--task", choices=["transcribe", "translate"], default="transcribe")
@@ -442,7 +452,7 @@ def main() -> int:
         output_dir = video_directory(args.output_dir, title)
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
-        candidates = capture_media(args.url, args.browser_session, args.wait_seconds, args.headless)
+        candidates = capture_media(args.url, args.browser_session, args.wait_seconds, args.headless, args.cdp_url)
         if not candidates:
             print("没有捕获到 m3u8。请确认已在浏览器登录并手动播放视频，然后增加 --wait-seconds。", file=sys.stderr)
             return 1

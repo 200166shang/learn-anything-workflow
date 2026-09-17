@@ -21,22 +21,18 @@ class CliContractTests(unittest.TestCase):
             self.assertEqual(main(), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["schema_version"], 5)
-        self.assertEqual(result["mandarin_audio"]["mode"], "external_pyvideotrans")
-        self.assertNotIn("localize_audio", [x["name"] for x in result["planned_stages"]])
+        self.assertEqual(result["audio"]["reason"], "missing_requested_language_track")
+        self.assertEqual([x["name"] for x in result["planned_stages"]], ["resolve_source"])
 
     def test_help_exposes_goal_commands(self):
         help_text = parser().format_help()
         self.assertIn("plan", help_text); self.assertIn("ensure", help_text)
+        self.assertIn("xiaoe", help_text)
         self.assertNotIn("localize-audio", help_text)
 
-    def test_offline_plan_contract(self):
-        inventory = MediaInventory("youtube", "fixture", "Fixture", 3, (MediaStream("zh", "audio", "zh-CN"),))
-        output = io.StringIO()
-        argv = ["video-extract", "plan", "https://youtube.com/watch?v=fixture", "--goal", "podcast_zh", "--json"]
-        with patch("video_extract.orchestrator.resolve_inventory", return_value=inventory), patch("sys.argv", argv), contextlib.redirect_stdout(output):
-            self.assertEqual(main(), 0)
-        result = json.loads(output.getvalue())
-        self.assertEqual(result["requested_goals"], ["podcast_zh"]); self.assertIn("screenshots", result["exclusions"])
+    def test_goal_execution_is_no_longer_a_public_plan_input(self):
+        with patch("sys.argv", ["video-extract", "plan", "fixture", "--goal", "podcast_zh"]), self.assertRaises(SystemExit):
+            main()
 
     def test_status_reports_goal_state_without_legacy_video_failure(self):
         with tempfile.TemporaryDirectory() as raw:

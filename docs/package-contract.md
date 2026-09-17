@@ -4,12 +4,13 @@
 
 This document and the v4/v5 schemas are the authoritative deterministic package contract. `video_extract.validate` implements artifact-derived semantics. Schema 1–4 manifests remain readable; stored status labels are hints only.
 
-## Public goals
+## Current public workflows and retained validation goals
 
-- `podcast_zh` requires a positive-duration, ffprobe-readable `audio/podcast.zh-CN.m4a` plus provenance identifying a native Chinese track or complete synthesized script coverage. It does not require video, screenshots, or notes.
-- `notes_zh` requires a timed transcript, Chinese notes with timestamp evidence, and resolvable approved visual evidence, or an explicit reason that no useful visuals exist. It does not require localized audio.
+- New acquisition uses `plan/ensure --media`; it never synthesizes a missing language track.
+- New source-note work uses `source import`, `notes prepare`, and `notes finalize`.
+- `podcast_zh` and `notes_zh` remain artifact validation names for historical packages and final note checks; they are not public `plan/ensure --goal` inputs.
 
-`plan` is read-only. Pass `--output EXISTING_PACKAGE` to include its safely resolved, validated reusable artifacts. `ensure` may return `awaiting_ai` with an action, package-relative input/output, schema, and exact resume command. Semantic output must be written to that expected path and the resume command rerun; final completion always requires `verify --goal`.
+`plan` is read-only. Pass `--output EXISTING_PACKAGE` only for an explicitly selected package. `notes prepare` returns `awaiting_ai` with package-relative input/output and a resume argv; `notes finalize` verifies, exports, and updates the library.
 
 Formal subtitles are materialized to SRT; when absent, source audio is passed through the existing local faster-whisper implementation. Existing but invalid notes are never accepted by filename alone: `ensure` returns to the `notes_write` AI pause until artifact-derived goal validation succeeds. `audio_quality=standard` means 128 kbps AAC and `high` means 192 kbps AAC for normalized and synthesized podcast audio.
 
@@ -45,8 +46,8 @@ Identical validated input/parameter fingerprints are cache hits. Browser capture
 
 The stable interface adds `plan` and `ensure` while preserving `doctor|scan|acquire|transcribe|prepare-evidence|verify|status`; `--help` owns current defaults and platform parameters.
 
-## Manifest v5 Chinese listening audio
+## Manifest v5 media language requests
 
-For `--media audio --language zh-CN`, native Chinese audio completes directly. Without a native Chinese track, an English source yields `mandarin_audio.mode=external_pyvideotrans` and `input_artifact=media/audio.source.m4a`; ensure may pause normally as `awaiting_external`. A non-English or unknown source yields `unsupported` and no external command is run.
+For `--media audio --language zh-CN`, an existing Chinese track is materialized as source audio. Without that track, extraction records `missing_requested_language_track`; it never starts synthesis.
 
-The top-level `extract-media` workflow extracts original audio and directly invokes pyVideoTrans podcast mode. pyVideoTrans independently owns `listening/zh-CN/` and its manifest, 48 kHz mono 64 kbps MP3, production report, private run state, and intermediates. video-extract does not copy, validate, or adopt those artifacts. This is a natural-paced Chinese listening edition whose duration may differ from the source; synchronized dubbing and remux-ready tracks are outside the contract.
+The independent `mandarin-audio` skill consumes a managed package. It owns native-track normalization or the configured pyVideoTrans podcast call and produces `listening/zh-CN/podcast.zh-CN.mp3`. This is a natural-paced Chinese listening edition whose duration may differ from the source.

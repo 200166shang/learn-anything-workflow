@@ -97,7 +97,9 @@ def export_package(package: Path, root: Path, *, allow_preserved_invalid: bool =
         "source_video": str(source_video), "updated": str(manifest.get("updated") or manifest.get("updated_at") or ""),
     }
     frontmatter = "---\n" + "".join(f"{key}: {_yaml(value)}\n" for key, value in properties.items()) + "---\n\n"
-    rendered = frontmatter + body.rstrip() + f"\n\n[打开源视频](file://{source_video})\n"
+    source_link = ("\n" if manifest.get("source_kind") in {"audio", "transcript", "document"}
+                   else f"\n\n[打开源视频](file://{source_video})\n")
+    rendered = frontmatter + body.rstrip() + source_link
     source_hash = hashlib.sha256(b"obsidian-export-v4\0" + source_note.read_bytes() + json.dumps(approved, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     if destination.is_file() and previous.get("source_hash") == source_hash and _hash(destination) == previous.get("export_hash"):
         _bases(root)
