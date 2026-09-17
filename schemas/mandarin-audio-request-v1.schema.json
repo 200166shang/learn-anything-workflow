@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/mandarin-audio-request-v1.schema.json",
+  "title": "Mandarin audio request v1",
+  "type": "object",
+  "required": ["contract_version", "workspace", "package", "source_id", "source_version"],
+  "properties": {
+    "contract_version": {"const": 1},
+    "workspace": {"type": "string", "minLength": 1},
+    "package": {"type": "string", "minLength": 1},
+    "source_id": {"type": "string", "minLength": 1},
+    "source_version": {"type": "string", "minLength": 1},
+    "profile": {"const": "alibaba-podcast-tts-throughput"},
+    "sample_rate": {"const": 48000},
+    "channels": {"const": 1},
+    "bitrate_kbps": {"type": "integer", "minimum": 56, "maximum": 72},
+    "adapter": {"type": "string", "minLength": 1},
+    "authorization_ref": {"type": "string", "minLength": 1},
+    "check_only": {"type": "boolean"},
+    "verification_report": {"type": "string", "minLength": 1},
+    "adopt_operation_id": {"type": "string", "pattern": "^operation-[0-9a-f]{24}$"}
+  },
+  "additionalProperties": false
+}
