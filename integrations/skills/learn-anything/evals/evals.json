@@ -1,0 +1,35 @@
+{
+  "skill_name": "learn-anything",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "$learn-anything 我想学习小沫机器人的 agent 语音模块，源码目录是 /Users/syz/code/robot。",
+      "expected_output": "固定使用 VideoLearning 工作区，把源码视为材料；先确认模块范围并登记来源，不以临时源码摘要代替持久学习。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "$learn-anything 继续上次的小沫机器人学习。",
+      "expected_output": "先恢复已有模块、线程、当前问题、反馈和返回路线，不创建重复模块，并让用户决定继续或返回。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "$learn-anything 今天我想复习，但雷达融合比系统推荐的内容更想先复习。",
+      "expected_output": "查询持久建议，尊重用户改选，先主动回忆后揭示讲解，并且不改变 Learn 位置。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "$learn-anything 这段课程视频是 https://example.invalid/lesson，我想只学其中的标定章节。",
+      "expected_output": "确认授权和章节边界，仅准备所需媒体与来源笔记，复用已有产物，然后推荐根问题；不会扩展为整门课程。",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "$learn-anything 我想看看以前保存的小沫机器人笔记和现在的学习地图。",
+      "expected_output": "区分旧 Obsidian 笔记、当前权威学习事实和派生地图，提供可点击路径并在需要时重建投影。",
+      "files": []
+    }
+  ]
+}
