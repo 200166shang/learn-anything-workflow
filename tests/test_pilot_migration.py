@@ -182,7 +182,7 @@ def test_public_migration_stops_cutover_when_source_changed(tmp_path: Path) -> N
     }
     assert planned["result"]["inventory"]["image_references"] == [{
         "note": "notes/lesson.md", "target": "images/frame.png",
-        "external": False, "present": True,
+        "external": False, "present": True, "validation_scope": "active_note",
     }]
     assert planned["result"]["inventory"]["missing_facts"] == ["feedbacks", "operation_receipts"]
     assert planned["result"]["engineering_basis"] == {
@@ -208,6 +208,30 @@ def test_public_migration_stops_cutover_when_source_changed(tmp_path: Path) -> N
     assert batch_state["acceptance"]["real_pilot"] == "pending_authorization"
     assert batch_state["events"][-1]["operation"] == "migration cutover"
     assert batch_state["events"][-1]["status"] == "failed"
+
+
+def test_archived_legacy_variant_keeps_broken_links_without_becoming_active(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "workspace")
+    legacy = legacy_pilot(tmp_path / "legacy")
+    archived = legacy / "course/notes/legacy-variants/original"
+    archived.mkdir(parents=True)
+    archived_note = archived / "notes.md"
+    archived_note.write_text("# archived\n\n![old](../frames/missing.jpg)\n", encoding="utf-8")
+    common = ("--batch", "archived-note", "--workspace", config, "--json")
+
+    code, planned = cli("migration", "plan", "--legacy-package", legacy / "course",
+                        "--legacy-thread", legacy / "thread.json", *common)
+    assert code == 0
+    archived_reference = next(item for item in planned["result"]["inventory"]["image_references"]
+                              if item["note"].startswith("notes/legacy-variants/"))
+    assert archived_reference["present"] is False
+    assert archived_reference["validation_scope"] == "opaque_archive"
+    assert cli("migration", "convert", *common)[0] == 0
+    verify_code, verified = cli("migration", "verify", *common)
+    assert verify_code == 0
+    assert verified["validation"]["image_references"] == "passed"
+    preserved = config.parent / "local/migration-batches/archived-note/converted/course"
+    assert (preserved / archived_note.relative_to(legacy / "course")).read_bytes() == archived_note.read_bytes()
 
 
 def test_unknown_legacy_domains_are_reported_and_preserved_opaque(tmp_path: Path) -> None:

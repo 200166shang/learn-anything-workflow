@@ -232,12 +232,15 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any],
     image_references: list[dict[str, Any]] = []
     for note in notes:
         note_path = package / note["path"]
+        archived_variant = "legacy-variants" in Path(note["path"]).parts
         for target in re.findall(r"!\[[^]]*\]\(([^)]+)\)", note_path.read_text(encoding="utf-8")):
             external = "://" in target
             resolved = (note_path.parent / target).resolve(strict=False) if not external else None
             inside = bool(resolved and (resolved == package or package in resolved.parents))
             image_references.append({"note": note["path"], "target": target,
-                                     "external": external, "present": bool(inside and resolved.is_file())})
+                                     "external": external, "present": bool(inside and resolved.is_file()),
+                                     "validation_scope": "opaque_archive" if archived_variant
+                                     else "active_note"})
     feedbacks = list(thread.get("feedbacks") or [])
     receipts = list(thread.get("operation_receipts") or [])
     # These names resemble current domains but are not part of the supported v1
@@ -523,6 +526,7 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
               "notes": len(value["inventory"]["notes"]) == value["inventory"]["counts"]["notes"],
               "images": len(value["inventory"]["images"]) == value["inventory"]["counts"]["images"],
               "image_references": all(item["external"] or item["present"]
+                                      or item.get("validation_scope") == "opaque_archive"
                                       for item in value["inventory"]["image_references"]),
               "questions": len(converted["record"]["questions"]) == value["inventory"]["counts"]["questions"],
               "relationships": (len(converted["record"]["relationships"])
