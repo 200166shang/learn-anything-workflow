@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/backup-manifest-v1.schema.json",
+  "type": "object",
+  "required": ["schema_version", "commit_id", "workspace_id", "created_at", "tool_version", "authorities", "entries", "exclusions"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "commit_id": {"type": "string", "pattern": "^backup-commit-[0-9a-f]{64}$"},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "tool_version": {"type": "string", "minLength": 1},
+    "authorities": {
+      "type": "object",
+      "required": ["sources", "notes", "learning", "operation_receipts"],
+      "properties": {
+        "sources": {"$ref": "#/$defs/authority"}, "notes": {"$ref": "#/$defs/authority"},
+        "learning": {"$ref": "#/$defs/authority"}, "operation_receipts": {"$ref": "#/$defs/authority"}
+      }, "additionalProperties": false
+    },
+    "entries": {"type": "array", "items": {"$ref": "#/$defs/entry"}},
+    "exclusions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+  },
+  "$defs": {
+    "authority": {"type": "object", "required": ["store", "commit_id", "revision", "schema_version", "root_sha256"],
+      "properties": {"store": {"type": "string"}, "commit_id": {"type": ["string", "null"]},
+        "revision": {"type": "integer", "minimum": 0}, "schema_version": {"type": ["integer", "null"]},
+        "root_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": false},
+    "entry": {"type": "object", "required": ["path", "size", "sha256"],
+      "properties": {"path": {"type": "string", "pattern": "^payload/"}, "size": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "additionalProperties": false}
+  },
+  "additionalProperties": false
+}

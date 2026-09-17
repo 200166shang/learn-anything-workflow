@@ -352,6 +352,19 @@ def cmd_practice(args: argparse.Namespace) -> int:
     emit(result, args.json); return exit_code(result)
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    from .backup import create_backup, restore_backup, verify_backup
+    from .command_response import exit_code
+    if args.backup_action == "verify":
+        result = verify_backup(args.backup)
+    else:
+        workspace = discover_workspace(args.workspace)
+        result = (create_backup(workspace, args.backup) if args.backup_action == "create"
+                  else restore_backup(args.backup, workspace))
+    emit(result, args.json)
+    return exit_code(result)
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     from .command_response import exit_code
     from .installation import apply, inspect, plan
@@ -755,6 +768,11 @@ def parser() -> argparse.ArgumentParser:
     practice_prepare = practice_actions.add_parser("prepare"); practice_prepare.add_argument("--request", type=Path, required=True); practice_prepare.add_argument("--workspace", type=Path); practice_prepare.add_argument("--json", action="store_true"); practice_prepare.set_defaults(func=cmd_practice)
     practice_checkpoint = practice_actions.add_parser("checkpoint"); practice_checkpoint.add_argument("--practice-id", required=True); practice_checkpoint.add_argument("--expected-revision", type=int, required=True); practice_checkpoint.add_argument("--workspace", type=Path); practice_checkpoint.add_argument("--json", action="store_true"); practice_checkpoint.set_defaults(func=cmd_practice, request=None)
     practice_record = practice_actions.add_parser("record"); practice_record.add_argument("--practice-id", required=True); practice_record.add_argument("--request", type=Path, required=True); practice_record.add_argument("--expected-revision", type=int, required=True); practice_record.add_argument("--workspace", type=Path); practice_record.add_argument("--json", action="store_true"); practice_record.set_defaults(func=cmd_practice)
+    backup = commands.add_parser("backup", help="create, verify, or restore a complete result-only generation")
+    backup_actions = backup.add_subparsers(dest="backup_action", required=True)
+    backup_create = backup_actions.add_parser("create"); backup_create.add_argument("backup", type=Path); backup_create.add_argument("--workspace", type=Path); backup_create.add_argument("--json", action="store_true"); backup_create.set_defaults(func=cmd_backup)
+    backup_verify = backup_actions.add_parser("verify"); backup_verify.add_argument("backup", type=Path); backup_verify.add_argument("--json", action="store_true"); backup_verify.set_defaults(func=cmd_backup, workspace=None)
+    backup_restore = backup_actions.add_parser("restore"); backup_restore.add_argument("backup", type=Path); backup_restore.add_argument("--workspace", type=Path, required=True); backup_restore.add_argument("--json", action="store_true"); backup_restore.set_defaults(func=cmd_backup)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):

@@ -66,6 +66,7 @@ include = [
 "schemas/media-acquire-request-v1.schema.json" = "schemas/media-acquire-request-v1.schema.json"
 "schemas/mandarin-audio-request-v1.schema.json" = "schemas/mandarin-audio-request-v1.schema.json"
 "schemas/netease-publish-request-v1.schema.json" = "schemas/netease-publish-request-v1.schema.json"
+"schemas/backup-manifest-v1.schema.json" = "schemas/backup-manifest-v1.schema.json"
 "integrations/skills" = "integrations/skills"
 "integrations/obsidian-learning-map" = "integrations/obsidian-learning-map"
 ".codex/agents" = ".codex/agents"
