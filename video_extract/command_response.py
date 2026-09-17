@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .workspace import validate_workspace_id
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -36,9 +38,9 @@ def workspace_id(path: str | None) -> str:
         config = Path(path).expanduser()
         try:
             parsed = tomllib.loads(config.read_text(encoding="utf-8"))
-            explicit = parsed.get("workspace_id")
-            if isinstance(explicit, str) and explicit.strip():
-                raw = "explicit:" + explicit.strip()
+            explicit = validate_workspace_id(parsed.get("workspace_id"))
+            if explicit:
+                raw = "explicit:" + explicit
             else:
                 raw = "legacy-workspace-without-persistent-id"
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):

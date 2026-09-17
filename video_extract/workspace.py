@@ -30,6 +30,15 @@ class WorkspaceError(RuntimeError):
     pass
 
 
+def validate_workspace_id(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().lower().replace("_", "-")
+    reserved = ("replace", "placeholder", "change-me", "changeme", "todo", "example", "your-",
+                "fixture", "sample", "default")
+    return None if any(marker in normalized for marker in reserved) else value.strip()
+
+
 def _contained(child: Path, parent: Path, label: str) -> Path:
     child, parent = child.resolve(), parent.resolve()
     try:
@@ -67,8 +76,8 @@ class WorkspaceConfig:
         if raw.get("schema_version") != SCHEMA_VERSION:
             raise WorkspaceError(f"unsupported workspace schema_version: {raw.get('schema_version')!r}")
         workspace_id = raw.get("workspace_id")
-        if workspace_id is not None and (not isinstance(workspace_id, str) or not workspace_id.strip()):
-            raise WorkspaceError("workspace_id must be a non-empty persistent logical identifier")
+        if workspace_id is not None and validate_workspace_id(workspace_id) is None:
+            raise WorkspaceError("workspace_id must be a non-empty persistent logical identifier, not a placeholder")
         paths, obs = raw.get("paths", {}), raw.get("obsidian", {})
         root = path.parent.resolve()
         project = _contained(root / _required(paths, "project"), root, "project")
@@ -85,7 +94,7 @@ class WorkspaceConfig:
         if generated == vault or any(generated == item or generated in item.parents for item in (threads, concepts, review, vault / "收件箱")):
             raise WorkspaceError("generated path overlaps a protected Vault boundary")
         return cls(path, source, root, project, media, vault, generated, threads, concepts, review,
-                   workspace_id.strip() if isinstance(workspace_id, str) else None,
+                   validate_workspace_id(workspace_id),
                    pyvideotrans_python, pyvideotrans_cli)
 
     def as_dict(self) -> dict[str, Any]:

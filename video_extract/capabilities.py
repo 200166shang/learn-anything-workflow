@@ -8,12 +8,13 @@ import importlib.util
 import inspect
 import json
 import shutil
+import typing
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .command_response import PUBLIC_STATUSES, engineering_revision, exit_code, response
+from .command_response import PUBLIC_STATUSES, engineering_revision, exit_code, response, workspace_id
 from .manifest import read_json
 from .workspace import WorkspaceError, discover_workspace
 
@@ -70,6 +71,7 @@ def _operation_id(entry: Capability, request: dict[str, Any]) -> str:
             except (OSError, json.JSONDecodeError):
                 pass
     stable = json.dumps({"capability": entry.id, "contract_version": entry.contract_version,
+                         "workspace_id": workspace_id(request.get("workspace")),
                          "request": logical_request}, sort_keys=True, ensure_ascii=False)
     return "operation-" + hashlib.sha256(stable.encode()).hexdigest()[:24]
 
@@ -98,6 +100,14 @@ def _contract_compatible(entry: Capability, implementation: Callable[..., Any] |
         signature.bind({})
     except (TypeError, ValueError):
         return False
+    try:
+        return_annotation = typing.get_type_hints(implementation).get("return", signature.return_annotation)
+    except (NameError, TypeError):
+        return_annotation = signature.return_annotation
+    if return_annotation not in {inspect.Signature.empty, Any}:
+        origin = typing.get_origin(return_annotation) or return_annotation
+        if origin not in {dict, Mapping}:
+            return False
     return True
 
 
@@ -124,9 +134,10 @@ def check_capabilities(capability_id: str | None = None) -> dict[str, Any]:
         implementation = _resolve(entry)
         compatible = _contract_compatible(entry, implementation)
         dependencies = {dependency: _dependency_available(dependency) for dependency in entry.dependencies}
+        contract_state = "unavailable" if not available else ("compatible" if compatible else "incompatible")
         results.append({**asdict(entry), "dependencies": list(entry.dependencies),
                         "implementation_state": "available" if available else "missing",
-                        "contract_state": "compatible" if compatible else "incompatible",
+                        "contract_state": contract_state,
                         "dependency_state": dependencies})
         if not available:
             diagnostics.append(
@@ -139,15 +150,16 @@ def check_capabilities(capability_id: str | None = None) -> dict[str, Any]:
             diagnostics.append(f"{entry.id} input/output contract or callable signature is incompatible")
     dependencies_ok = all(all(item["dependency_state"].values()) for item in results)
     implementations_ok = all(item["implementation_state"] == "available" for item in results)
-    contracts_ok = all(item["contract_state"] == "compatible" for item in results)
-    if not contracts_ok and dependencies_ok and implementations_ok:
+    contract_failed = any(item["contract_state"] == "incompatible" for item in results)
+    contracts_checked = all(item["contract_state"] != "unavailable" for item in results)
+    if contract_failed:
         status = "unsupported"
     else:
         status = "completed" if not diagnostics else "missing_dependency"
     return response(status=status, result={"capabilities": results},
                      validation={"implementations": "passed" if implementations_ok else "failed",
                                  "dependencies": "passed" if dependencies_ok else "failed",
-                                 "contracts": "passed" if contracts_ok else "failed"},
+                                 "contracts": "failed" if contract_failed else ("passed" if contracts_checked else "not_checked")},
                      diagnostics=diagnostics)
 
 

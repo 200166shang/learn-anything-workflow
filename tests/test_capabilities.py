@@ -18,7 +18,7 @@ def make_workspace(root: Path) -> WorkspaceConfig:
     (root / "vault").mkdir()
     config = root / "workspace.toml"
     config.write_text('''schema_version = 1
-workspace_id = "fixture-workspace"
+workspace_id = "11111111-1111-4111-8111-111111111111"
 [paths]
 project = "project"
 media = "media"
@@ -173,6 +173,29 @@ def test_operation_identity_survives_relocation_and_tracks_contract_versions(tmp
     assert contract_changed["operation_id"] != relocated["operation_id"]
 
 
+def test_operation_identity_distinguishes_logical_workspaces(tmp_path: Path) -> None:
+    first = make_workspace(tmp_path / "first")
+    second = make_workspace(tmp_path / "second")
+    second.config_path.write_text(second.config_path.read_text(encoding="utf-8").replace(
+        'workspace_id = "11111111-1111-4111-8111-111111111111"',
+        'workspace_id = "22222222-2222-4222-8222-222222222222"'), encoding="utf-8")
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "manifest.json").write_text(json.dumps({"identity": "source-123"}), encoding="utf-8")
+    requests = []
+    for index, workspace in enumerate((first, second), 1):
+        request = tmp_path / f"request-{index}.json"
+        request.write_text(json.dumps({"contract_version": 1, "action": "prepare",
+                                       "workspace": str(workspace.config_path),
+                                       "package": str(package), "source_version": "v1"}), encoding="utf-8")
+        requests.append(request)
+    with patch.object(capability_module, "run_source_notes", capability_module.run_source_notes):
+        _, one = run_cli("capability", "run", "source.notes", "--request", str(requests[0]))
+        _, two = run_cli("capability", "run", "source.notes", "--request", str(requests[1]))
+
+    assert one["operation_id"] != two["operation_id"]
+
+
 def test_check_rejects_incompatible_contract_declaration_and_callable() -> None:
     def incompatible() -> list[str]:
         return []
@@ -205,8 +228,43 @@ def test_contract_failure_with_dependencies_present_is_unsupported() -> None:
     assert result["validation"] == {"implementations": "passed", "dependencies": "passed", "contracts": "failed"}
 
 
+def test_contract_failure_precedes_missing_dependency() -> None:
+    def incompatible(_request: dict) -> list[str]:
+        return []
+
+    incompatible.__capability_contract__ = {"input_type": "source-notes-request-v1",
+                                            "output_type": "command-response-v1"}
+    bad = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                        "implementation": "video_extract.capabilities:incompatible"})
+    with patch.object(capability_module, "incompatible", incompatible, create=True), \
+            patch("video_extract.capabilities._dependency_available", return_value=False), \
+            patch.dict(CAPABILITIES, {"source.notes": bad}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 1
+    assert result["status"] == "unsupported"
+    assert result["validation"] == {"implementations": "passed", "dependencies": "failed", "contracts": "failed"}
+
+
+def test_metadata_cannot_hide_incompatible_return_annotation() -> None:
+    def disguised(_request: dict) -> list[str]:
+        return []
+
+    disguised.__capability_contract__ = {"input_type": "source-notes-request-v1",
+                                         "output_type": "command-response-v1"}
+    bad = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                        "implementation": "video_extract.capabilities:disguised"})
+    with patch.object(capability_module, "disguised", disguised, create=True), \
+            patch.dict(CAPABILITIES, {"source.notes": bad}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 1
+    assert result["result"]["capabilities"][0]["contract_state"] == "incompatible"
+
+
 def test_run_incompatible_return_keeps_v1_envelope(tmp_path: Path) -> None:
-    def returns_list(_request: dict) -> list[str]:
+    # Unannotated adapters are allowed by the probe protocol, so runtime must still enforce Mapping.
+    def returns_list(_request: dict):
         return []
 
     request = tmp_path / "request.json"
@@ -298,7 +356,8 @@ def test_workspace_identity_survives_workspace_relocation(tmp_path: Path) -> Non
 
 def test_legacy_workspace_doctor_requires_persistent_identity(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
-    text = workspace.config_path.read_text(encoding="utf-8").replace('workspace_id = "fixture-workspace"\n', '')
+    text = workspace.config_path.read_text(encoding="utf-8").replace(
+        'workspace_id = "11111111-1111-4111-8111-111111111111"\n', '')
     workspace.config_path.write_text(text, encoding="utf-8")
 
     code, result = run_cli("workspace", "doctor", "--workspace", str(workspace.config_path),
@@ -308,6 +367,21 @@ def test_legacy_workspace_doctor_requires_persistent_identity(tmp_path: Path) ->
     assert code == 3
     assert result["status"] == "missing_input"
     assert "workspace_id" in result["diagnostics"][0]
+
+
+def test_workspace_template_identity_is_rejected(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    workspace.config_path.write_text(workspace.config_path.read_text(encoding="utf-8").replace(
+        'workspace_id = "11111111-1111-4111-8111-111111111111"',
+        'workspace_id = "REPLACE_ME_WITH_UUID"'), encoding="utf-8")
+
+    code, result = run_cli("workspace", "doctor", "--workspace", str(workspace.config_path),
+                           "--agents-root", str(tmp_path / "agents"),
+                           "--codex-root", str(tmp_path / "codex"))
+
+    assert code == 3
+    assert result["status"] == "missing_input"
+    assert "placeholder" in result["diagnostics"][0]
 
 
 def test_malformed_workspace_toml_is_normalized(tmp_path: Path) -> None:
