@@ -34,6 +34,18 @@ class Capability:
 
 
 CAPABILITIES: dict[str, Capability] = {
+    "learning.learn": Capability(
+        id="learning.learn",
+        contract_version=1,
+        implementation_version=1,
+        implementation="video_extract.capabilities:run_learning",
+        input_type="learning-request-v1",
+        output_type="command-response-v1",
+        side_effect="workspace_write",
+        dependencies=(),
+        authorization_category="local_workspace",
+        recovery_query="capability run learning.learn with the same request",
+    ),
     "source.notes": Capability(
         id="source.notes",
         contract_version=1,
@@ -203,6 +215,36 @@ def run_source_notes(request: dict[str, Any]) -> dict[str, Any]:
 
 run_source_notes.__capability_contract__ = {
     "input_type": "source-notes-request-v1",
+    "output_type": "command-response-v1",
+}
+
+
+def run_learning(request: dict[str, Any]) -> dict[str, Any]:
+    from .learning import (commit_explanation, create_module, create_thread, locate,
+                           prepare_explanation, pursue, recommend_roots, show_module, show_thread)
+
+    workspace = discover_workspace(Path(request["workspace"]))
+    action = request.get("action")
+    if action == "module.create":
+        return create_module(workspace, request["goal"], request["scope"], request["source_id"], request["source_version"])
+    if action == "module.show": return show_module(workspace, request["module_id"])
+    if action == "recommend": return recommend_roots(workspace, request["module_id"])
+    if action == "thread.create": return create_thread(workspace, request["module_id"], request["root_question"])
+    if action == "thread.show": return show_thread(workspace, request["thread_id"])
+    if action == "pursue":
+        return pursue(workspace, request["thread_id"], request["from_question_id"], request["relation"], request["question"])
+    if action == "locate": return locate(workspace, request["question_id"])
+    if action == "explanation.prepare":
+        return prepare_explanation(workspace, request["question_id"], request["profile"])
+    if action == "explanation.commit":
+        return commit_explanation(workspace, request["question_id"], Path(request["draft"]),
+                                  Path(request["evidence"]), Path(request["teaching_review"]),
+                                  request["profile"], request.get("expected_revision"))
+    return {"status": "needs_input", "error": "unsupported learning action"}
+
+
+run_learning.__capability_contract__ = {
+    "input_type": "learning-request-v1",
     "output_type": "command-response-v1",
 }
 

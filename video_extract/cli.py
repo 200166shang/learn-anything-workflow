@@ -147,6 +147,57 @@ def cmd_notes(args: argparse.Namespace) -> int:
     return 0 if result.get("status") in {"ready", "complete", "awaiting_ai"} else 1
 
 
+def cmd_learning(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .learning import (LearningPublishError, create_module, create_thread, locate,
+                           publish_failure_response, pursue, recommend_roots, reconcile,
+                           show_module, show_thread)
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.learning_entity == "module" and args.learning_action == "create":
+            result = create_module(workspace, args.goal, args.scope, args.source_id, args.source_version, args.expected_revision)
+        elif args.learning_entity == "module" and args.learning_action == "show":
+            result = show_module(workspace, args.module_id)
+        elif args.learning_entity == "recommend":
+            result = recommend_roots(workspace, args.module_id)
+        elif args.learning_entity == "thread" and args.learning_action == "create":
+            result = create_thread(workspace, args.module_id, args.root_question, args.expected_revision)
+        elif args.learning_entity == "thread" and args.learning_action == "show":
+            result = show_thread(workspace, args.thread_id)
+        elif args.learning_entity == "pursue":
+            result = pursue(workspace, args.thread_id, args.from_question_id, args.relation, args.question, args.expected_revision)
+        elif args.learning_entity == "locate":
+            result = locate(workspace, args.question_id)
+        elif args.learning_entity == "reconcile":
+            result = reconcile(workspace, args.commit_id)
+        else:
+            result = response(status="unsupported", workspace=str(workspace.config_path))
+    except LearningPublishError as exc:
+        result = publish_failure_response(workspace, exc)
+    except (OSError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json)
+    return exit_code(result)
+
+
+def cmd_explanation(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .learning import LearningPublishError, commit_explanation, prepare_explanation, publish_failure_response
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        result = (prepare_explanation(workspace, args.question_id, args.profile)
+                  if args.explanation_action == "prepare" else
+                  commit_explanation(workspace, args.question_id, args.draft, args.evidence,
+                                     args.teaching_review, args.profile, args.expected_revision))
+    except LearningPublishError as exc:
+        result = publish_failure_response(workspace, exc)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     from .command_response import exit_code
     from .installation import apply, inspect, plan
@@ -494,6 +545,22 @@ def parser() -> argparse.ArgumentParser:
     notes_actions = notes.add_subparsers(dest="notes_action", required=True)
     for action in ("prepare", "finalize"):
         p = notes_actions.add_parser(action); p.add_argument("package", type=Path); p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
+    learning = commands.add_parser("learning", help="manage authoritative learning modules, threads, and questions")
+    learning_entities = learning.add_subparsers(dest="learning_entity", required=True)
+    module = learning_entities.add_parser("module"); module_actions = module.add_subparsers(dest="learning_action", required=True)
+    module_create = module_actions.add_parser("create"); module_create.add_argument("--goal", required=True); module_create.add_argument("--scope", required=True); module_create.add_argument("--source-id", required=True); module_create.add_argument("--source-version", required=True); module_create.add_argument("--expected-revision", type=int); module_create.add_argument("--workspace", type=Path); module_create.add_argument("--json", action="store_true"); module_create.set_defaults(func=cmd_learning)
+    module_show = module_actions.add_parser("show"); module_show.add_argument("module_id"); module_show.add_argument("--workspace", type=Path); module_show.add_argument("--json", action="store_true"); module_show.set_defaults(func=cmd_learning)
+    recommend = learning_entities.add_parser("recommend", help="prepare source-grounded root question recommendations without persisting candidates"); recommend.add_argument("--module-id", required=True); recommend.add_argument("--workspace", type=Path); recommend.add_argument("--json", action="store_true"); recommend.set_defaults(func=cmd_learning)
+    thread = learning_entities.add_parser("thread"); thread_actions = thread.add_subparsers(dest="learning_action", required=True)
+    thread_create = thread_actions.add_parser("create"); thread_create.add_argument("--module-id", required=True); thread_create.add_argument("--root-question", required=True); thread_create.add_argument("--expected-revision", type=int); thread_create.add_argument("--workspace", type=Path); thread_create.add_argument("--json", action="store_true"); thread_create.set_defaults(func=cmd_learning)
+    thread_show = thread_actions.add_parser("show"); thread_show.add_argument("thread_id"); thread_show.add_argument("--workspace", type=Path); thread_show.add_argument("--json", action="store_true"); thread_show.set_defaults(func=cmd_learning)
+    pursue_parser = learning_entities.add_parser("pursue"); pursue_parser.add_argument("--thread-id", required=True); pursue_parser.add_argument("--from-question-id", required=True); pursue_parser.add_argument("--relation", required=True); pursue_parser.add_argument("--question", required=True); pursue_parser.add_argument("--expected-revision", type=int); pursue_parser.add_argument("--workspace", type=Path); pursue_parser.add_argument("--json", action="store_true"); pursue_parser.set_defaults(func=cmd_learning)
+    locate_parser = learning_entities.add_parser("locate"); locate_parser.add_argument("question_id"); locate_parser.add_argument("--workspace", type=Path); locate_parser.add_argument("--json", action="store_true"); locate_parser.set_defaults(func=cmd_learning)
+    reconcile_parser = learning_entities.add_parser("reconcile"); reconcile_parser.add_argument("--commit-id", required=True); reconcile_parser.add_argument("--workspace", type=Path); reconcile_parser.add_argument("--json", action="store_true"); reconcile_parser.set_defaults(func=cmd_learning)
+    explanation = commands.add_parser("explanation", help="prepare and commit versioned teaching explanations")
+    explanation_actions = explanation.add_subparsers(dest="explanation_action", required=True)
+    explanation_prepare = explanation_actions.add_parser("prepare"); explanation_prepare.add_argument("--question-id", required=True); explanation_prepare.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_prepare.add_argument("--workspace", type=Path); explanation_prepare.add_argument("--json", action="store_true"); explanation_prepare.set_defaults(func=cmd_explanation)
+    explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/learning-snapshot-v2.schema.json",
+  "title": "Learning snapshot v2",
+  "type": "object",
+  "required": ["schema_version", "commit_id", "parent_commit_id", "revision", "created_at", "record", "objects"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "commit_id": {"type": "string", "pattern": "^learning-commit-[0-9a-f]{64}$"},
+    "parent_commit_id": {"type": ["string", "null"], "pattern": "^learning-commit-[0-9a-f]{64}$"},
+    "revision": {"type": "integer", "minimum": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "record": {"$ref": "learning-record-v2.schema.json"},
+    "objects": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[0-9a-f]{64}$"},
+      "additionalProperties": {
+        "type": "object", "required": ["kind", "size"],
+        "properties": {"kind": {"const": "explanation_markdown"}, "size": {"type": "integer", "minimum": 0}},
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

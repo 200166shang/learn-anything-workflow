@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/learning-record-v2.schema.json",
+  "title": "Learning record v2",
+  "type": "object",
+  "required": ["schema_version", "modules", "threads", "questions", "relationships", "explanations"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "modules": {"type": "object"},
+    "threads": {"type": "object"},
+    "questions": {"type": "object"},
+    "relationships": {"type": "object"},
+    "explanations": {"type": "object"}
+  },
+  "additionalProperties": false
+}
