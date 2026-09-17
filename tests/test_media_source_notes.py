@@ -337,3 +337,40 @@ def test_explicit_reselection_records_new_decision_and_publishes_review_provenan
     assert review["approved"] == []
     assert review["no_useful_visuals_reason"] == "frame is irrelevant to this claim"
     assert audit_notes(config)["status"] == "completed"
+
+
+def test_visual_preparation_refuses_symlink_outside_results(tmp_path):
+    from video_extract.workspace import WorkspaceError
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video", "subtitles":
+                          b"1\n00:00:01,000 --> 00:00:02,000\nClaim\n"}))
+    register_frame_adapter("fixture.frames-v1", FrameFixture())
+    config, acquired = setup_operation(tmp_path, ["subtitles", "video"])
+    external = tmp_path / "external"
+    external.mkdir()
+    notes = config.results / "source-notes"
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "visual-preparations").symlink_to(external, target_is_directory=True)
+    with pytest.raises(WorkspaceError, match="symbolic link"):
+        prepare_media_note(config, acquired["operation_id"], "chapter-1", frame_adapter="fixture.frames-v1")
+    assert list(external.iterdir()) == []
+
+
+def test_published_approval_remains_required_after_preparation_files_are_lost(tmp_path):
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video", "subtitles":
+                          b"1\n00:00:01,000 --> 00:00:02,000\nClaim\n"}))
+    register_frame_adapter("fixture.frames-v1", FrameFixture())
+    config, acquired = setup_operation(tmp_path, ["subtitles", "video"])
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps({"approved": ["frame-001"]}))
+    selected = prepare_media_note(config, acquired["operation_id"], "chapter-1",
+                                  frame_adapter="fixture.frames-v1", selection=selection)
+    request_path = Path(selected["result"]["finalize_request"])
+    assert finalize_note(config, request_path)["status"] == "completed"
+    for path in (config.results / "source-notes" / "visual-preparations").glob("*.json"):
+        path.unlink()
+    request = json.loads(request_path.read_text())
+    request.update(expected_revision=1, markdown="# Changed without visual evidence", attachments=[])
+    request.pop("visual_review")
+    request_path.write_text(json.dumps(request))
+    with pytest.raises(ValueError, match="visual approval"):
+        finalize_note(config, request_path)

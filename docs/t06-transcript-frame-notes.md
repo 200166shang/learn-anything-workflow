@@ -29,6 +29,8 @@ run preparation with an explicit new selection (an empty set requires a reason).
 Decisions remain recorded, and the final approval is stored in the note revision
 history. This adds optional `visual_review` to notes-v1 requests, notes and history;
 existing non-media note requests remain compatible.
+Preparation paths reject symlinks, and restored notes continue enforcing their
+published approval history even when transient preparation files are unavailable.
 
 SRT locators normalize comma/dot milliseconds and horizontal spacing while
 preserving the original transcript bytes. ASR and frame cache receipts include
