@@ -56,9 +56,14 @@ def legacy_pilot(root: Path) -> Path:
     (root / "thread.json").write_text(json.dumps({
         "schema_version": 1,
         "module": {"goal": "理解坐标变换", "scope": "旧课程第一课"},
-        "thread": {"id": "thread-old", "root_question_id": "q001", "current_question_id": "q002"},
+        "thread": {"id": "thread-old", "root_question_id": "q001", "current_question_id": "q002",
+                   "return_route": [{"question_id": "q001", "entered_at": "2026-09-16T00:00:00+00:00"}],
+                   "entry_history": [{"id": "entered-q002", "from_question_id": "q001",
+                                      "to_question_id": "q002", "original_text": "继续追问基向量",
+                                      "relation": "deepens", "created_at": "2026-09-16T00:01:00+00:00"}]},
         "questions": [
-            {"id": "q001", "text": "为什么要变换坐标？"},
+            {"id": "q001", "text": "为什么要变换坐标？",
+             "locator": {"path": "notes/lesson.md", "heading": "第一课"}},
             {"id": "q002", "text": "基向量如何参与？", "parent_id": "q001", "relation": "deepens"},
         ],
     }), encoding="utf-8")
@@ -75,7 +80,8 @@ def test_public_migration_stops_cutover_when_source_changed(tmp_path: Path) -> N
     assert code == 0
     assert planned["result"]["inventory"]["counts"] == {
         "notes": 1, "images": 1, "questions": 2, "relationships": 1,
-        "feedbacks": 0, "operation_receipts": 0,
+        "feedbacks": 0, "operation_receipts": 0, "return_route": 1,
+        "entry_history": 1, "locators": 1,
     }
     assert planned["result"]["inventory"]["image_references"] == [{
         "note": "notes/lesson.md", "target": "images/frame.png",
@@ -100,6 +106,10 @@ def test_public_migration_stops_cutover_when_source_changed(tmp_path: Path) -> N
     assert blocked["status"] == "recoverable_failure"
     assert blocked["validation"]["source_unchanged"] == "failed"
     assert not (config.parent / "results/migration-ownership.json").exists()
+    batch_state = json.loads((config.parent / "local/migration-batches" / batch / "batch.json").read_text())
+    assert batch_state["acceptance"]["real_pilot"] == "pending_authorization"
+    assert batch_state["events"][-1]["operation"] == "migration cutover"
+    assert batch_state["events"][-1]["status"] == "failed"
 
 
 def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Path) -> None:
@@ -113,10 +123,13 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     assert cli("migration", "verify", *common)[0] == 0
     code, cutover = cli("migration", "cutover", *common)
     assert code == 0 and cutover["status"] == "completed"
+    retry_code, retried = cli("migration", "cutover", *common)
+    assert retry_code == 0 and retried["result"]["reconciled"] is True
 
     ownership = json.loads((config.parent / "results/migration-ownership.json").read_text())
     assert ownership["batches"][batch]["owner"] == "new"
     assert ownership["batches"][batch]["legacy_read_only"] is True
+    assert (legacy / "course/manifest.json").stat().st_mode & 0o222 == 0
     migrated = Path(cutover["result"]["migrated_course"])
     assert (migrated / "notes/lesson.md").read_text(encoding="utf-8").startswith("# 第一课")
     assert (migrated / "notes/images/frame.png").read_bytes() == b"legacy-image"
@@ -133,6 +146,15 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
         if item["original_question"] == "基向量如何参与？"
     )
     assert all(state["feedback_history"] == [] for state in shown["result"]["question_states"].values())
+    assert len(shown["result"]["thread"]["return_route"]) == 1
+    assert len(shown["result"]["thread"]["entry_history"]) == 1
+
+    root_question = next(item["question_id"] for item in shown["result"]["questions"]
+                         if item["original_question"] == "为什么要变换坐标？")
+    feedback_code, _ = cli("learning", "feedback", "--question-id", root_question,
+                           "--state", "confused", "--text", "切换后仍有疑惑",
+                           "--workspace", config, "--json")
+    assert feedback_code == 0
 
     increment = migrated / "new-after-cutover.md"
     increment.write_text("切换后的新成果", encoding="utf-8")
@@ -144,7 +166,9 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     preserved = Path(rolled_back["result"]["preserved_increment"])
     assert (preserved / "new-after-cutover.md").read_text(encoding="utf-8") == "切换后的新成果"
     assert (preserved / "operation-receipts/publish.json").is_file()
+    assert (preserved / "learning/current.json").is_file()
     ownership = json.loads((config.parent / "results/migration-ownership.json").read_text())
     assert ownership["batches"][batch]["owner"] == "legacy"
     assert ownership["batches"][batch]["replay_required"] is True
     assert increment.is_file()
+    assert (legacy / "course/manifest.json").stat().st_mode & 0o200
