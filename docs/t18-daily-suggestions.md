@@ -18,9 +18,9 @@ Issue: `#30`. Specification: `#12` (US31, US32; I2, I3, I7, I8; A11, A12).
 
 | Item | Evidence |
 | --- | --- |
-| Engineering and schemas | T18 branch based on `0586291b`; command-response v1, learning-record v2, card-record v1, review-record v1. |
-| Input/source versions | Tests create a registered byte-derived source version, a committed explanation pin, selected card versions, and immutable Review facts. |
+| Engineering and schemas | Tested implementation `4093b2280893b67cfd7ef9f9a0f7e8febbc45335`, based on `0586291b`; command-response v1, learning-record v2, card-record v1, review-record v1. |
+| Input/source versions | Isolated fixtures register byte-derived `source-version-*` identities, then use the resulting committed explanation pins, selected card versions, and immutable Review facts. |
 | Public operations | `suggestions today`, `review prepare`, `review record`, and `capability run learning.suggestions`. |
 | Expected | Stable maximum-three group capped at 15 minutes; explicit preference first; completed, parked, future, and stale candidates excluded; empty and failed reads remain distinct. |
-| Actual | Automated public-CLI tests exercise every branch above without changing the Learn/Card/Review pointers during suggestion calculation. |
-| Disposition | Automated slice passed; real morning delivery remains pending in T22/T23/T26 and is not claimed here. |
+| Actual | 2026-09-17: `uv run pytest -q tests/test_daily_suggestions.py tests/test_card_workflow.py tests/test_review_workflow.py tests/test_learning_workflow.py tests/test_capabilities.py tests/test_cli_contract.py tests/test_installation.py` → `97 passed in 41.79s`; pointer hashes remain unchanged during calculation. |
+| Disposition | T18 automated/public-contract slice passed. Real morning delivery remains pending in T22/T23/T26 and is not claimed here. |
