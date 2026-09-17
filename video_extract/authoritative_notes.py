@@ -31,9 +31,10 @@ SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/notes-sna
 
 
 class NotesPublishInterrupted(OSError):
-    def __init__(self, message: str, commit_id: str):
+    def __init__(self, message: str, commit_id: str, stage: str):
         super().__init__(message)
         self.commit_id = commit_id
+        self.stage = stage
 
 
 def _schema_validate(value: Any, definition: str | None = None) -> None:
@@ -366,20 +367,36 @@ def _publish(config: WorkspaceConfig, previous: dict[str, Any], notes: dict[str,
     commits.mkdir(parents=True, exist_ok=True)
     path = commits / f"{manifest['commit_id']}.json"
     if not path.exists():
-        with path.open("xb") as stream:
-            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        try:
+            with path.open("xb") as stream:
+                stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        except OSError:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
     elif path.read_bytes() != raw:
         raise WorkspaceError(f"immutable note commit differs from published content: {manifest['commit_id']}")
-    _sync_dir(commits)
+    try:
+        _sync_dir(commits)
+    except OSError as exc:
+        raise NotesPublishInterrupted(str(exc), manifest["commit_id"], "commit_directory_fsync") from exc
     if os.environ.get("VIDEO_EXTRACT_NOTES_TEST_FAULT") == "before_publish":
-        raise NotesPublishInterrupted("injected failure before notes publish", manifest["commit_id"])
+        raise NotesPublishInterrupted("injected failure before notes publish", manifest["commit_id"], "before_pointer_write")
     pointer_value = {"schema_version": 1, "workspace_id": config.workspace_id,
                      "commit_id": manifest["commit_id"], "manifest_sha256": _digest(raw)}
     _schema_validate(pointer_value, "pointer")
-    atomic_write_json(pointer, pointer_value)
-    _sync_dir(pointer.parent)
+    try:
+        atomic_write_json(pointer, pointer_value)
+    except OSError as exc:
+        raise NotesPublishInterrupted(str(exc), manifest["commit_id"], "pointer_write") from exc
+    try:
+        _sync_dir(pointer.parent)
+    except OSError as exc:
+        raise NotesPublishInterrupted(str(exc), manifest["commit_id"], "pointer_directory_fsync") from exc
     if os.environ.get("VIDEO_EXTRACT_NOTES_TEST_FAULT") == "after_publish":
-        raise NotesPublishInterrupted("injected failure after notes publish", manifest["commit_id"])
+        raise NotesPublishInterrupted("injected failure after notes publish", manifest["commit_id"], "after_pointer_write")
     return manifest
 
 
@@ -460,16 +477,20 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
     except OSError as exc:
         current = _load_current(config)
         target_commit = exc.commit_id if isinstance(exc, NotesPublishInterrupted) else None
-        command = f"video-extract notes reconcile --workspace {shlex.quote(str(config.config_path))} --json"
+        interrupted_stage = exc.stage if isinstance(exc, NotesPublishInterrupted) else None
+        command = (f"video-extract notes finalize {shlex.quote(source_id)} --request {shlex.quote(str(request))} "
+                   f"--workspace {shlex.quote(str(config.config_path))} --json")
+        action_type = "retry"
         if target_commit:
             command = (f"video-extract notes reconcile --commit-id {shlex.quote(target_commit)} "
                        f"--workspace {shlex.quote(str(config.config_path))} --json")
+            action_type = "reconcile"
         return response(status="recoverable_failure", workspace=str(config.config_path),
                         result={"source_id": source_id, "visible_commit_id": current.get("commit_id"),
-                                "target_commit_id": target_commit},
+                                "target_commit_id": target_commit, "interrupted_stage": interrupted_stage},
                         validation={"commit": "uncertain", "durability": "unknown"}, diagnostics=[str(exc)],
-                        next_action={"type": "reconcile", "source_id": source_id,
-                                     "commit_id": target_commit, "command": command})
+                        next_action={"type": action_type, "source_id": source_id,
+                                     "commit_id": target_commit, "stage": interrupted_stage, "command": command})
 
 
 def audit_notes(config: WorkspaceConfig) -> dict[str, Any]:
@@ -512,6 +533,13 @@ def audit_notes(config: WorkspaceConfig) -> dict[str, Any]:
 
 def reconcile_notes(config: WorkspaceConfig, target_commit_id: str | None = None) -> dict[str, Any]:
     objects, commits, pointer, _ = _roots(config)
+    assert config.results is not None
+    with package_lock(_safe(config.results.resolve(strict=False), "source-notes")):
+        return _reconcile_notes_locked(config, objects, commits, pointer, target_commit_id)
+
+
+def _reconcile_notes_locked(config: WorkspaceConfig, objects: Path, commits: Path, pointer: Path,
+                            target_commit_id: str | None) -> dict[str, Any]:
     if target_commit_id:
         target_path = commits / f"{target_commit_id}.json"
         if not target_path.is_file():
@@ -523,7 +551,18 @@ def reconcile_notes(config: WorkspaceConfig, target_commit_id: str | None = None
         current = _load_current(config)
         if current.get("commit_id") != target_commit_id:
             if target["parent_commit_id"] != current.get("commit_id") or target["revision"] != current["revision"] + 1:
-                raise WorkspaceError("target notes commit is not the unique next commit after current")
+                _, _, _, candidates = _roots(config)
+                candidates.mkdir(parents=True, exist_ok=True)
+                candidate = candidates / f"recovery-{target_commit_id}.json"
+                atomic_write_json(candidate, {"target_commit_id": target_commit_id,
+                                              "observed_commit_id": current.get("commit_id"),
+                                              "target_parent_commit_id": target["parent_commit_id"]})
+                return response(status="awaiting_user", workspace=str(config.config_path),
+                                result={"target_commit_id": target_commit_id,
+                                        "observed_commit_id": current.get("commit_id"),
+                                        "candidate": str(candidate)},
+                                validation={"expected_revision": "conflict"},
+                                next_action={"type": "user", "reason": "resolve competing note commits"})
             raw = target_path.read_bytes()
             pointer_value = {"schema_version": 1, "workspace_id": config.workspace_id,
                              "commit_id": target_commit_id, "manifest_sha256": _digest(raw)}

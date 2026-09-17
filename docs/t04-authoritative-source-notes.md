@@ -35,7 +35,11 @@ pointer and store directory. A failed barrier leaves durability unconfirmed.
 If publication stops after an immutable commit is durable but before its
 pointer is published, the recoverable response names that exact commit and an
 executable `notes reconcile --commit-id ...` action. Reconcile publishes it
-only when it validates and is the unique next revision after current; an
+only while holding the same writer lock as finalize, after rereading current,
+when it validates and is the unique next revision after current. If another
+finalize wins, the recovery commit is preserved as a conflict candidate and
+the pointer is not overwritten. Failures before the commit file is durable
+return an executable finalize retry instead. An
 unclaimed orphan still makes ordinary audit fail.
 
 No command in this slice creates a learning question graph, invokes a model,

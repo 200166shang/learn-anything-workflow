@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import video_extract.authoritative_notes as notes_module
 
 from video_extract.authoritative_notes import associate_sources, audit_notes, finalize_note, prepare_note, reconcile_notes
 from video_extract.workspace import WorkspaceError
@@ -229,6 +230,58 @@ def test_reconcile_does_not_confirm_when_any_object_barrier_fails(tmp_path: Path
     with patch("video_extract.authoritative_notes._sync_file", side_effect=OSError("barrier failed")):
         with pytest.raises(OSError, match="barrier failed"):
             reconcile_notes(config)
+
+
+@pytest.mark.parametrize("failure_stage", ["commit_directory_fsync", "pointer_write", "pointer_directory_fsync"])
+def test_real_publish_io_failure_returns_executable_target_recovery(tmp_path: Path, failure_stage: str) -> None:
+    config = workspace(tmp_path / failure_stage)
+    source = tmp_path / f"{failure_stage}.md"; source.write_text("One\n\nTwo\n", encoding="utf-8")
+    registered = register(config, source); prepared = prepare_note(config, registered["result"]["source_id"])
+    request = draft(tmp_path / f"{failure_stage}.json", prepared, "# Note\n\nTwo\n")
+    original_sync = notes_module._sync_dir
+    original_write = notes_module.atomic_write_json
+
+    def failing_sync(path: Path) -> None:
+        if failure_stage == "commit_directory_fsync" and path.name == "commits":
+            raise OSError("real commit dir failure")
+        if failure_stage == "pointer_directory_fsync" and path.name == "source-notes":
+            raise OSError("real pointer dir failure")
+        original_sync(path)
+
+    def failing_write(path: Path, value: dict) -> None:
+        if failure_stage == "pointer_write" and path.name == "current.json":
+            raise OSError("real pointer write failure")
+        original_write(path, value)
+
+    with patch.object(notes_module, "_sync_dir", side_effect=failing_sync), \
+            patch.object(notes_module, "atomic_write_json", side_effect=failing_write):
+        failed = finalize_note(config, request)
+
+    target = failed["next_action"]["commit_id"]
+    assert failed["status"] == "recoverable_failure"
+    assert target and failed["next_action"]["stage"] == failure_stage
+    recovered = reconcile_notes(config, target)
+    assert recovered["status"] == "completed" and recovered["result"]["commit_id"] == target
+
+
+def test_reconcile_conflicts_when_finalize_wins_writer_race(tmp_path: Path, monkeypatch) -> None:
+    config = workspace(tmp_path / "ws")
+    source = tmp_path / "fixture.md"; source.write_text("One\n\nTwo\n", encoding="utf-8")
+    registered = register(config, source); prepared = prepare_note(config, registered["result"]["source_id"])
+    finalize_note(config, draft(tmp_path / "first.json", prepared, "# First\n\nTwo\n"))
+    monkeypatch.setenv("VIDEO_EXTRACT_NOTES_TEST_FAULT", "before_publish")
+    interrupted = finalize_note(config, draft(tmp_path / "orphan.json", prepared, "# Orphan\n\nTwo\n", expected_revision=1))
+    monkeypatch.delenv("VIDEO_EXTRACT_NOTES_TEST_FAULT")
+    target = interrupted["next_action"]["commit_id"]
+
+    winner = finalize_note(config, draft(tmp_path / "winner.json", prepared, "# Winner\n\nTwo\n", expected_revision=1))
+    conflict = reconcile_notes(config, target)
+    pointer = json.loads((config.results / "source-notes/current.json").read_text())
+
+    assert winner["status"] == "completed"
+    assert conflict["status"] == "awaiting_user" and conflict["validation"]["expected_revision"] == "conflict"
+    assert pointer["commit_id"] == winner["result"]["commit_id"]
+    assert Path(conflict["result"]["candidate"]).is_file()
 
 
 def test_identical_finalize_reuses_valid_revision(tmp_path: Path) -> None:
