@@ -27,3 +27,9 @@ to Obsidian, and unregisters its view/resources on unload. It must be installed 
 isolated fixture Vault for real UI acceptance. Automated tests use only temporary
 workspace fixtures, so responsive rendering, plugin install/uninstall, and click
 behavior in real Obsidian remain pending acceptance under A06/A16.
+
+The isolated-Vault operator checklist and evidence template are in
+[`docs/acceptance/issue-25.md`](acceptance/issue-25.md). The current schema-v1
+production Vault is not a valid acceptance target and must not be modified to
+manufacture this evidence. A reproducible public fixture-preparation entry point
+is still required before a clean checkout can run the complete checklist.
