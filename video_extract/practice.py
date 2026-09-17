@@ -214,9 +214,16 @@ def _unstable(config:WorkspaceConfig,snapshot:dict[str,Any],pid:str,diagnostic:s
 def _derive_completion(practice:dict[str,Any])->str:
     events=practice["events"]
     attempts=any(item["kind"]=="attempt" for item in events)
-    observed_tests=[item for item in events if item["kind"]=="test" and item.get("verification")=="tool_observed"]
-    passed=any(item["exit_code"]==0 and all(value=="passed" for value in item["cases"].values()) for item in observed_tests)
-    if not practice["checkpoints"] or not attempts or not passed:return "in_progress"
+    if not practice["checkpoints"] or not attempts:return "in_progress"
+    checkpoint=practice["checkpoints"][-1]
+    observed_tests=[item for item in events if item["kind"]=="test"
+                    and item.get("verification")=="tool_observed"
+                    and item.get("checkpoint_id")==checkpoint["checkpoint_id"]
+                    and item.get("code_object_sha256")==checkpoint["object_sha256"]]
+    if not observed_tests:return "in_progress"
+    latest=observed_tests[-1]
+    passed=latest["exit_code"]==0 and all(value=="passed" for value in latest["cases"].values())
+    if not passed:return "in_progress"
     return "with_hint" if any(item["kind"]=="hint" for item in events) else "independent"
 
 def checkpoint(config:WorkspaceConfig,pid:str,expected_revision:int)->dict[str,Any]:
@@ -248,6 +255,14 @@ def checkpoint(config:WorkspaceConfig,pid:str,expected_revision:int)->dict[str,A
             if before!=after: raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
             second=[(name,_read_regular(task_fd,name)) for name in file_names]
             if first!=second: raise WorkspaceError("editable file content changed during checkpoint")
+            if fault=="late_after_second":(task/"late.py").write_text("# late\n")
+            final_fd=_open_task(root,pid)
+            try:
+                final_root=os.fstat(final_fd)
+                if (initial_root.st_dev,initial_root.st_ino)!=(final_root.st_dev,final_root.st_ino):raise WorkspaceError("editable task root changed during checkpoint")
+                final=_inventory(final_fd)
+            finally:os.close(final_fd)
+            if after!=final: raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
             payload=json.dumps({name:body.decode("utf-8") for name,body in first},ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
         except (OSError,WorkspaceError) as exc:
             return _unstable(config,snapshot,pid,str(exc))
@@ -271,6 +286,11 @@ def record(config:WorkspaceConfig,pid:str,request_path:Path,expected_revision:in
         snapshot=_load(config); practice=_get(snapshot,pid); conflict=_conflict(config,snapshot,expected_revision,"record",{"practice_id":pid,"event":event})
         if conflict:return conflict
         if any(x["event_id"]==event["event_id"] for x in practice["events"]):return _result(config,snapshot,practice,reused=True)
+        if event["kind"]=="test":
+            checkpoints={item["checkpoint_id"]:item for item in practice["checkpoints"]}
+            checkpoint=checkpoints.get(event["checkpoint_id"])
+            if checkpoint is None or checkpoint["object_sha256"]!=event["code_object_sha256"]:
+                raise ValueError("test event must identify an existing checkpoint and its code object")
         saved={**event,"recorded_at":_now()}
         if event["kind"]!="test":saved["verification"]="reported_not_executed"
         updated={**practice,"events":[*practice["events"],saved]}

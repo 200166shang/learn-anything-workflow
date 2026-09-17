@@ -131,14 +131,18 @@ def test_record_keeps_hint_attempt_and_test_facts_without_executing_or_changing_
     _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
     practice_id = prepared["result"]["practice"]["practice_id"]
     marker = tmp_path / "must-not-run"
-    revision = 1
+    _, checked = cli("practice", "checkpoint", "--practice-id", practice_id,
+                     "--expected-revision", 1, "--workspace", config, "--json")
+    revision = checked["result"]["revision"]
+    checkpoint = checked["result"]["checkpoint"]
     events = [
         {"event_id": "hint-1", "kind": "hint", "level": 1, "summary": "先比较时间差"},
         {"event_id": "attempt-1", "kind": "attempt", "summary": "修正边界条件"},
         {"event_id": "test-1", "kind": "test", "command": ["touch", str(marker)],
          "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
          "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00",
-         "verification": "tool_observed"},
+         "verification": "tool_observed", "checkpoint_id": checkpoint["checkpoint_id"],
+         "code_object_sha256": checkpoint["object_sha256"]},
         {"event_id": "outcome-1", "kind": "outcome", "completion": "with_hint",
          "next_step": "尝试改变过期阈值"},
     ]
@@ -151,7 +155,7 @@ def test_record_keeps_hint_attempt_and_test_facts_without_executing_or_changing_
         assert code == 0
         revision = recorded["result"]["revision"]
     assert not marker.exists()
-    assert recorded["result"]["practice"]["completion"] == "in_progress"
+    assert recorded["result"]["practice"]["completion"] == "with_hint"
     assert recorded["result"]["practice"]["reported_outcome"] == "with_hint"
     assert len(recorded["result"]["practice"]["events"]) == 4
     assert not (config.parent / "results/learning/current.json").exists()
@@ -211,7 +215,7 @@ def test_backup_entries_pin_checkpointed_code_and_exclude_editable_workspace(tmp
     assert restored_entries["commit_id"] == checked["result"]["commit_id"]
 
 
-@pytest.mark.parametrize("fault", ["late_file", "remove_file", "type_change", "symlink_swap"])
+@pytest.mark.parametrize("fault", ["late_file", "remove_file", "type_change", "symlink_swap", "late_after_second"])
 def test_checkpoint_rejects_file_set_and_type_races(tmp_path: Path, fault: str) -> None:
     config = write_workspace(tmp_path / "workspace")
     request = prepare_request(tmp_path / "practice.json")
@@ -258,7 +262,9 @@ def test_hint_prevents_independent_completion_even_when_outcome_claims_it(tmp_pa
         {"event_id": "attempt-derived", "kind": "attempt", "summary": "fixed boundary"},
         {"event_id": "test-derived", "kind": "test", "command": ["pytest"],
          "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
-         "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00", "verification": "tool_observed"},
+         "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00", "verification": "tool_observed",
+         "checkpoint_id": checked["result"]["checkpoint"]["checkpoint_id"],
+         "code_object_sha256": checked["result"]["checkpoint"]["object_sha256"]},
         {"event_id": "outcome-derived", "kind": "outcome", "completion": "independent", "next_step": "vary threshold"},
     ]
     for event in events:
@@ -303,10 +309,79 @@ def test_reported_but_unexecuted_test_fact_cannot_complete_practice(tmp_path: Pa
         {"event_id": "test-reported", "kind": "test", "command": ["pytest"],
          "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
          "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00",
-         "verification": "reported_not_executed"},
+         "verification": "reported_not_executed",
+         "checkpoint_id": checked["result"]["checkpoint"]["checkpoint_id"],
+         "code_object_sha256": checked["result"]["checkpoint"]["object_sha256"]},
     ):
         path = tmp_path / f'{event["event_id"]}.json'; path.write_text(json.dumps(event))
         _, result = cli("practice", "record", "--practice-id", pid, "--request", path,
                         "--expected-revision", revision, "--workspace", config, "--json")
         revision = result["result"]["revision"]
     assert result["result"]["practice"]["completion"] == "in_progress"
+
+
+def test_new_checkpoint_resets_completion_until_that_code_is_tested(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+    _, first = cli("practice", "checkpoint", "--practice-id", pid, "--expected-revision", 1,
+                   "--workspace", config, "--json")
+    revision = first["result"]["revision"]; checkpoint = first["result"]["checkpoint"]
+    for event in (
+        {"event_id": "attempt-first", "kind": "attempt", "summary": "implemented"},
+        {"event_id": "test-first", "kind": "test", "command": ["pytest"],
+         "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"}, "exit_code": 0,
+         "observed_at": "2026-09-17T02:00:00+00:00", "verification": "tool_observed",
+         "checkpoint_id": checkpoint["checkpoint_id"], "code_object_sha256": checkpoint["object_sha256"]},
+    ):
+        path=tmp_path/f'{event["event_id"]}.json';path.write_text(json.dumps(event))
+        _, result=cli("practice","record","--practice-id",pid,"--request",path,"--expected-revision",revision,"--workspace",config,"--json")
+        revision=result["result"]["revision"]
+    assert result["result"]["practice"]["completion"] == "independent"
+    _, second = cli("practice", "checkpoint", "--practice-id", pid, "--expected-revision", revision,
+                    "--workspace", config, "--json")
+    assert second["result"]["practice"]["completion"] == "in_progress"
+
+
+def test_latest_failure_for_current_checkpoint_overrides_earlier_pass(tmp_path: Path) -> None:
+    config=write_workspace(tmp_path/"workspace");request=prepare_request(tmp_path/"practice.json")
+    _,prepared=cli("practice","prepare","--request",request,"--workspace",config,"--json");pid=prepared["result"]["practice"]["practice_id"]
+    _,checked=cli("practice","checkpoint","--practice-id",pid,"--expected-revision",1,"--workspace",config,"--json")
+    revision=checked["result"]["revision"]; checkpoint=checked["result"]["checkpoint"]
+    events=[{"event_id":"attempt-latest","kind":"attempt","summary":"implemented"}]
+    for name,state,exit_code in (("pass","passed",0),("fail","failed",1)):
+        events.append({"event_id":f"test-{name}","kind":"test","command":["pytest"],
+            "cases":{"normal":state,"expired":state,"boundary":state},"exit_code":exit_code,
+            "observed_at":"2026-09-17T02:00:00+00:00","verification":"tool_observed",
+            "checkpoint_id":checkpoint["checkpoint_id"],"code_object_sha256":checkpoint["object_sha256"]})
+    for event in events:
+        path=tmp_path/f'{event["event_id"]}.json';path.write_text(json.dumps(event))
+        _,result=cli("practice","record","--practice-id",pid,"--request",path,"--expected-revision",revision,"--workspace",config,"--json")
+        revision=result["result"]["revision"]
+    assert result["result"]["practice"]["completion"] == "in_progress"
+
+
+def test_test_event_rejects_checkpoint_code_identity_mismatch(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+    _, checked = cli("practice", "checkpoint", "--practice-id", pid, "--expected-revision", 1,
+                     "--workspace", config, "--json")
+    checkpoint = checked["result"]["checkpoint"]
+    event = tmp_path / "mismatched-test.json"
+    event.write_text(json.dumps({
+        "event_id": "test-mismatch", "kind": "test", "command": ["pytest"],
+        "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
+        "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00",
+        "verification": "tool_observed", "checkpoint_id": checkpoint["checkpoint_id"],
+        "code_object_sha256": "0" * 64,
+    }))
+
+    code, rejected = cli("practice", "record", "--practice-id", pid, "--request", event,
+                         "--expected-revision", checked["result"]["revision"],
+                         "--workspace", config, "--json")
+
+    assert code == 1
+    assert rejected["validation"]["request"] == "failed"
