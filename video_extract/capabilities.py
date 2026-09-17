@@ -319,7 +319,8 @@ def run_learning(request: dict[str, Any]) -> dict[str, Any]:
             return back(workspace, request["thread_id"], request.get("expected_revision"))
         if action == "locate": return locate(workspace, request["question_id"])
         if action == "explanation.prepare":
-            return prepare_explanation(workspace, request["question_id"], request["profile"])
+            return prepare_explanation(workspace, request["question_id"], request["profile"],
+                                       request.get("reuse_review"))
         if action == "explanation.commit":
             return commit_explanation(workspace, request["question_id"], Path(request["draft"]),
                                       Path(request["evidence"]), Path(request["teaching_review"]),

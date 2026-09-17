@@ -168,6 +168,19 @@ def _deep_validate(value: dict[str, Any]) -> None:
                     or ref["object_sha256"] != revision["object_sha256"] \
                     or ref["logical_path"] != revision["logical_path"]:
                 raise WorkspaceError(f"question explanation locator is invalid: {question_id}")
+        local_thread = threads[question["thread_id"]]
+        for ref in question.get("cross_root_references", []):
+            source = ref["source"]
+            source_question = questions.get(source["question_id"])
+            source_thread = threads.get(source["thread_id"])
+            explanation = explanations.get(source["explanation_id"])
+            revision = explanation and explanation["revisions"].get(str(source["explanation_revision"]))
+            if (source_question is None or source_question["thread_id"] != source["thread_id"]
+                    or source_thread is None or source_thread["module_id"] != source["module_id"]
+                    or source["module_id"] == local_thread["module_id"] or revision is None
+                    or source["section_id"] not in revision["section_map"].get(source["question_id"], [])
+                    or source["object_sha256"] != revision["object_sha256"]):
+                raise WorkspaceError(f"cross-root reference target is invalid: {question_id}")
 
 
 def _validate_candidate_store(config: WorkspaceConfig) -> list[Path]:
@@ -774,27 +787,58 @@ def _evidence_source_checks(config: WorkspaceConfig, evidence_refs: list[dict[st
     return checks
 
 
+def _cross_root_reference_state(record: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:
+    source = reference["source"]
+    explanation = record["explanations"].get(source["explanation_id"])
+    if explanation is None or source["question_id"] not in record["questions"]:
+        return {**reference, "status": "needs_review", "change": "target_missing"}
+    current_revision = explanation["current_revision"]
+    current = explanation["revisions"][str(current_revision)]
+    current_sections = current["section_map"].get(source["question_id"], [])
+    if (current_revision == source["explanation_revision"]
+            and source["section_id"] in current_sections
+            and current["object_sha256"] == source["object_sha256"]):
+        return {**reference, "status": "current"}
+    pinned = explanation["revisions"].get(str(source["explanation_revision"])) or {}
+    change = ("location_or_expression_changed"
+              if pinned.get("evidence_refs") == current.get("evidence_refs")
+              and not current.get("introduced_correction_ids")
+              else "conclusion_or_conditions_changed")
+    return {**reference, "status": "needs_review", "change": change,
+            "current_target": {"explanation_revision": current_revision,
+                               "section_ids": current_sections,
+                               "object_sha256": current["object_sha256"]}}
+
+
+def _cross_root_states(record: dict[str, Any], question: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_cross_root_reference_state(record, item)
+            for item in question.get("cross_root_references", [])]
+
+
 def locate(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
-    snapshot = _load(config); question = snapshot["record"]["questions"].get(question_id)
+    snapshot = _load(config); record = snapshot["record"]; question = record["questions"].get(question_id)
     if question is None:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
+    cross_root_references = _cross_root_states(record, question)
     if not question["explanation_refs"]:
         return response(status="awaiting_model", workspace=str(config.config_path), result={
-            "question": question, "explanation_state": "pending"},
+            "question": question, "explanation_state": "pending",
+            "cross_root_references": cross_root_references},
             next_action={"type": "model", "action": "prepare_explanation"})
     locations = [{**ref, "document_path": str(config.results / ref["logical_path"])}
                  for ref in question["explanation_refs"]]
     evidence_refs: list[dict[str, Any]] = []
     for ref in question["explanation_refs"]:
-        explanation = snapshot["record"]["explanations"][ref["explanation_id"]]
+        explanation = record["explanations"][ref["explanation_id"]]
         revision = explanation["revisions"][str(ref["explanation_revision"])]
         evidence_refs.extend(revision["evidence_refs"])
     source_checks = _evidence_source_checks(config, evidence_refs)
     explanation_state = ("needs_review" if any(item["status"] != "current" for item in source_checks)
+                         or any(item["status"] != "current" for item in cross_root_references)
                          else "available")
     return response(status="completed", workspace=str(config.config_path), result={
         "question": question, "explanation_state": explanation_state, "locations": locations,
-        "source_checks": source_checks})
+        "source_checks": source_checks, "cross_root_references": cross_root_references})
 
 
 PROFILES = {
@@ -804,7 +848,8 @@ PROFILES = {
 }
 
 
-def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str) -> dict[str, Any]:
+def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str,
+                        reuse_review: dict[str, Any] | None = None) -> dict[str, Any]:
     if profile not in PROFILES:
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=[f"unknown teaching profile: {profile}"])
@@ -812,6 +857,64 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str)
     if question is None:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
     thread = record["threads"][question["thread_id"]]; module = record["modules"][thread["module_id"]]
+    cross_root_reference = None
+    stale_references = [item for item in _cross_root_states(record, question) if item["status"] != "current"]
+    if stale_references and reuse_review is None:
+        return response(status="awaiting_user", workspace=str(config.config_path), result={
+            "question": question, "explanation_state": "needs_review",
+            "cross_root_references": stale_references}, validation={"cross_root_references": "needs_review"},
+            diagnostics=["a pinned cross-root reference changed; recheck its meaning, conditions, and target before revising"],
+            next_action={"type": "user", "reason": "explicitly recheck the affected cross-root reference"})
+    if reuse_review is not None:
+        required = ("target_question_id", "concept", "semantic_equivalence", "coordinate_assumptions",
+                    "applicability_conditions", "citation_intent", "local_context")
+        missing = [key for key in required if not reuse_review.get(key)]
+        target = record["questions"].get(reuse_review.get("target_question_id"))
+        target_thread = record["threads"].get((target or {}).get("thread_id"))
+        if missing or target is None or target_thread is None:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"cross_root_review": "failed"},
+                            diagnostics=["reuse review must name an existing target and explicitly check concept semantics, coordinates/assumptions, conditions, intent, and local context"])
+        if target_thread["module_id"] == thread["module_id"]:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"cross_root_review": "failed"},
+                            diagnostics=["cross-root reuse target must belong to another module"])
+        if not isinstance(reuse_review["applicability_conditions"], list) or not all(
+                isinstance(item, str) and item.strip() for item in reuse_review["applicability_conditions"]):
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"cross_root_review": "failed"},
+                            diagnostics=["applicability_conditions must be a non-empty list of explicit conditions"])
+        if not target["explanation_refs"]:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"cross_root_review": "failed"}, diagnostics=["reuse target has no explanation"])
+        target_locator = target["explanation_refs"][0]
+        target_explanation = record["explanations"][target_locator["explanation_id"]]
+        target_revision = target_explanation["revisions"][str(target_explanation["current_revision"])]
+        target_checks = _evidence_source_checks(config, target_revision["evidence_refs"])
+        if any(item["status"] != "current" for item in target_checks):
+            return response(status="awaiting_user", workspace=str(config.config_path),
+                            result={"target_question": target, "source_checks": target_checks},
+                            validation={"cross_root_review": "needs_review"},
+                            diagnostics=["reuse target source versions are not current"])
+        checked_versions = []
+        target_module = record["modules"][target_thread["module_id"]]
+        roles = {(item["source_id"], item["source_version"]): item["role"] for item in target_module["source_refs"]}
+        for evidence in target_revision["evidence_refs"]:
+            identity = (evidence["source_id"], evidence["source_version"])
+            item = {"source_id": identity[0], "source_version": identity[1], "role": roles[identity]}
+            if item not in checked_versions: checked_versions.append(item)
+        cross_root_reference = {
+            "reference_id": "cross-reference-" + str(uuid.uuid4()),
+            "source": {"module_id": target_thread["module_id"], "thread_id": target["thread_id"],
+                       "question_id": target["question_id"], "explanation_id": target_locator["explanation_id"],
+                       "explanation_revision": target_explanation["current_revision"],
+                       "section_id": target_revision["section_map"][target["question_id"]][0],
+                       "object_sha256": target_revision["object_sha256"]},
+            "concept": reuse_review["concept"], "semantic_equivalence": reuse_review["semantic_equivalence"],
+            "coordinate_assumptions": reuse_review["coordinate_assumptions"],
+            "applicability_conditions": reuse_review["applicability_conditions"],
+            "citation_intent": reuse_review["citation_intent"], "local_context": reuse_review["local_context"],
+            "checked_source_versions": checked_versions, "checked_at": _now()}
     trusted_evidence_refs: list[dict[str, Any]] | None = None
     if question["explanation_refs"]:
         evidence_refs: list[dict[str, Any]] = []
@@ -855,12 +958,15 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str)
                        "section_id": section_id, "prepared_revision": snapshot["revision"] + 1,
                        "source_refs": module["source_refs"], "source_scope_sha256": source_scope,
                        "created_at": _now(), "consumed_at": None}
+        if cross_root_reference is not None:
+            preparation["cross_root_reference"] = cross_root_reference
         updated = {**record, "preparations": {**record["preparations"], preparation_id: preparation}}
         published = _publish(config, snapshot, updated)
     return response(status="awaiting_model", workspace=str(config.config_path), result={
         "question": question, "profile": profile, "section_id": section_id, "preparation_id": preparation_id,
         "prepared_revision": published["revision"],
         "required_marker": f"<!-- section-id: {section_id} -->", "source_context": context,
+        "cross_root_reference": cross_root_reference,
         "claim_types": ["course_fact", "current_code", "supplemental_source", "inference"],
     }, validation={"learning_record": "passed", "sources": "passed"}, next_action={
         "type": "model", "action": "write_complete_explanation", "instructions": PROFILES[profile],
@@ -1039,6 +1145,11 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
             return response(status="failed", workspace=str(config.config_path),
                             validation={"preparation": "failed"},
                             diagnostics=["preparation token is missing, stale, consumed, cross-question, or marker-mismatched"])
+        prepared_cross_reference = preparation.get("cross_root_reference")
+        if prepared_cross_reference is not None and prepared_cross_reference["local_context"] not in text:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"cross_root_context": "failed"},
+                            diagnostics=["the current root draft must retain the reviewed local context for a cross-root reference"])
         allowed_refs = {(item["source_id"], item["source_version"]): item["role"] for item in module["source_refs"]}
         evidence_errors: list[str] = []
         for item in evidence:
@@ -1165,10 +1276,15 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
                        "confirmed_corrections": confirmed_corrections}
         updated_questions = dict(record["questions"])
         for mapped_question_id, section_ids in section_map.items():
-            updated_questions[mapped_question_id] = {**updated_questions[mapped_question_id], "explanation_refs": [
+            updated_question = {**updated_questions[mapped_question_id], "explanation_refs": [
                 {"explanation_id": explanation_id, "explanation_revision": revision,
                  "section_id": section_id, "object_sha256": digest, "logical_path": logical_path}
                 for section_id in section_ids]}
+            if mapped_question_id == question_id and prepared_cross_reference is not None:
+                prior = [item for item in updated_question.get("cross_root_references", [])
+                         if item["source"]["question_id"] != prepared_cross_reference["source"]["question_id"]]
+                updated_question["cross_root_references"] = [*prior, prepared_cross_reference]
+            updated_questions[mapped_question_id] = updated_question
         updated = {**record, "questions": updated_questions,
                    "preparations": {**record["preparations"], preparation_id: {**preparation, "consumed_at": _now()}},
                    "explanations": {**record["explanations"], explanation_id: explanation}}
