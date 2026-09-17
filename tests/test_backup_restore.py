@@ -14,6 +14,25 @@ from video_extract.workspace import WorkspaceConfig
 from video_extract.cli import main
 
 
+@pytest.mark.parametrize("kind", ["file", "dangling_symlink"])
+def test_backup_cli_rejects_invalid_receipt_root(tmp_path: Path, kind: str) -> None:
+    config = workspace(tmp_path / "workspace")
+    config.results.mkdir(parents=True)
+    root = config.results / "operation-receipts"
+    if kind == "file":
+        root.write_text("corrupt receipt root", encoding="utf-8")
+    else:
+        root.symlink_to(tmp_path / "missing-receipts", target_is_directory=True)
+    backup = tmp_path / "backup"
+    completed = subprocess.run(
+        [sys.executable, "-m", "video_extract.cli", "backup", "create", str(backup),
+         "--workspace", str(config.config_path), "--json"], capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+    assert completed.returncode != 0
+    assert result["status"] != "completed"
+    assert not backup.exists()
+
+
 def test_restore_cli_rejects_receipt_changed_during_copy(tmp_path: Path, monkeypatch, capsys) -> None:
     config, _, _ = populated(tmp_path)
     backup = tmp_path / "backup"

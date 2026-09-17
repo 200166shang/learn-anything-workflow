@@ -107,10 +107,12 @@ def _generation(config: WorkspaceConfig, store: str) -> tuple[dict[str, Any], li
 
 def _receipt_files(results: Path) -> list[Path]:
     root = results / "operation-receipts"
-    if not root.exists():
-        return []
     if root.is_symlink():
         raise WorkspaceError("operation receipt root must not be a symbolic link")
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise WorkspaceError("operation receipt root must be a directory")
     files = []
     for path in sorted(root.rglob("*")):
         if path.is_symlink():
