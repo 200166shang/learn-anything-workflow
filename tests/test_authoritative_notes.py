@@ -150,17 +150,16 @@ def test_failure_before_publish_leaves_previous_note_current(tmp_path: Path, mon
     assert failed["status"] == "recoverable_failure"
     with pytest.raises(WorkspaceError, match="not on the current commit chain"):
         audit_notes(config)
-    # Recovery refuses to claim durability while an orphan commit remains.
-    with pytest.raises(WorkspaceError):
-        reconcile_notes(config)
-    orphan = next((config.results / "source-notes/commits").glob("*.json"))
-    pointer = json.loads((config.results / "source-notes/current.json").read_text())
-    for item in (config.results / "source-notes/commits").glob("*.json"):
-        if item.stem != pointer["commit_id"]:
-            item.unlink()
+    target = failed["next_action"]["commit_id"]
+    recovered_run = subprocess.run(
+        [sys.executable, "-m", "video_extract.cli", "notes", "reconcile", "--commit-id", target,
+         "--workspace", str(config.config_path), "--json"], capture_output=True, text=True)
+    recovered = json.loads(recovered_run.stdout)
     current = audit_notes(config)
-    assert current["result"]["notes"][0]["revision"] == 1
-    assert Path(current["result"]["notes"][0]["note"]).read_text(encoding="utf-8").startswith("# First")
+    assert recovered_run.returncode == 0
+    assert recovered["status"] == "completed" and recovered["result"]["commit_id"] == target
+    assert current["result"]["notes"][0]["revision"] == 2
+    assert Path(current["result"]["notes"][0]["note"]).read_text(encoding="utf-8").startswith("# Second")
 
 
 def test_history_revision_pins_every_reconstructable_artifact(tmp_path: Path) -> None:
@@ -205,6 +204,12 @@ def test_locators_match_exact_structured_boundaries(tmp_path: Path) -> None:
     request.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="heading citation"):
         finalize_note(config, request)
+
+    for invalid in ("paragraph:0", "paragraph:-1", "paragraph:01"):
+        value["citations"] = [{"claim": "x", "locator_type": "paragraph", "locator": invalid}]
+        request.write_text(json.dumps(value))
+        with pytest.raises(ValueError, match="paragraph citation"):
+            finalize_note(config, request)
 
     transcript = tmp_path / "fixture.srt"; transcript.write_text("1\n00:00:03,000 --> 00:00:05,000\nEvidence\n", encoding="utf-8")
     srt = register(config, transcript); srt_prepared = prepare_note(config, srt["result"]["source_id"])

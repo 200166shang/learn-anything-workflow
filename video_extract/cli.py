@@ -163,7 +163,7 @@ def cmd_notes(args: argparse.Namespace) -> int:
             elif args.notes_action == "audit":
                 result = audit_notes(workspace)
             else:
-                result = reconcile_notes(workspace)
+                result = reconcile_notes(workspace, args.commit_id)
         except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
             result = response(status="missing_input", workspace=str(workspace.config_path),
                               validation={"request": "failed"}, diagnostics=[str(exc)])
@@ -533,6 +533,7 @@ def parser() -> argparse.ArgumentParser:
     notes_audit.add_argument("--workspace", type=Path); notes_audit.add_argument("--json", action="store_true")
     notes_audit.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
     notes_reconcile = notes_actions.add_parser("reconcile", help="deeply validate and repeat notes durability barriers")
+    notes_reconcile.add_argument("--commit-id")
     notes_reconcile.add_argument("--workspace", type=Path); notes_reconcile.add_argument("--json", action="store_true")
     notes_reconcile.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")

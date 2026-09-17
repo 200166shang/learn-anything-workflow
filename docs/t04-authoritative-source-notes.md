@@ -32,6 +32,11 @@ workspace identity, all note objects and source foreign keys, providing
 the common rebuild seam for later projections. `notes reconcile` repeats that
 validation and fsyncs every object, shard directory, commit, commit directory,
 pointer and store directory. A failed barrier leaves durability unconfirmed.
+If publication stops after an immutable commit is durable but before its
+pointer is published, the recoverable response names that exact commit and an
+executable `notes reconcile --commit-id ...` action. Reconcile publishes it
+only when it validates and is the unique next revision after current; an
+unclaimed orphan still makes ordinary audit fail.
 
 No command in this slice creates a learning question graph, invokes a model,
 produces audio, uploads content, or modifies the original transcript.

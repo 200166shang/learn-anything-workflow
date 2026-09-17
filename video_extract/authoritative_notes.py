@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,12 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 
 SCHEMA_VERSION = 1
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/notes-snapshot-v1.schema.json").read_text())
+
+
+class NotesPublishInterrupted(OSError):
+    def __init__(self, message: str, commit_id: str):
+        super().__init__(message)
+        self.commit_id = commit_id
 
 
 def _schema_validate(value: Any, definition: str | None = None) -> None:
@@ -234,7 +241,7 @@ def _validate_request(config: WorkspaceConfig, value: Any) -> tuple[dict[str, An
         if citation["locator_type"] == "timestamp" and locator not in cue_ranges:
             raise ValueError("timestamp citation does not match a real SRT cue")
         if citation["locator_type"] == "paragraph":
-            match = re.fullmatch(r"paragraph:(\d+)", locator)
+            match = re.fullmatch(r"paragraph:([1-9]\d*)", locator)
             if not match or int(match.group(1)) > len(paragraphs):
                 raise ValueError("paragraph citation does not match the registered source")
         if citation["locator_type"] == "heading" and locator not in headings:
@@ -365,14 +372,14 @@ def _publish(config: WorkspaceConfig, previous: dict[str, Any], notes: dict[str,
         raise WorkspaceError(f"immutable note commit differs from published content: {manifest['commit_id']}")
     _sync_dir(commits)
     if os.environ.get("VIDEO_EXTRACT_NOTES_TEST_FAULT") == "before_publish":
-        raise OSError("injected failure before notes publish")
+        raise NotesPublishInterrupted("injected failure before notes publish", manifest["commit_id"])
     pointer_value = {"schema_version": 1, "workspace_id": config.workspace_id,
                      "commit_id": manifest["commit_id"], "manifest_sha256": _digest(raw)}
     _schema_validate(pointer_value, "pointer")
     atomic_write_json(pointer, pointer_value)
     _sync_dir(pointer.parent)
     if os.environ.get("VIDEO_EXTRACT_NOTES_TEST_FAULT") == "after_publish":
-        raise OSError("injected failure after notes publish")
+        raise NotesPublishInterrupted("injected failure after notes publish", manifest["commit_id"])
     return manifest
 
 
@@ -452,10 +459,17 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                             artifact_refs=[str(stored["body"][1])])
     except OSError as exc:
         current = _load_current(config)
+        target_commit = exc.commit_id if isinstance(exc, NotesPublishInterrupted) else None
+        command = f"video-extract notes reconcile --workspace {shlex.quote(str(config.config_path))} --json"
+        if target_commit:
+            command = (f"video-extract notes reconcile --commit-id {shlex.quote(target_commit)} "
+                       f"--workspace {shlex.quote(str(config.config_path))} --json")
         return response(status="recoverable_failure", workspace=str(config.config_path),
-                        result={"source_id": source_id, "visible_commit_id": current.get("commit_id")},
+                        result={"source_id": source_id, "visible_commit_id": current.get("commit_id"),
+                                "target_commit_id": target_commit},
                         validation={"commit": "uncertain", "durability": "unknown"}, diagnostics=[str(exc)],
-                        next_action={"type": "reconcile", "source_id": source_id})
+                        next_action={"type": "reconcile", "source_id": source_id,
+                                     "commit_id": target_commit, "command": command})
 
 
 def audit_notes(config: WorkspaceConfig) -> dict[str, Any]:
@@ -496,9 +510,27 @@ def audit_notes(config: WorkspaceConfig) -> dict[str, Any]:
                     validation={"commits": "passed", "objects": "passed", "sources": "passed"})
 
 
-def reconcile_notes(config: WorkspaceConfig) -> dict[str, Any]:
-    audited = audit_notes(config)
+def reconcile_notes(config: WorkspaceConfig, target_commit_id: str | None = None) -> dict[str, Any]:
     objects, commits, pointer, _ = _roots(config)
+    if target_commit_id:
+        target_path = commits / f"{target_commit_id}.json"
+        if not target_path.is_file():
+            raise WorkspaceError(f"target notes commit is missing: {target_commit_id}")
+        target = read_json(target_path)
+        _validate_commit(config, target)
+        if target["commit_id"] != target_commit_id or target_path.name != f"{target_commit_id}.json":
+            raise WorkspaceError("target notes commit identity is invalid")
+        current = _load_current(config)
+        if current.get("commit_id") != target_commit_id:
+            if target["parent_commit_id"] != current.get("commit_id") or target["revision"] != current["revision"] + 1:
+                raise WorkspaceError("target notes commit is not the unique next commit after current")
+            raw = target_path.read_bytes()
+            pointer_value = {"schema_version": 1, "workspace_id": config.workspace_id,
+                             "commit_id": target_commit_id, "manifest_sha256": _digest(raw)}
+            _schema_validate(pointer_value, "pointer")
+            atomic_write_json(pointer, pointer_value)
+            _sync_dir(pointer.parent)
+    audited = audit_notes(config)
     for path in sorted(objects.glob("*/*")) if objects.exists() else []:
         _sync_file(path)
     for shard in sorted(objects.glob("*")) if objects.exists() else []:
@@ -513,5 +545,6 @@ def reconcile_notes(config: WorkspaceConfig) -> dict[str, Any]:
     _sync_file(pointer)
     _sync_dir(pointer.parent)
     audited["result"]["durability"] = "confirmed"
+    audited["result"]["commit_id"] = audited["result"]["notes"][0]["commit_id"] if audited["result"]["notes"] else None
     audited["validation"]["durability"] = "passed"
     return audited
