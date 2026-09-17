@@ -57,6 +57,24 @@ def test_restore_cli_rejects_receipt_changed_during_copy(tmp_path: Path, monkeyp
     assert not target.results.exists()
 
 
+def test_backup_accepts_completed_delivery_receipt_and_rejects_invalid_projection(tmp_path: Path) -> None:
+    from test_delivery import at, configured
+    from video_extract.delivery import tick
+    config, _, _ = configured(tmp_path)
+    delivered = tick(config, "2026-09-18", clock=at("2026-09-18T09:00:00+08:00"))
+    assert delivered["status"] == "completed"
+
+    accepted = create_backup(config, tmp_path / "delivery-backup")
+    assert accepted["status"] == "completed"
+
+    receipt = config.results / "operation-receipts" / f'{delivered["operation_id"]}.json'
+    damaged = json.loads(receipt.read_text(encoding="utf-8"))
+    damaged["receipt"].pop("target_fingerprint")
+    receipt.write_text(json.dumps(damaged), encoding="utf-8")
+    rejected = create_backup(config, tmp_path / "damaged-delivery-backup")
+    assert rejected["status"] == "recoverable_failure"
+
+
 def workspace(root: Path, *, results: str = "results") -> WorkspaceConfig:
     root.mkdir(parents=True)
     config = root / "workspace.toml"
