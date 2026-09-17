@@ -333,6 +333,25 @@ def cmd_review(args: argparse.Namespace) -> int:
     emit(result, args.json); return exit_code(result)
 
 
+def cmd_practice(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .package_lock import PackageBusyError
+    from .practice import checkpoint, prepare, record
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.practice_action == "prepare": result = prepare(workspace, args.request)
+        elif args.practice_action == "checkpoint": result = checkpoint(workspace, args.practice_id, args.expected_revision)
+        else: result = record(workspace, args.practice_id, args.request, args.expected_revision)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)],
+                          next_action={"type": "retry", "reason": "another practice write is publishing"})
+    except (OSError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path),
+                          validation={"request": "failed"}, diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     from .command_response import exit_code
     from .installation import apply, inspect, plan
@@ -731,6 +750,11 @@ def parser() -> argparse.ArgumentParser:
     review_prepare = review_actions.add_parser("prepare"); review_prepare.add_argument("--question-id", required=True); review_prepare.add_argument("--preparation-id", help="stable retry identity beginning review-preparation-"); review_prepare.add_argument("--workspace", type=Path); review_prepare.add_argument("--json", action="store_true"); review_prepare.set_defaults(func=cmd_review)
     review_record = review_actions.add_parser("record"); review_record.add_argument("--preparation-id", required=True); review_record.add_argument("--event-id", required=True); review_record.add_argument("--answer"); review_record.add_argument("--answer-summary"); review_record.add_argument("--hint", action="append", default=[]); review_record.add_argument("--model-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored"), required=True); review_record.add_argument("--correction"); review_record.add_argument("--corrected-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored")); review_record.add_argument("--workspace", type=Path); review_record.add_argument("--json", action="store_true"); review_record.set_defaults(func=cmd_review)
     review_show = review_actions.add_parser("show"); review_show.add_argument("--question-id"); review_show.add_argument("--workspace", type=Path); review_show.add_argument("--json", action="store_true"); review_show.set_defaults(func=cmd_review)
+    practice = commands.add_parser("practice", help="prepare and record one isolated local mechanism practice")
+    practice_actions = practice.add_subparsers(dest="practice_action", required=True)
+    practice_prepare = practice_actions.add_parser("prepare"); practice_prepare.add_argument("--request", type=Path, required=True); practice_prepare.add_argument("--workspace", type=Path); practice_prepare.add_argument("--json", action="store_true"); practice_prepare.set_defaults(func=cmd_practice)
+    practice_checkpoint = practice_actions.add_parser("checkpoint"); practice_checkpoint.add_argument("--practice-id", required=True); practice_checkpoint.add_argument("--expected-revision", type=int, required=True); practice_checkpoint.add_argument("--workspace", type=Path); practice_checkpoint.add_argument("--json", action="store_true"); practice_checkpoint.set_defaults(func=cmd_practice, request=None)
+    practice_record = practice_actions.add_parser("record"); practice_record.add_argument("--practice-id", required=True); practice_record.add_argument("--request", type=Path, required=True); practice_record.add_argument("--expected-revision", type=int, required=True); practice_record.add_argument("--workspace", type=Path); practice_record.add_argument("--json", action="store_true"); practice_record.set_defaults(func=cmd_practice)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):

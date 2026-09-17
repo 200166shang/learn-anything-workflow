@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/practice-event-v1.schema.json",
+  "oneOf": [
+    {"type":"object","required":["event_id","kind","level","summary"],"properties":{"event_id":{"type":"string","minLength":1},"kind":{"const":"hint"},"level":{"enum":[1,2,3]},"summary":{"type":"string","minLength":1,"maxLength":2000}},"additionalProperties":false},
+    {"type":"object","required":["event_id","kind","summary"],"properties":{"event_id":{"type":"string","minLength":1},"kind":{"const":"attempt"},"summary":{"type":"string","minLength":1,"maxLength":2000}},"additionalProperties":false},
+    {"type":"object","required":["event_id","kind","command","cases","exit_code","observed_at","verification","checkpoint_id","code_object_sha256"],"properties":{"event_id":{"type":"string","minLength":1},"kind":{"const":"test"},"command":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},"cases":{"type":"object","required":["normal","expired","boundary"],"properties":{"normal":{"enum":["passed","failed"]},"expired":{"enum":["passed","failed"]},"boundary":{"enum":["passed","failed"]}},"additionalProperties":false},"exit_code":{"type":"integer"},"observed_at":{"type":"string","format":"date-time"},"verification":{"enum":["reported_not_executed","tool_observed"]},"checkpoint_id":{"type":"string","pattern":"^checkpoint-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},"code_object_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"additionalProperties":false},
+    {"type":"object","required":["event_id","kind","completion","next_step"],"properties":{"event_id":{"type":"string","minLength":1},"kind":{"const":"outcome"},"completion":{"enum":["independent","with_hint","example_only","incomplete"]},"next_step":{"type":"string","minLength":1,"maxLength":2000}},"additionalProperties":false}
+  ]
+}
