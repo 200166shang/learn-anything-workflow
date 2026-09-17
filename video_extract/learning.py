@@ -692,8 +692,9 @@ _CORRECTION_BLOCK = re.compile(
     r"<!-- correction-id: (correction-[0-9a-f-]{36}) -->\n(.*?)\n<!-- /correction-id: \1 -->",
     re.DOTALL,
 )
-_CORRECTION_MARKER = re.compile(
-    r"(?m)^<!--\s*(?P<closing>/?)correction-id:\s*(?P<id>[^\s>]+)\s*-->$"
+_ANY_CORRECTION_COMMENT = re.compile(r"<!--(?:(?!-->).)*correction-id(?:(?!-->).)*-->", re.DOTALL)
+_CANONICAL_CORRECTION_MARKER = re.compile(
+    r"<!-- (?P<closing>/?)correction-id: (?P<id>correction-[0-9a-f-]{36}) -->"
 )
 
 
@@ -725,7 +726,13 @@ def _confirmed_correction_errors(text: str, corrections: list[dict[str, Any]]) -
     known = {correction["correction_id"]: correction for correction in corrections}
     blocks: dict[str, list[str]] = {}
     active: tuple[str, int] | None = None
-    for marker in _CORRECTION_MARKER.finditer(text):
+    for discovered in _ANY_CORRECTION_COMMENT.finditer(text):
+        marker = _CANONICAL_CORRECTION_MARKER.fullmatch(discovered.group())
+        at_column_zero = discovered.start() == 0 or text[discovered.start() - 1] == "\n"
+        ends_line = discovered.end() == len(text) or text[discovered.end()] == "\n"
+        if marker is None or not at_column_zero or not ends_line:
+            errors.append(f"noncanonical correction marker: {discovered.group()}")
+            continue
         correction_id = marker.group("id"); closing = bool(marker.group("closing"))
         if correction_id not in known:
             errors.append(f"unknown correction marker: {correction_id}")
@@ -733,14 +740,14 @@ def _confirmed_correction_errors(text: str, corrections: list[dict[str, Any]]) -
             if active is not None:
                 errors.append(f"correction opening marker is nested or duplicated: {correction_id}")
             else:
-                active = (correction_id, marker.start())
+                active = (correction_id, discovered.start())
         elif active is None:
             errors.append(f"orphan correction closing marker: {correction_id}")
         elif active[0] != correction_id:
             errors.append(f"mismatched correction closing marker: {active[0]} != {correction_id}")
             active = None
         else:
-            blocks.setdefault(correction_id, []).append(text[active[1]:marker.end()])
+            blocks.setdefault(correction_id, []).append(text[active[1]:discovered.end()])
             active = None
     if active is not None:
         errors.append(f"unclosed correction opening marker: {active[0]}")

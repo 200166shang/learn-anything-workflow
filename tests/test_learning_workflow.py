@@ -734,6 +734,12 @@ def test_restore_old_expression_overlays_confirmed_correction_without_moving_pro
         "orphan_closing": canonical_update + f"\n{closing}\n",
         "unknown_id": canonical_update + (f"\n<!-- correction-id: {unknown_id} -->\n未知\n"
                                                    f"<!-- /correction-id: {unknown_id} -->\n"),
+        "one_space_indent": canonical_update.replace(opening, " " + opening),
+        "three_space_indent": canonical_update.replace(opening, "   " + opening),
+        "tab_indent": canonical_update.replace(opening, "\t" + opening),
+        "inline_marker": canonical_update.replace(opening, "正文" + opening),
+        "spacing_variant_duplicate": canonical_update.replace(
+            opening, opening + f"\n<!--  correction-id: {correction_id} -->"),
     }
     for label, tampered in tampered_variants.items():
         rollback.write_text(tampered)
