@@ -13,6 +13,7 @@ from .workspace import WorkspaceConfig
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 MAX_SUGGESTIONS = 3
+MAX_TOTAL_MINUTES = 15
 
 
 def _latest_by(items: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
@@ -37,7 +38,9 @@ def _card_is_current(record: dict[str, Any], version: dict[str, Any]) -> bool:
     ))
 
 
-def today(config: WorkspaceConfig, on_date: str | None = None) -> dict[str, Any]:
+def today(config: WorkspaceConfig, on_date: str | None = None, *,
+          preferred_question_ids: list[str] | None = None,
+          preferred_card_version_ids: list[str] | None = None) -> dict[str, Any]:
     """Return at most three stable, read-only suggestions for one Shanghai date."""
     from .cards import _load as load_cards, schedule
     from .learning import _load as load_learning
@@ -48,6 +51,8 @@ def today(config: WorkspaceConfig, on_date: str | None = None) -> dict[str, Any]
     cards = load_cards(config)
     reviews = load_review(config)
     record = learning["record"]
+    preferred_questions = set(preferred_question_ids or [])
+    preferred_versions = set(preferred_card_version_ids or [])
 
     feedbacks = _latest_by(list(record["feedbacks"].values()), "question_id")
     latest_reviews = _latest_by([
@@ -62,15 +67,16 @@ def today(config: WorkspaceConfig, on_date: str | None = None) -> dict[str, Any]
     for card in cards["record"]["cards"].values():
         version = card["versions"][card["active_version_id"]]
         question_id = version["explanation_pin"]["question_id"]
+        preferred = version["card_version_id"] in preferred_versions
         feedback = feedbacks.get(question_id)
-        if feedback and feedback["state"] == "parked":
+        if feedback and feedback["state"] == "parked" and not preferred:
             continue
         if not _card_is_current(record, version):
             invalid_cards += 1
             continue
         computed = schedule(config, card_version_id=version["card_version_id"],
                             on_date=as_of.isoformat())["result"]
-        if date.fromisoformat(computed["due_date"]) > as_of:
+        if date.fromisoformat(computed["due_date"]) > as_of and not preferred:
             continue
         card_questions.add(question_id)
         item = {
@@ -78,12 +84,13 @@ def today(config: WorkspaceConfig, on_date: str | None = None) -> dict[str, Any]
             "object_id": card["card_id"],
             "object_version": version["card_version_id"],
             "question_id": question_id,
-            "reason": f"卡片已于 {computed['due_date']} 到期，适合进行一次主动回忆",
-            "estimated_minutes": 10,
+            "reason": ("你明确选择今天强化这张卡片" if preferred else
+                       f"卡片已于 {computed['due_date']} 到期，适合进行一次主动回忆"),
+            "estimated_minutes": 5,
             "action": {"command": "review prepare", "card_version_id": version["card_version_id"]},
             "due_date": computed["due_date"],
         }
-        ranked.append(((0, computed["due_date"], card["card_id"]), item))
+        ranked.append(((-1 if preferred else 0, computed["due_date"], card["card_id"]), item))
 
     for question_id, question in record["questions"].items():
         if question_id in card_questions or _current_question_pin(record, question_id) is None:
@@ -91,16 +98,24 @@ def today(config: WorkspaceConfig, on_date: str | None = None) -> dict[str, Any]
         thread = record["threads"].get(question["thread_id"])
         if thread is None:
             continue
+        preferred = question_id in preferred_questions
         feedback = feedbacks.get(question_id)
-        if feedback and feedback["state"] in {"understood", "parked"}:
+        if feedback and feedback["state"] in {"understood", "parked"} and not preferred:
             continue
         review = latest_reviews.get(question_id)
+        review_day = (date.fromisoformat(review["review_date"]) if review and review.get("review_date")
+                      else date.fromisoformat(review["created_at"][:10]) if review else None)
+        if review_day == as_of and not preferred:
+            continue
         difficult = bool(question["unresolved_confusions"]) or (feedback and feedback["state"] == "confused") \
             or (review and review["effective_evaluation"] in {"prompted", "not_recalled"})
         current_or_root = question_id in {thread["current_question_id"], thread["root_question_id"]}
-        if not difficult and not current_or_root:
+        if not preferred and not difficult and not current_or_root:
             continue
-        if feedback and feedback["state"] == "confused":
+        if preferred:
+            reason = "你明确选择今天强化这个已学问题"
+            recency = question["created_at"]
+        elif feedback and feedback["state"] == "confused":
             reason = "最近仍标记为不理解，建议用主动回忆定位具体卡点"
             recency = feedback["created_at"]
         elif question["unresolved_confusions"]:
@@ -124,13 +139,21 @@ def today(config: WorkspaceConfig, on_date: str | None = None) -> dict[str, Any]
             "question_id": question_id,
             "title": question["title"],
             "reason": reason,
-            "estimated_minutes": 15,
+            "estimated_minutes": 10,
             "action": {"command": "review prepare", "question_id": question_id},
         }
         recent_first = -datetime.fromisoformat(recency).timestamp()
-        ranked.append(((1 if difficult else 2, recent_first, question_id), item))
+        ranked.append(((-1 if preferred else 1 if difficult else 2, recent_first, question_id), item))
 
-    suggestions = [item for _, item in sorted(ranked, key=lambda pair: pair[0])[:MAX_SUGGESTIONS]]
+    suggestions: list[dict[str, Any]] = []
+    total_minutes = 0
+    for _, item in sorted(ranked, key=lambda pair: pair[0]):
+        if len(suggestions) >= MAX_SUGGESTIONS:
+            break
+        if total_minutes + item["estimated_minutes"] > MAX_TOTAL_MINUTES:
+            continue
+        suggestions.append(item)
+        total_minutes += item["estimated_minutes"]
     return response(
         status="completed",
         workspace=str(config.config_path),
@@ -138,6 +161,8 @@ def today(config: WorkspaceConfig, on_date: str | None = None) -> dict[str, Any]
             "as_of_date": as_of.isoformat(),
             "timezone": "Asia/Shanghai",
             "suggestions": suggestions,
+            "total_estimated_minutes": total_minutes,
+            "maximum_total_minutes": MAX_TOTAL_MINUTES,
             "empty_reason": None if suggestions else "no_eligible_started_learning_or_due_cards",
             "selection": {
                 "choose": "run review prepare for the selected question_id or card_version_id",
@@ -167,7 +192,9 @@ def run_suggestions(request: dict[str, Any]) -> dict[str, Any]:
     if request.get("action") != "today":
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=["unsupported suggestions action"])
-    return today(config, request.get("on_date"))
+    return today(config, request.get("on_date"),
+                 preferred_question_ids=request.get("preferred_question_ids"),
+                 preferred_card_version_ids=request.get("preferred_card_version_ids"))
 
 
 run_suggestions.__capability_contract__ = {

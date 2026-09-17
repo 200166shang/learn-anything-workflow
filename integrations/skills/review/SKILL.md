@@ -5,7 +5,7 @@ description: Run active recall against an existing persisted explanation, reveal
 
 # Review
 
-For a daily review intent, begin with `video-extract suggestions today --workspace CONFIG --json`. Present its saved-fact suggestions and reasons, then let the user choose one, name another valid question or card, or skip. A suggestion is read-only: only the selected `review prepare` and subsequent `review record` create Review facts. Treat an empty result as no eligible work; surface a failed read as a failure. Offer a longer Practice only when the user asks for it and state that it exceeds the default short session.
+For a daily review intent, begin with `video-extract suggestions today --workspace CONFIG --json`. When the user names a preferred question or card, pass its ID with `--prefer-question-id` or `--prefer-card-version-id`. Present the saved-fact suggestions and reasons, then let the user choose one, name another valid item, or skip. A suggestion is read-only: only the selected `review prepare` and subsequent `review record` create Review facts. Treat an empty result as no eligible work; surface a failed read as a failure. Offer a longer Practice only when the user asks for it and state that it exceeds the default short session.
 
 Resolve an explicit review intent to an existing `question_id`. Run `video-extract review prepare --question-id QUESTION --preparation-id review-preparation-STABLE_RETRY_ID --workspace CONFIG --json`, retaining that retry identity until the preparation is observed. If the question or persisted explanation is missing, explain that no review history was created; never invent a thread, question, or past learning.
 

@@ -377,7 +377,9 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
     from .workspace import WorkspaceError
     workspace = discover_workspace(args.workspace)
     try:
-        result = today(workspace, args.on_date)
+        result = today(workspace, args.on_date,
+                       preferred_question_ids=args.prefer_question_id,
+                       preferred_card_version_ids=args.prefer_card_version_id)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
         result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
     emit(result, args.json); return exit_code(result)
@@ -850,6 +852,8 @@ def parser() -> argparse.ArgumentParser:
     suggestion_actions = suggestions.add_subparsers(dest="suggestions_action", required=True)
     suggestions_today = suggestion_actions.add_parser("today")
     suggestions_today.add_argument("--on-date", help="Asia/Shanghai date (YYYY-MM-DD)")
+    suggestions_today.add_argument("--prefer-question-id", action="append", default=[])
+    suggestions_today.add_argument("--prefer-card-version-id", action="append", default=[])
     suggestions_today.add_argument("--workspace", type=Path); suggestions_today.add_argument("--json", action="store_true")
     suggestions_today.set_defaults(func=cmd_suggestions)
     review = commands.add_parser("review", help="prepare active recall before revealing and record independent Review facts")

@@ -31,7 +31,9 @@ def test_today_prioritizes_due_card_and_is_read_only(tmp_path: Path) -> None:
     suggestion = result["result"]["suggestions"][0]
     assert suggestion["kind"] == "card_review"
     assert suggestion["object_version"] == card["active_version_id"]
-    assert suggestion["estimated_minutes"] == 10
+    assert suggestion["estimated_minutes"] == 5
+    assert result["result"]["total_estimated_minutes"] == 5
+    assert result["result"]["maximum_total_minutes"] == 15
     assert result["validation"]["recommendation_persisted"] is False
     assert "long_practice" in result["result"]["selection"]
 
@@ -66,11 +68,48 @@ def test_confused_started_question_is_suggested_but_understood_is_not(tmp_path: 
     assert code == 0
     assert result["result"]["suggestions"][0]["kind"] == "question_review"
     assert result["result"]["suggestions"][0]["question_id"] == question_id
-    assert result["result"]["suggestions"][0]["estimated_minutes"] == 15
+    assert result["result"]["suggestions"][0]["estimated_minutes"] == 10
 
     record_feedback(config, question_id, "understood", "现在可以独立解释")
     assert cli("suggestions", "today", "--on-date", "2026-09-18",
                "--workspace", config.config_path, "--json")[1]["result"]["suggestions"] == []
+
+    code, preferred = cli("suggestions", "today", "--on-date", "2026-09-18",
+                          "--prefer-question-id", question_id,
+                          "--workspace", config.config_path, "--json")
+    assert code == 0
+    assert preferred["result"]["suggestions"][0]["question_id"] == question_id
+    assert "明确选择" in preferred["result"]["suggestions"][0]["reason"]
+
+
+def test_completed_question_review_is_not_suggested_again_that_day(tmp_path: Path) -> None:
+    config, _, question_id = explained_question(tmp_path)
+    code, prepared = cli("review", "prepare", "--question-id", question_id,
+                         "--workspace", config.config_path, "--json")
+    assert code == 3
+    assert cli("review", "record", "--preparation-id", prepared["result"]["preparation_id"],
+               "--event-id", "question-reviewed-today", "--answer", "矩阵列是基向量的像",
+               "--model-evaluation", "recalled", "--review-date", "2026-09-18",
+               "--workspace", config.config_path, "--json")[0] == 0
+
+    code, result = cli("suggestions", "today", "--on-date", "2026-09-18",
+                       "--workspace", config.config_path, "--json")
+    assert code == 0
+    assert result["result"]["suggestions"] == []
+
+
+def test_daily_group_has_at_most_three_items_and_fifteen_minutes(tmp_path: Path) -> None:
+    config, _, question_id = explained_question(tmp_path)
+    for index in range(4):
+        candidate = _propose(config, question_id, target=f"强化目标 {index}",
+                             conditions=f"适用条件 {index}")
+        _select(config, tmp_path, candidate)
+
+    code, result = cli("suggestions", "today", "--on-date", "2026-09-18",
+                       "--workspace", config.config_path, "--json")
+    assert code == 0
+    assert len(result["result"]["suggestions"]) == 3
+    assert result["result"]["total_estimated_minutes"] == 15
 
 
 def test_corrupt_authoritative_store_is_failed_not_empty(tmp_path: Path) -> None:
