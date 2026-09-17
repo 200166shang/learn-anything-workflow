@@ -94,10 +94,25 @@ _Avoid_: 媒体包、输出、结果
 
 ## Architecture
 
-The portable workspace is rooted by `workspace.toml`: code, authoritative Media, and the independent Obsidian Vault are siblings. Media packages remain the fact source; `学习系统/资料库/网站视频转录` is a marker-protected, rebuildable reading layer. `threads/`, `concepts/`, `REVIEW.md`, and `收件箱/` are protected learning boundaries and must never be replaced by video-extract.
+The portable workspace is rooted by schema-v2 `workspace.toml`: engineering,
+authoritative results, original sources, rebuildable views, and machine-local
+state are distinct roles. Source packages and registered source versions are
+evidence; Learn, Review, Practice, cards and operation receipts are independent
+authoritative result domains. Obsidian contains generated views, not a second
+editable truth.
 
-`video-extract` 是媒体包确定性处理与状态验证的深模块，也是顶层 `manifest.json` 的唯一写入者。`extract-media` 只负责媒体提取，`source-notes` 负责来源笔记，`mandarin-audio` 负责音频本地化；三个 Skill 都调用普通项目 CLI，不互相调用。缺少原生中文轨时，仅英文源可由 `mandarin-audio` 调用 pyVideoTrans 的兼容 `podcast` task；pyVideoTrans 独立拥有 `listening/zh-CN/`，不把内部产物登记进 video-extract manifest。工程中的 `podcast` 参数和旧文件名是外部兼容字面量，不是领域能力名称。
+`video-extract` 提供确定性写入、验证、恢复和稳定能力 ID。当前 Codex
+对话按意图选择 Learn、Review、Practice、`extract-media`、`source-notes`
+或 `mandarin-audio`；Skills 不互相调用。缺少原生中文轨时，仅英文源可
+由 `mandarin-audio` 使用外部兼容的 `podcast` task。外部参数字面量不是
+公开领域能力名称。
 
-Schema v5 的新请求使用媒体请求或 `notes_zh`；`podcast_zh` 仅作为旧请求别名。Schema v1–v4 媒体包原地可读且不会被普通 ensure 搬迁。完成状态始终从 artifacts 推导。模型自动审阅显式记为 `model_only`；只有用户明确审阅才记为 `human`。确定性规则唯一事实源是 [docs/package-contract.md](docs/package-contract.md)，CLI 参数唯一事实源是 `video-extract <command> --help`。
+正常运行只接受当前 workspace、source、media 和 learning contracts。
+Schema 1–4 媒体包与 thread v1 只由显式
+`migration plan|convert|verify|cutover|rollback` 读取；切换后的旧副本
+只读、退出发现且未经单独确认不删除。旧 goals、旧脚本命令和旧 Skill
+别名不属于运行契约。模型自动审阅显式记为 `model_only`；只有用户明确
+审阅才记为 `human`。CLI 参数唯一事实源是
+`video-extract <command> --help`。
 
 浏览器捕获、下载、ffmpeg 与 Whisper 使用分阶段并行策略；相同 fingerprint 的已验证结果复用，manifest 原子写入且记录 sanitized stage observation。

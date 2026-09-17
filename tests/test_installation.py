@@ -16,6 +16,7 @@ class InstallationContractTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.agents_root = self.root / ".agents"
         self.codex_root = self.root / ".codex"
+        self.plugins_root = self.root / "vault/.obsidian/plugins"
 
     def tearDown(self):
         self.temp.cleanup()
@@ -30,6 +31,8 @@ class InstallationContractTests(unittest.TestCase):
             str(self.agents_root),
             "--codex-root",
             str(self.codex_root),
+            "--obsidian-plugins-root",
+            str(self.plugins_root),
             "--json",
         ]
         with patch("sys.argv", argv), contextlib.redirect_stdout(stdout):
@@ -81,8 +84,10 @@ class InstallationContractTests(unittest.TestCase):
         self.assertEqual(checked["result"]["tool"]["source"], str(source))
 
     def test_apply_operation_identity_distinguishes_install_targets(self):
-        first = apply(self.root / "agents-one", self.root / "codex-one")
-        second = apply(self.root / "agents-two", self.root / "codex-two")
+        first = apply(self.root / "agents-one", self.root / "codex-one",
+                      obsidian_plugins_root=self.root / "plugins-one")
+        second = apply(self.root / "agents-two", self.root / "codex-two",
+                       obsidian_plugins_root=self.root / "plugins-two")
 
         self.assertNotEqual(first["operation_id"], second["operation_id"])
 
@@ -128,7 +133,8 @@ class InstallationContractTests(unittest.TestCase):
             return original(path, target, target_is_directory=target_is_directory)
 
         with patch.object(Path, "symlink_to", interrupted):
-            result = apply(self.agents_root, self.codex_root)
+            result = apply(self.agents_root, self.codex_root,
+                           obsidian_plugins_root=self.plugins_root)
 
         self.assertFalse(result["result"]["ok"])
         self.assertEqual(result["status"], "recoverable_failure")
@@ -143,7 +149,8 @@ class InstallationContractTests(unittest.TestCase):
         first.write_text("manual agent\n", encoding="utf-8")
 
         with patch("video_extract.manifest.atomic_write_json", side_effect=OSError("receipt fsync failed")):
-            result = apply(self.agents_root, self.codex_root)
+            result = apply(self.agents_root, self.codex_root,
+                           obsidian_plugins_root=self.plugins_root)
 
         self.assertEqual(result["status"], "recoverable_failure")
         self.assertIn("receipt fsync failed", result["diagnostics"][0])
@@ -200,7 +207,8 @@ class InstallationContractTests(unittest.TestCase):
         (old / "SKILL.md").write_text("old practice\n", encoding="utf-8")
 
         with patch("video_extract.manifest.atomic_write_json", side_effect=OSError("receipt failed")):
-            result = apply(self.agents_root, self.codex_root)
+            result = apply(self.agents_root, self.codex_root,
+                           obsidian_plugins_root=self.plugins_root)
 
         self.assertEqual(result["status"], "recoverable_failure")
         self.assertTrue(old.is_dir())
@@ -246,6 +254,14 @@ class InstallationContractTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(result["status"], "recoverable_failure")
         self.assertEqual(result["result"]["receipt"]["state"], "missing")
+
+    def test_apply_requires_an_obsidian_plugin_target_before_changing_hosts(self):
+        result = apply(self.agents_root, self.codex_root)
+
+        self.assertEqual(result["status"], "missing_input")
+        self.assertFalse(self.agents_root.exists())
+        self.assertFalse(self.codex_root.exists())
+        self.assertEqual(result["result"]["plugin"]["state"], "not_configured")
 
 
 if __name__ == "__main__":

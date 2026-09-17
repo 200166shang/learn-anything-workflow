@@ -23,8 +23,7 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 KNOWN_THREAD_KEYS = {"schema_version", "module", "thread", "questions", "relationships",
-                     "feedbacks", "operation_receipts", "explanations", "cards", "reviews",
-                     "practices", "_legacy_format"}
+                     "feedbacks", "operation_receipts", "_legacy_format"}
 KNOWN_MODULE_KEYS = {"goal", "scope"}
 KNOWN_THREAD_STATE_KEYS = {"id", "root_question_id", "current_question_id", "return_route",
                            "entry_history", "title"}
@@ -241,6 +240,9 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any],
                                      "external": external, "present": bool(inside and resolved.is_file())})
     feedbacks = list(thread.get("feedbacks") or [])
     receipts = list(thread.get("operation_receipts") or [])
+    # These names resemble current domains but are not part of the supported v1
+    # thread contract.  They remain unknown extensions until a format-specific
+    # converter exists; the original thread is preserved byte-for-byte.
     domain_values = {name: list(thread.get(name) or [])
                      for name in ("explanations", "cards", "reviews", "practices")}
     unknown = _unknown_legacy_data(thread)
@@ -281,7 +283,7 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any],
                 "cards_review_history": {"count": len(domain_values["cards"]) + len(domain_values["reviews"]),
                                          "disposition": "preserve_opaque"},
                 "operation_receipts": {"count": len(receipts), "disposition": "preserve_opaque_no_replay"},
-            }}
+            }, "unsupported_domain_extensions": [name for name, items in domain_values.items() if items]}
 
 
 def plan(config: WorkspaceConfig, batch: str, package: Path, thread_path: Path) -> dict[str, Any]:
@@ -663,35 +665,6 @@ def _optional_tree(root: Path) -> list[dict[str, Any]]:
     return _tree(root) if root.is_dir() else []
 
 
-def _learning_scope(record: dict[str, Any], protected: dict[str, list[str]]) -> dict[str, Any]:
-    """Select facts owned by a migrated batch, including later linked facts."""
-    module_ids = set(protected.get("modules", []))
-    thread_ids = set(protected.get("threads", []))
-    question_ids = set(protected.get("questions", []))
-    scoped: dict[str, Any] = {}
-    for key, values in record.items():
-        if not isinstance(values, dict):
-            continue
-        selected: dict[str, Any] = {}
-        for identity, item in values.items():
-            if not isinstance(item, dict):
-                continue
-            linked = (
-                identity in set(protected.get(key, []))
-                or item.get("module_id") in module_ids
-                or item.get("thread_id") in thread_ids
-                or item.get("question_id") in question_ids
-                or item.get("root_question_id") in question_ids
-                or item.get("from_question_id") in question_ids
-                or item.get("to_question_id") in question_ids
-            )
-            if linked:
-                selected[identity] = item
-        if selected:
-            scoped[key] = selected
-    return scoped
-
-
 def _contains_owned_identity(path: Path, identities: set[str]) -> bool:
     if not identities or not path.is_dir():
         return False
@@ -705,6 +678,88 @@ def _contains_owned_identity(path: Path, identities: set[str]) -> bool:
         if any(identity in body for identity in identities):
             return True
     return False
+
+
+def _mentions_identity(value: Any, identities: set[str]) -> bool:
+    if isinstance(value, str):
+        return value in identities
+    if isinstance(value, dict):
+        return any(_mentions_identity(item, identities) for item in value.values())
+    if isinstance(value, list):
+        return any(_mentions_identity(item, identities) for item in value)
+    return False
+
+
+def _copy_stable_file(source: Path, destination: Path) -> dict[str, Any]:
+    before = source.read_bytes()
+    fact = {"size": len(before), "sha256": hashlib.sha256(before).hexdigest()}
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(before)
+    after = source.read_bytes()
+    if before != after or destination.read_bytes() != before:
+        raise RuntimeError(f"file changed while rollback was preserving it: {source}")
+    return fact
+
+
+def _preserve_linked_domain_records(config: WorkspaceConfig, preserved: Path,
+                                    identities: set[str]) -> dict[str, Any]:
+    """Export only records linked to this batch; leave shared stores writable."""
+    result: dict[str, Any] = {}
+    from . import cards, practice, review
+
+    card_snapshot = cards._load(config)
+    selected_cards = {identity: item for identity, item in card_snapshot["record"]["cards"].items()
+                      if _mentions_identity(item, identities)}
+    if selected_cards:
+        target = preserved / "domain-records/cards.json"
+        atomic_write_json(target, {"schema_version": 1, "cards": selected_cards})
+        result["cards"] = {"count": len(selected_cards), "path": str(target)}
+
+    review_snapshot = review._load(config)
+    selected_preparations = {identity: item for identity, item in
+                             review_snapshot["record"]["preparations"].items()
+                             if _mentions_identity(item, identities)}
+    selected_events = {identity: item for identity, item in review_snapshot["record"]["events"].items()
+                       if item.get("preparation_id") in selected_preparations
+                       or _mentions_identity(item, identities)}
+    if selected_preparations or selected_events:
+        target = preserved / "domain-records/review.json"
+        atomic_write_json(target, {"schema_version": 1, "preparations": selected_preparations,
+                                  "events": selected_events})
+        result["reviews"] = {"preparations": len(selected_preparations),
+                             "events": len(selected_events), "path": str(target)}
+
+    practice_snapshot = practice._load(config)
+    selected_practices = {identity: item for identity, item in practice_snapshot["practices"].items()
+                          if _mentions_identity(item, identities)}
+    if selected_practices:
+        practice_root = practice._root(config)
+        object_digests = {
+            digest for item in selected_practices.values()
+            for digest in (item["preparation_sha256"],
+                           *(checkpoint["object_sha256"] for checkpoint in item.get("checkpoints", [])))
+        }
+        object_facts = {}
+        for digest in sorted(object_digests):
+            source = practice._object(practice_root, digest)
+            relative = Path("practice-objects") / digest[:2] / digest
+            object_facts[digest] = _copy_stable_file(source, preserved / relative)
+        workspaces = []
+        for practice_id in sorted(selected_practices):
+            source = practice_root / "workspaces" / practice_id
+            if not source.is_dir():
+                continue
+            destination = preserved / "practice-workspaces" / practice_id
+            before = _tree(source); shutil.copytree(source, destination)
+            if _tree(source) != before or _tree(destination) != before:
+                raise RuntimeError(f"practice workspace changed while preserving it: {practice_id}")
+            workspaces.append(practice_id)
+        target = preserved / "domain-records/practices.json"
+        atomic_write_json(target, {"schema_version": 1, "practices": selected_practices,
+                                  "objects": object_facts, "workspaces": workspaces})
+        result["practices"] = {"count": len(selected_practices), "path": str(target),
+                               "workspaces": workspaces}
+    return result
 
 
 def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> dict[str, Any]:
@@ -800,6 +855,15 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
                      "preparations", "explanations")}
     domain_baselines = {name: _optional_tree(results / name)
                         for name in ("cards", "reviews", "practices", "operation-receipts")}
+    historical_receipt_archive = None
+    if converted.get("legacy_operation_receipts"):
+        historical_receipt_archive = results / "migration-historical-receipts" / f"{batch}.json"
+        atomic_write_json(historical_receipt_archive, {
+            "schema_version": 1, "batch": batch,
+            "source_thread_sha256": value["thread_snapshot"]["sha256"],
+            "receipts": converted["legacy_operation_receipts"],
+            "policy": "historical_evidence_only", "replay_policy": "never_automatic",
+        })
     owners["batches"][batch] = {"owner": "new", "legacy_read_only": True,
         "legacy_package": value["legacy_package"], "legacy_thread": value["legacy_thread"],
         "migrated_course": str(target),
@@ -807,10 +871,11 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
         "learning_commit_id": published["commit_id"], "cutover_at": _now(), "cutover_baseline": baseline,
         "legacy_modes": legacy_modes, "locators": converted["legacy_locators"],
         "learning_ids": learning_ids,
-        "learning_scope_sha256": _digest(_learning_scope(published["record"], learning_ids)),
+        "learning_scope_sha256": _digest(learning.migration_scope(published["record"], learning_ids)),
         "domain_baselines": domain_baselines,
         "unknown_legacy_data": converted.get("unknown_legacy_data", []),
         "preserved_domains": converted.get("preserved_domains", {}),
+        "historical_receipt_archive": str(historical_receipt_archive) if historical_receipt_archive else None,
         "authorization_sha256": authorization_sha256}
     atomic_write_json(_ownership_path(config), owners)
     value.update(status="cutover", cutover_at=_now(), migrated_course=str(target),
@@ -864,7 +929,7 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
         shutil.copy2(target / relative, destination)
     protected_ids = {identity for values in owner["learning_ids"].values() for identity in values}
     domain_deltas: dict[str, list[str]] = {}
-    copied_domains: list[str] = []
+    preserved_records = _preserve_linked_domain_records(config, preserved, protected_ids)
     for domain in ("cards", "reviews", "practices", "operation-receipts"):
         domain_root = results / domain
         before = {item["path"]: item for item in owner.get("domain_baselines", {}).get(domain, [])}
@@ -872,23 +937,29 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
         after = {item["path"]: item for item in after_list}
         delta = sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
         domain_deltas[domain] = delta
-        if not delta:
+    receipt_files: list[str] = []
+    unclassified_receipts: list[str] = []
+    receipt_root = results / "operation-receipts"
+    receipt_identities = {*protected_ids, owner["source_id"], owner["source_version"],
+                          owner["migrated_course"], batch}
+    for relative in domain_deltas.get("operation-receipts", []):
+        source = receipt_root / relative
+        if not source.is_file() or source.is_symlink():
             continue
-        linked = domain == "operation-receipts" or _contains_owned_identity(domain_root, protected_ids)
-        if not linked:
-            continue
-        destination = preserved / domain
-        shutil.copytree(domain_root, destination)
-        if _tree(domain_root) != _tree(destination):
-            raise RuntimeError(f"{domain} changed while rollback was preserving it")
-        copied_domains.append(domain)
-    receipt_files = domain_deltas.get("operation-receipts", [])
+        try:
+            receipt_value = read_json(source)
+        except (OSError, json.JSONDecodeError):
+            receipt_value = None
+        linked = _mentions_identity(receipt_value, receipt_identities)
+        destination_root = "operation-receipts" if linked else "unclassified-operation-receipts"
+        _copy_stable_file(source, preserved / destination_root / relative)
+        (receipt_files if linked else unclassified_receipts).append(relative)
     learning_changed = False
     from .package_lock import package_lock
     with package_lock(results / "learning"):
         from . import learning
         current_learning = learning._load(config)
-        learning_scope = _learning_scope(current_learning["record"], owner["learning_ids"])
+        learning_scope = learning.migration_scope(current_learning["record"], owner["learning_ids"])
         learning_changed = _digest(learning_scope) != owner.get("learning_scope_sha256")
         if learning_changed:
             shutil.copytree(results / "learning", preserved / "learning")
@@ -900,8 +971,9 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     atomic_write_json(preserved / "rollback-manifest.json", {"schema_version": 1, "batch": batch,
         "created_at": _now(), "changed_course_files": changed, "deleted_course_files": deleted,
         "learning_changed": learning_changed,
-        "domain_deltas": domain_deltas, "preserved_domains": copied_domains,
+        "domain_deltas": domain_deltas, "preserved_records": preserved_records,
         "operation_receipts": receipt_files,
+        "unclassified_operation_receipts": unclassified_receipts,
         "unknown_legacy_data": owner.get("unknown_legacy_data", []),
         "policy": "preserve_only_no_remote_replay", "replay_policy": "never_automatic"})
     _restore_legacy_modes(Path(owner["legacy_package"]), Path(owner["legacy_thread"]), owner["legacy_modes"])
@@ -921,7 +993,7 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     return response(status="completed", workspace=str(config.config_path), result={
         "batch": batch, "preserved_increment": str(preserved), "changed_course_files": changed,
         "deleted_course_files": deleted, "learning_changed": learning_changed,
-        "operation_receipts": len(receipt_files), "preserved_domains": copied_domains,
+        "operation_receipts": len(receipt_files), "preserved_records": preserved_records,
         "replay_required": bool(changed or deleted or any(domain_deltas.values()) or learning_changed)},
         validation={"increment_preserved": "passed", "new_store_not_overwritten": "passed",
                     "remote_operations_replayed": "no"})

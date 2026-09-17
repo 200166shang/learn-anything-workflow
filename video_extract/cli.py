@@ -51,9 +51,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     manifest = read_json(args.path / "manifest.json") if (args.path / "manifest.json").exists() else {}
     if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
         from .command_response import exit_code
-        result = response(status="unsupported", validation={"legacy_package": "rejected"},
-                          diagnostics=["legacy package schemas are available only to the isolated migration converter"],
-                          next_action={"command": "video-extract migration plan"})
+        result = _legacy_package_result("legacy package schemas are available only to the isolated migration converter")
         emit(result, args.json); return exit_code(result)
     if manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "media":
         result = validate_media_request(args.path); emit(result, args.json); return 0 if result["ok"] else 1
@@ -75,6 +73,11 @@ def _excluded_discovery_root(name: str) -> bool:
     )
 
 
+def _legacy_package_result(diagnostic: str) -> dict[str, Any]:
+    return response(status="unsupported", validation={"legacy_package": "rejected"},
+                    diagnostics=[diagnostic], next_action={"command": "video-extract migration plan"})
+
+
 def _discover(root: Path) -> list[dict[str, Any]]:
     found = []
     resolved = root.expanduser().resolve()
@@ -94,9 +97,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         manifest = read_json(path / "manifest.json") if (path / "manifest.json").exists() else {}
         if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
             from .command_response import exit_code
-            result = response(status="unsupported", validation={"legacy_package": "rejected"},
-                              diagnostics=["legacy package schemas are excluded from normal runtime discovery and reads"],
-                              next_action={"command": "video-extract migration plan"})
+            result = _legacy_package_result("legacy package schemas are excluded from normal runtime discovery and reads")
             emit(result, args.json); return exit_code(result)
         goals = manifest.get("request", {}).get("goals")
         result: Any = validate_media_request(path) if manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "media" else {
@@ -642,7 +643,10 @@ def cmd_workspace(args: argparse.Namespace) -> int:
             from .installation import inspect
             doctor_result = workspace_doctor(config)
             capabilities = check_capabilities()
-            installation = inspect(args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve())
+            installation = inspect(
+                args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve(),
+                args.obsidian_plugins_root.expanduser().resolve() if args.obsidian_plugins_root else None,
+            )
             doctor_result["capabilities"] = capabilities
             doctor_result["installation"] = installation
             ok = doctor_result["ok"] and capabilities["status"] == "completed" and installation["status"] == "completed"
@@ -675,6 +679,7 @@ def parser() -> argparse.ArgumentParser:
         if action == "doctor":
             p.add_argument("--agents-root", type=Path, default=Path.home() / ".agents")
             p.add_argument("--codex-root", type=Path, default=Path.home() / ".codex")
+            p.add_argument("--obsidian-plugins-root", type=Path)
         p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_workspace)
     rebuild = workspace_actions.add_parser("rebuild"); rebuild.add_argument("--workspace", type=Path); rebuild.add_argument("--json", action="store_true")
     rebuild_mode = rebuild.add_mutually_exclusive_group(required=True); rebuild_mode.add_argument("--dry-run", action="store_true"); rebuild_mode.add_argument("--apply", action="store_true"); rebuild.set_defaults(func=cmd_workspace)

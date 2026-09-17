@@ -207,7 +207,7 @@ def _inspect_details(agents_root: Path, codex_root: Path,
     tool = _tool()
     entries_ok = all(item["state"] == "linked" for item in entries)
     retirement_ok = all(item["state"] == "retired" for item in retired_entries)
-    plugin_ok = plugin["state"] in {"linked", "not_configured"}
+    plugin_ok = plugin["state"] == "linked"
     dependencies_ok = all(dependencies.values())
     tool_ok = tool["matches_source"]
     receipt_path = codex_root.joinpath(*RECEIPT_PARTS)
@@ -234,7 +234,10 @@ def _inspect_details(agents_root: Path, codex_root: Path,
     ok = entries_ok and retirement_ok and plugin_ok and dependencies_ok and tool_ok and receipt_ok
     status = "completed"
     diagnostics = []
-    if not entries_ok or not retirement_ok or not plugin_ok or not tool_ok:
+    if plugin["state"] == "not_configured":
+        status = "missing_input"
+        diagnostics.append("obsidian_plugins_root is required to publish and verify the project-owned navigation plugin")
+    elif not entries_ok or not retirement_ok or not plugin_ok or not tool_ok:
         status = "recoverable_failure"
         diagnostics.append("source_or_install_drift: installed entries, retired entries, or the video-extract executable do not match the maintenance source")
     elif not receipt_ok:
@@ -287,7 +290,7 @@ def inspect(agents_root: Path, codex_root: Path, obsidian_plugins_root: Path | N
 
 
 def plan(agents_root: Path, codex_root: Path, obsidian_plugins_root: Path | None = None) -> dict[str, Any]:
-    _, details, diagnostics = _inspect_details(agents_root, codex_root, obsidian_plugins_root)
+    inspected_status, details, diagnostics = _inspect_details(agents_root, codex_root, obsidian_plugins_root)
     details["changes"] = [
         {"id": item["id"], "action": "keep" if item["state"] == "linked" else "link", "target": item["target"]}
         for item in details["entries"]
@@ -301,11 +304,18 @@ def plan(agents_root: Path, codex_root: Path, obsidian_plugins_root: Path | None
                                "action": "not_configured" if details["plugin"]["state"] == "not_configured"
                                else "keep" if details["plugin"]["state"] == "linked" else "link",
                                "target": details["plugin"]["target"]})
-    return _wrap("completed", details, diagnostics, next_command="video-extract install apply --json")
+    return _wrap("completed" if obsidian_plugins_root is not None else inspected_status,
+                 details, diagnostics,
+                 next_command="video-extract install apply --obsidian-plugins-root VAULT/.obsidian/plugins --json")
 
 
 def apply(agents_root: Path, codex_root: Path, backup_root: Path | None = None,
           obsidian_plugins_root: Path | None = None) -> dict[str, Any]:
+    if obsidian_plugins_root is None:
+        status, details, diagnostics = _inspect_details(agents_root, codex_root, None)
+        return _wrap(status, details, diagnostics,
+                     operation_id=_install_operation_id(agents_root, codex_root, None),
+                     next_command="video-extract install apply --obsidian-plugins-root VAULT/.obsidian/plugins --json")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     backup = (backup_root or codex_root / "backups/video-extract-install") / stamp
     backed_up: list[dict[str, str]] = []

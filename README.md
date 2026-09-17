@@ -82,7 +82,7 @@ video-extract capability run source.notes --request request.json --json
 
 `source.notes` 的请求使用 `contract_version: 1`，包含 `action`（`prepare` 或 `finalize`）、`workspace`、`package` 和可选的 `source_version`。能力声明同时记录 `implementation_version` 及 `ffmpeg`、`ffprobe`、Pillow、faster-whisper 依赖。实现函数通过无副作用的 `__capability_contract__` 元数据声明 adapter I/O；check 同时验证注册声明、callable 形状、该元数据和类型注解。runner 传入普通 dict，因此输入注解必须能接受 dict（dict 或相应 Mapping 协议），不能要求某个更具体的 dict 子类；输出可使用 dict、Mapping 子类或 TypedDict。明确的非 mapping 类型拒绝，无注解则由协议声明并在 run 时强制验证真实返回。响应采用 `api_version: 1`；`completed` 退出 0，可继续但未完成的状态退出 3，contract 不兼容和其他失败退出非零。实现移动时只修改 `video_extract.capabilities:CAPABILITIES`；兼容移动不改变同一逻辑请求的 operation ID，行为版本只作为 provenance 和诊断事实。入口、I/O contract、依赖或版本不匹配会返回确切维护位置，不会猜测替代工具。
 
-`install apply` 在 Codex 安装根原子写入 `video-extract/install-receipt.json`，记录工程 revision、CLI/capability/schema/集成源码指纹和安装契约版本；收据提交失败会回滚本次新链接并恢复已备份手改。`install check` 将源码、revision、链接、依赖或收据漂移报告为 `recoverable_failure`。`install` 与 `workspace doctor` 都返回统一 command-response-v1 envelope；后者同时汇总能力和安装诊断，并可用 `--agents-root`、`--codex-root` 指向临时根完成隔离检查。
+`install apply` 在 Codex 安装根原子写入 `video-extract/install-receipt.json`，记录工程 revision、CLI/capability/schema/集成源码指纹和安装契约版本；收据提交失败会回滚本次新链接并恢复已备份手改。`install check` 将源码、revision、链接、依赖或收据漂移报告为 `recoverable_failure`。`install` 与 `workspace doctor` 都返回统一 command-response-v1 envelope；后者同时汇总能力和安装诊断，并可用 `--agents-root`、`--codex-root`、`--obsidian-plugins-root` 指向临时根完成隔离检查。Obsidian 插件根是当前安装契约的必填项；缺失时 `plan/apply/doctor` 会返回 `missing_input`，且 `apply` 不会先修改其他宿主入口。
 
 新建 workspace 使用 schema v2，并把 `workspace.example.toml` 中的占位值替换为一次生成、之后不随改名、搬迁或路径映射变化而修改的 `workspace_id`。`project`、`results`、`sources`、`derived`、`local` 是相互独立的位置角色；相对路径随配置移动，绝对路径是显式声明的外置根。所有写入会在解析符号链接后重新核对声明边界。
 

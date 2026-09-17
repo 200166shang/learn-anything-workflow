@@ -228,10 +228,20 @@ def test_unknown_legacy_domains_are_reported_and_preserved_opaque(tmp_path: Path
                         "--legacy-thread", thread_path, *common)
     assert code == 0
     pointers = {item["pointer"] for item in planned["result"]["inventory"]["unknown_legacy_data"]}
-    assert pointers == {"/custom_learning_state", "/questions/0/private_annotation"}
+    assert pointers == {
+        "/cards",
+        "/custom_learning_state",
+        "/practices",
+        "/questions/0/private_annotation",
+        "/reviews",
+    }
     assert all(item["disposition"] == "preserve_opaque"
                for item in planned["result"]["inventory"]["unknown_legacy_data"])
-    assert planned["result"]["inventory"]["domain_reconciliation"]["practice_user_code"]["count"] == 1
+    assert planned["result"]["inventory"]["unsupported_domain_extensions"] == [
+        "cards",
+        "reviews",
+        "practices",
+    ]
     assert cli("migration", "convert", *common)[0] == 0
     verify_code, verified = cli("migration", "verify", *common)
     assert verify_code == 0, json.dumps(verified, ensure_ascii=False, indent=2)
@@ -300,7 +310,8 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     increment.write_text("切换后的新成果", encoding="utf-8")
     receipts = config.parent / "results/operation-receipts"
     receipts.mkdir()
-    (receipts / "publish.json").write_text('{"status":"confirmed"}', encoding="utf-8")
+    (receipts / "publish.json").write_text(
+        json.dumps({"status": "confirmed", "migration_batch": batch}), encoding="utf-8")
     failed_rollback_code, _ = cli(
         "migration", "rollback", *common,
         env={"VIDEO_EXTRACT_MIGRATION_TEST_FAULT": "after_rollback_frozen"},
@@ -314,7 +325,7 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     assert blocked_during_code != 0
     assert "owned by the legacy store" in blocked_during["diagnostics"][0]
     code, rolled_back = cli("migration", "rollback", *common)
-    assert code == 0
+    assert code == 0, json.dumps(rolled_back, ensure_ascii=False, indent=2)
     preserved = Path(rolled_back["result"]["preserved_increment"])
     assert (preserved / "new-after-cutover.md").read_text(encoding="utf-8") == "切换后的新成果"
     assert (preserved / "operation-receipts/publish.json").is_file()
