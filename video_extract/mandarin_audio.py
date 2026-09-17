@@ -119,7 +119,24 @@ def audio_info(path: Path) -> dict[str, Any]:
     return value
 
 
-def _localized_verification(value: Any, output: Path) -> dict[str, Any]:
+def _public_transcript_fact(package: Path, manifest: dict[str, Any]) -> dict[str, str] | None:
+    for key in ("source_transcript", "source_subtitle"):
+        raw = manifest.get("artifacts", {}).get(key)
+        if not isinstance(raw, str):
+            continue
+        path = (package / raw).resolve()
+        try:
+            path.relative_to(package)
+        except ValueError:
+            continue
+        if path.is_file():
+            return {"artifact": key, "path": raw, "sha256": _sha256(path)}
+    return None
+
+
+def _localized_verification(value: Any, output: Path, transcript_fact: dict[str, str] | None) -> dict[str, Any]:
+    if transcript_fact is None:
+        return {"valid": False, "reason": "a public source_transcript or source_subtitle is required for localized alignment"}
     if not isinstance(value, dict):
         return {"valid": False, "reason": "independent localized verification is missing"}
     required_strings = ("verifier_identity", "transcript_sha256", "output_sha256", "detected_language")
@@ -127,7 +144,7 @@ def _localized_verification(value: Any, output: Path) -> dict[str, Any]:
         return {"valid": False, "reason": "localized verification fields are incomplete"}
     language = value["detected_language"].casefold().replace("_", "-").split("-", 1)[0]
     digest_ok = value["output_sha256"] == _sha256(output)
-    transcript_ok = bool(re.fullmatch(r"[0-9a-f]{64}", value["transcript_sha256"]))
+    transcript_ok = value["transcript_sha256"] == transcript_fact["sha256"]
     speech = value.get("speech_confidence")
     alignment = value.get("alignment_confidence")
     content = value.get("content_match_confidence")
@@ -136,6 +153,7 @@ def _localized_verification(value: Any, output: Path) -> dict[str, Any]:
     safe = {key: value.get(key) for key in (*required_strings, "speech_confidence", "alignment_confidence",
                                              "content_match_confidence")}
     safe["valid"] = digest_ok and transcript_ok and language == "zh" and scores_ok
+    safe["transcript_artifact"] = transcript_fact["artifact"]
     return safe
 
 
@@ -242,7 +260,10 @@ def _finish(config: WorkspaceConfig, path: Path, record: dict[str, Any], source:
             verification: dict[str, Any] | None = None) -> dict[str, Any]:
     spec = audio_info(output)
     localized = mode == "localized"
-    verified = _localized_verification(verification, output) if localized and spec["valid"] else None
+    package = Path(record["intent"]["package"])
+    manifest = read_json(package / "manifest.json")
+    transcript_fact = _public_transcript_fact(package, manifest) if localized else None
+    verified = _localized_verification(verification, output, transcript_fact) if localized and spec["valid"] else None
     if not spec["valid"] or (localized and not verified["valid"]):
         uncertain = mode == "localized"
         record.update(status="awaiting_user" if localized and spec["valid"] else ("uncertain" if uncertain else "recoverable_failure"),
@@ -266,7 +287,8 @@ def _finish(config: WorkspaceConfig, path: Path, record: dict[str, Any], source:
                   artifact_refs=[str(output)], artifact_facts={"source": {"sha256": _sha256(source)},
                   "output": {"sha256": output_digest, "size": output.stat().st_size,
                              "validation": "ffprobe-48khz-mono-approx64kbps",
-                             **({"localized_verification": verified} if verified else {})}},
+                             **({"localized_verification": verified} if verified else {})},
+                  **({"source_transcript": transcript_fact} if transcript_fact else {})},
                   provenance={"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
                               "source_id": record["intent"]["source_id"],
                               "source_version": record["intent"]["source_version"], "mode": mode},
@@ -305,7 +327,9 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
         primary = _language_primary(language)
         report_path = output.parent / "production-report.json"
         report = read_json(report_path) if report_path.is_file() else {}
-        verification = _localized_verification(report.get("localized_verification"), output) if spec_valid and primary != "zh" else None
+        transcript_fact = _public_transcript_fact(package, manifest) if primary != "zh" else None
+        verification = (_localized_verification(report.get("localized_verification"), output, transcript_fact)
+                        if spec_valid and primary != "zh" else None)
         valid = spec_valid and (primary == "zh" or bool(verification and verification.get("valid")))
         return response(status="completed" if valid else "recoverable_failure",
                         workspace=str(config.config_path), operation_id=operation_id,
@@ -333,8 +357,18 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
                 return _public(config, existing)
             facts = existing.get("artifact_facts", {}).get("output", {})
             content_state = existing.get("validation", {}).get("localized_content")
-            if audio_info(output)["valid"] and facts.get("sha256") == _sha256(output) and content_state in {"passed", "not_required"}:
+            transcript_reusable = True
+            if content_state == "passed":
+                current_transcript = _public_transcript_fact(package, manifest)
+                transcript_reusable = (current_transcript is not None and
+                                       current_transcript.get("sha256") == existing.get("artifact_facts", {}).get("source_transcript", {}).get("sha256"))
+            if audio_info(output)["valid"] and facts.get("sha256") == _sha256(output) and content_state in {"passed", "not_required"} and transcript_reusable:
                 return _public(config, existing, "verified_operation")
+            if content_state == "passed" and not transcript_reusable:
+                existing.update(status="missing_input", validation={**existing.get("validation", {}), "source_transcript": "failed"},
+                                diagnostics=["public transcript changed without a new source_version"],
+                                next_action={"type": "user", "reason": "provide the revised source_version and a matching verification report"})
+                return _public(config, existing)
         if existing.get("status") == "running":
             from .media_operations import _lease_active
             existing.update(status="busy" if _lease_active(existing) else "uncertain",

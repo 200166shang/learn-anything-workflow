@@ -145,6 +145,14 @@ class UnrelatedContentAdapter(FakePaidAdapter):
         return result
 
 
+class ZeroTranscriptDigestAdapter(FakePaidAdapter):
+    adapter_identity = "fixture.mandarin-zero-transcript-v1"
+    def localize(self, source, target, *, profile, idempotency_token):
+        result = super().localize(source, target, profile=profile, idempotency_token=idempotency_token)
+        result["verification"]["transcript_sha256"] = "0" * 64
+        return result
+
+
 def test_native_chinese_normalizes_locally_and_reuses_only_verified_fingerprint(tmp_path, capsys):
     workspace, package, request = fixture(tmp_path, "zh-CN")
     adapter = FakePaidAdapter()
@@ -352,6 +360,40 @@ def test_structured_verifier_rejects_unrelated_recognized_content(tmp_path, caps
     code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
     assert code == 3 and result["status"] == "awaiting_user"
     assert result["validation"]["localized_content"] == "failed"
+
+
+def test_structured_verifier_rejects_placeholder_transcript_digest(tmp_path, capsys):
+    _, _, request = fixture(tmp_path, "en")
+    adapter = ZeroTranscriptDigestAdapter(); register_mandarin_adapter("zero-transcript", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="zero-transcript", authorization_ref="approved-zero")
+    request.write_text(json.dumps(data))
+    code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 3 and result["status"] == "awaiting_user"
+    assert result["validation"]["localized_content"] == "failed"
+
+
+def test_matching_public_transcript_digest_is_authoritative_and_change_invalidates_reuse(tmp_path, capsys):
+    _, package, request = fixture(tmp_path, "en")
+    (package / "media/subtitle.srt").write_text("1\n00:00:00,000 --> 00:00:02,000\nLower-priority subtitle text.\n")
+    manifest = json.loads((package / "manifest.json").read_text())
+    manifest["artifacts"]["source_subtitle"] = "media/subtitle.srt"
+    (package / "manifest.json").write_text(json.dumps(manifest))
+    adapter = FakePaidAdapter(); register_mandarin_adapter("matching-transcript", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="matching-transcript", authorization_ref="approved-match")
+    request.write_text(json.dumps(data))
+    code, completed = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 0 and completed["status"] == "completed"
+    operation = json.loads(next((tmp_path / "local/operations").glob("operation-*.json")).read_text())
+    expected = hashlib.sha256((package / "media/transcript.txt").read_bytes()).hexdigest()
+    assert operation["artifact_facts"]["source_transcript"] == {
+        "artifact": "source_transcript", "path": "media/transcript.txt", "sha256": expected,
+    }
+
+    (package / "media/transcript.txt").write_text("A revised public transcript changes the alignment basis.")
+    changed_code, changed = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert changed_code == 3 and changed["status"] == "missing_input"
+    assert changed["validation"]["source_transcript"] == "failed"
+    assert len(adapter.calls) == 1
 
 
 def test_pyvideotrans_argparse_rejection_is_definitely_not_submitted(tmp_path, capsys):
