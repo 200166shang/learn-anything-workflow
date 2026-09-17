@@ -48,6 +48,9 @@ include = [
 "schemas/manifest-v3.schema.json" = "schemas/manifest-v3.schema.json"
 "schemas/manifest-v4.schema.json" = "schemas/manifest-v4.schema.json"
 "schemas/manifest-v5.schema.json" = "schemas/manifest-v5.schema.json"
+"schemas/workspace-v2.schema.json" = "schemas/workspace-v2.schema.json"
+"schemas/source-package-v6.schema.json" = "schemas/source-package-v6.schema.json"
+"schemas/snapshot-v1.schema.json" = "schemas/snapshot-v1.schema.json"
 "integrations/skills" = "integrations/skills"
 ".codex/agents" = ".codex/agents"
 

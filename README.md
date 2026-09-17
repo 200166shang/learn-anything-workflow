@@ -83,6 +83,8 @@ video-extract capability run source.notes --request request.json --json
 
 `install apply` 在 Codex 安装根原子写入 `video-extract/install-receipt.json`，记录工程 revision、CLI/capability/schema/集成源码指纹和安装契约版本；收据提交失败会回滚本次新链接并恢复已备份手改。`install check` 将源码、revision、链接、依赖或收据漂移报告为 `recoverable_failure`。`install` 与 `workspace doctor` 都返回统一 command-response-v1 envelope；后者同时汇总能力和安装诊断，并可用 `--agents-root`、`--codex-root` 指向临时根完成隔离检查。
 
-新建 workspace 时必须把 `workspace.example.toml` 中的占位值替换为一次生成、之后不随改名、搬迁或路径映射变化而修改的 `workspace_id`。旧配置仍可被旧的内部工作流读取，但稳定公共 `workspace doctor` 和 capability 执行会返回 `missing_input`，提示先在配置中补入持久逻辑 ID；工具不会擅自修改真实 workspace。
+新建 workspace 使用 schema v2，并把 `workspace.example.toml` 中的占位值替换为一次生成、之后不随改名、搬迁或路径映射变化而修改的 `workspace_id`。`project`、`results`、`sources`、`derived`、`local` 是相互独立的位置角色；相对路径随配置移动，绝对路径是显式声明的外置根。所有写入会在解析符号链接后重新核对声明边界。
+
+本地文档可用 `source register` 或 `source import` 登记，源码目录用 `source register` 原处引用。`source verify` 固定读取一次 snapshot v1 的 `commit_id`，`source relocate` 只在内容版本相同且 `expected_revision` 匹配时更新本机位置映射。同一来源的新内容保留原 `source_id` 并新增 source version；文档正文、source package v6、完整清单和发布指针组成原子快照。旧 workspace v1 仍只供既有媒体流程读取；source v6 明确拒绝它并指向显式迁移，而不会猜测或自动转换。
 
 移动工作区后更新 locator，并重新执行 editable 安装、`install check` 与 `workspace doctor`。不要在 skill 或 agent 中写入项目、Media、资料库或 Python 环境的机器路径。

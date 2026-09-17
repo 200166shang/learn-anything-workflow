@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/snapshot-v1.schema.json",
+  "title": "Authoritative snapshot v1",
+  "type": "object",
+  "required": ["schema_version", "commit_id", "parent_commit_id", "revision", "created_at", "sources", "objects"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "commit_id": {"type": "string", "pattern": "^commit-"},
+    "parent_commit_id": {"type": ["string", "null"]},
+    "revision": {"type": "integer", "minimum": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "sources": {"type": "object"},
+    "objects": {"type": "object"}
+  },
+  "additionalProperties": false
+}

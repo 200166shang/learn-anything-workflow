@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/source-package-v6.schema.json",
+  "title": "Source package v6",
+  "type": "object",
+  "required": ["schema_version", "source_id", "kind", "title", "current_version", "versions"],
+  "properties": {
+    "schema_version": {"const": 6},
+    "source_id": {"type": "string", "pattern": "^source-"},
+    "kind": {"enum": ["document", "code"]},
+    "title": {"type": "string", "minLength": 1},
+    "current_version": {"type": "string", "pattern": "^source-version-"},
+    "versions": {"type": "object", "minProperties": 1}
+  },
+  "additionalProperties": false
+}

@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 SCHEMA_VERSION = 1
+PORTABLE_SCHEMA_VERSION = 2
 CONFIG_NAME = "workspace.toml"
 LOCATOR = Path("~/.config/video-extract/config.toml").expanduser()
 MANAGED_MARKER = ".video-extract-managed.json"
@@ -61,6 +62,11 @@ class WorkspaceConfig:
     workspace_id: str | None = None
     pyvideotrans_python: Path | None = None
     pyvideotrans_cli: Path | None = None
+    schema_version: int = SCHEMA_VERSION
+    results: Path | None = None
+    sources: Path | None = None
+    derived: Path | None = None
+    local: Path | None = None
 
     @classmethod
     def load(cls, path: Path, source: str = "explicit") -> "WorkspaceConfig":
@@ -71,13 +77,27 @@ class WorkspaceConfig:
             raw = tomllib.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise WorkspaceError(f"invalid workspace config: {path}: {exc}") from exc
-        if raw.get("schema_version") != SCHEMA_VERSION:
+        schema_version = raw.get("schema_version")
+        if schema_version not in {SCHEMA_VERSION, PORTABLE_SCHEMA_VERSION}:
             raise WorkspaceError(f"unsupported workspace schema_version: {raw.get('schema_version')!r}")
         workspace_id = raw.get("workspace_id")
         if workspace_id is not None and validate_workspace_id(workspace_id) is None:
             raise WorkspaceError("workspace_id must be a non-empty persistent logical identifier, not a placeholder")
         paths, obs = raw.get("paths", {}), raw.get("obsidian", {})
         root = path.parent.resolve()
+        if schema_version == PORTABLE_SCHEMA_VERSION:
+            if validate_workspace_id(workspace_id) is None:
+                raise WorkspaceError("workspace v2 requires a persistent workspace_id")
+            roles = {name: _declared_path(root, paths, name) for name in
+                     ("project", "results", "sources", "derived", "local")}
+            if len(set(roles.values())) != len(roles):
+                raise WorkspaceError("workspace v2 role roots must be distinct")
+            # Legacy fields remain usable by media-only commands during explicit migration.
+            return cls(path, source, root, roles["project"], roles["sources"], roles["derived"],
+                       roles["derived"] / "generated", roles["derived"] / "threads",
+                       roles["derived"] / "concepts", roles["derived"] / "REVIEW.md",
+                       validate_workspace_id(workspace_id), None, None, schema_version,
+                       roles["results"], roles["sources"], roles["derived"], roles["local"])
         project = _contained(root / _required(paths, "project"), root, "project")
         media = _contained(root / _required(paths, "media"), root, "media")
         vault = _contained(root / _required(paths, "obsidian"), root, "obsidian")
@@ -93,9 +113,14 @@ class WorkspaceConfig:
             raise WorkspaceError("generated path overlaps a protected Vault boundary")
         return cls(path, source, root, project, media, vault, generated, threads, concepts, review,
                    validate_workspace_id(workspace_id),
-                   pyvideotrans_python, pyvideotrans_cli)
+                   pyvideotrans_python, pyvideotrans_cli, schema_version)
 
     def as_dict(self) -> dict[str, Any]:
+        if self.schema_version == PORTABLE_SCHEMA_VERSION:
+            return {"ok": True, "schema_version": self.schema_version, "workspace_id": self.workspace_id,
+                    "config_source": self.source, "config": str(self.config_path),
+                    "root": str(self.root), "roles": {name: str(getattr(self, name)) for name in
+                    ("project", "results", "sources", "derived", "local")}}
         return {"ok": True, "schema_version": SCHEMA_VERSION, "workspace_id": self.workspace_id,
                 "config_source": self.source,
                 "config": str(self.config_path), "root": str(self.root), "project": str(self.project),
@@ -105,6 +130,11 @@ class WorkspaceConfig:
                     "python": str(self.pyvideotrans_python) if self.pyvideotrans_python else None,
                     "cli": str(self.pyvideotrans_cli) if self.pyvideotrans_cli else None,
                 }}}
+
+
+def _declared_path(root: Path, mapping: dict[str, Any], key: str) -> Path:
+    value = Path(_required(mapping, key)).expanduser()
+    return (value if value.is_absolute() else root / value).resolve(strict=False)
 
 
 def _required(mapping: dict[str, Any], key: str) -> str:
