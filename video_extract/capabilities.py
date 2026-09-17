@@ -34,6 +34,18 @@ class Capability:
 
 
 CAPABILITIES: dict[str, Capability] = {
+    "publish.netease": Capability(
+        id="publish.netease",
+        contract_version=1,
+        implementation_version=1,
+        implementation="video_extract.netease_publish:run_netease_publish",
+        input_type="netease-publish-request-v1",
+        output_type="command-response-v1",
+        side_effect="explicitly_authorized_netease_cloud_write",
+        dependencies=("command:ncm-cli",),
+        authorization_category="netease_cloud_write",
+        recovery_query="operation show/resume/reconcile with the returned operation_id",
+    ),
     "audio.mandarin": Capability(
         id="audio.mandarin",
         contract_version=1,
@@ -100,6 +112,12 @@ def _operation_id(entry: Capability, request: dict[str, Any]) -> str:
     if entry.id == "audio.mandarin":
         try:
             from .mandarin_audio import operation_identity
+            return operation_identity(request)
+        except (KeyError, TypeError, ValueError, FileNotFoundError, WorkspaceError):
+            pass
+    if entry.id == "publish.netease":
+        try:
+            from .netease_publish import operation_identity
             return operation_identity(request)
         except (KeyError, TypeError, ValueError, FileNotFoundError, WorkspaceError):
             pass
