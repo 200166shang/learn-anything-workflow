@@ -92,11 +92,15 @@ class WorkspaceConfig:
                      ("project", "results", "sources", "derived", "local")}
             if len(set(roles.values())) != len(roles):
                 raise WorkspaceError("workspace v2 role roots must be distinct")
+            tools = raw.get("tools", {})
+            pyvideotrans = tools.get("pyvideotrans", {}) if isinstance(tools, dict) else {}
+            pyvideotrans_python = _optional_tool_path(root, pyvideotrans, "python")
+            pyvideotrans_cli = _optional_tool_path(root, pyvideotrans, "cli")
             # Legacy fields remain usable by media-only commands during explicit migration.
             return cls(path, source, root, roles["project"], roles["sources"], roles["derived"],
                        roles["derived"] / "generated", roles["derived"] / "threads",
                        roles["derived"] / "concepts", roles["derived"] / "REVIEW.md",
-                       validate_workspace_id(workspace_id), None, None, schema_version,
+                       validate_workspace_id(workspace_id), pyvideotrans_python, pyvideotrans_cli, schema_version,
                        roles["results"], roles["sources"], roles["derived"], roles["local"])
         project = _contained(root / _required(paths, "project"), root, "project")
         media = _contained(root / _required(paths, "media"), root, "media")
@@ -120,7 +124,11 @@ class WorkspaceConfig:
             return {"ok": True, "schema_version": self.schema_version, "workspace_id": self.workspace_id,
                     "config_source": self.source, "config": str(self.config_path),
                     "root": str(self.root), "roles": {name: str(getattr(self, name)) for name in
-                    ("project", "results", "sources", "derived", "local")}}
+                    ("project", "results", "sources", "derived", "local")},
+                    "tools": {"pyvideotrans": {
+                        "python": str(self.pyvideotrans_python) if self.pyvideotrans_python else None,
+                        "cli": str(self.pyvideotrans_cli) if self.pyvideotrans_cli else None,
+                    }}}
         return {"ok": True, "schema_version": SCHEMA_VERSION, "workspace_id": self.workspace_id,
                 "config_source": self.source,
                 "config": str(self.config_path), "root": str(self.root), "project": str(self.project),
