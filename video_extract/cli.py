@@ -403,6 +403,28 @@ def cmd_backup(args: argparse.Namespace) -> int:
     return exit_code(result)
 
 
+def cmd_migration(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .pilot_migration import convert, cutover, plan, rollback, verify
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.migration_action == "plan":
+            result = plan(workspace, args.batch, args.legacy_package, args.legacy_thread)
+        elif args.migration_action == "convert":
+            result = convert(workspace, args.batch)
+        elif args.migration_action == "verify":
+            result = verify(workspace, args.batch)
+        elif args.migration_action == "cutover":
+            result = cutover(workspace, args.batch)
+        else:
+            result = rollback(workspace, args.batch)
+    except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path),
+                          validation={"migration": "failed"}, diagnostics=[str(exc)])
+    emit(result, args.json)
+    return exit_code(result)
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     from .command_response import exit_code
     from .installation import apply, inspect, plan
@@ -822,6 +844,15 @@ def parser() -> argparse.ArgumentParser:
     practice_prepare = practice_actions.add_parser("prepare"); practice_prepare.add_argument("--request", type=Path, required=True); practice_prepare.add_argument("--workspace", type=Path); practice_prepare.add_argument("--json", action="store_true"); practice_prepare.set_defaults(func=cmd_practice)
     practice_checkpoint = practice_actions.add_parser("checkpoint"); practice_checkpoint.add_argument("--practice-id", required=True); practice_checkpoint.add_argument("--expected-revision", type=int, required=True); practice_checkpoint.add_argument("--workspace", type=Path); practice_checkpoint.add_argument("--json", action="store_true"); practice_checkpoint.set_defaults(func=cmd_practice, request=None)
     practice_record = practice_actions.add_parser("record"); practice_record.add_argument("--practice-id", required=True); practice_record.add_argument("--request", type=Path, required=True); practice_record.add_argument("--expected-revision", type=int, required=True); practice_record.add_argument("--workspace", type=Path); practice_record.add_argument("--json", action="store_true"); practice_record.set_defaults(func=cmd_practice)
+    migration = commands.add_parser("migration", help="plan, convert, verify, cut over, or roll back one explicit legacy pilot batch")
+    migration_actions = migration.add_subparsers(dest="migration_action", required=True)
+    migration_plan = migration_actions.add_parser("plan", help="inventory one legacy course package and learning thread without changing them")
+    migration_plan.add_argument("--legacy-package", type=Path, required=True); migration_plan.add_argument("--legacy-thread", type=Path, required=True)
+    migration_parsers = [migration_plan]
+    migration_parsers.extend(migration_actions.add_parser(action) for action in ("convert", "verify", "cutover", "rollback"))
+    for action_parser in migration_parsers:
+        action_parser.add_argument("--batch", required=True); action_parser.add_argument("--workspace", type=Path, required=True)
+        action_parser.add_argument("--json", action="store_true"); action_parser.set_defaults(func=cmd_migration)
     backup = commands.add_parser("backup", help="create, verify, or restore a complete result-only generation")
     backup_actions = backup.add_subparsers(dest="backup_action", required=True)
     backup_create = backup_actions.add_parser("create"); backup_create.add_argument("backup", type=Path); backup_create.add_argument("--workspace", type=Path); backup_create.add_argument("--json", action="store_true"); backup_create.set_defaults(func=cmd_backup)
