@@ -280,6 +280,14 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     converted = read_json(conversion_path)
     target_source_digest, _ = _directory_manifest(root / "converted/course")
     source_files = value["package_snapshot"]; target_files = _tree(root / "converted/course")
+    locator_checks = []
+    for locator in converted["legacy_locators"].values():
+        relative = locator.get("path")
+        document = (root / "converted/course" / relative).resolve(strict=False) if isinstance(relative, str) else None
+        course_root = (root / "converted/course").resolve(strict=False)
+        present = bool(document and course_root in document.parents and document.is_file())
+        heading = locator.get("heading")
+        locator_checks.append(present and (not heading or f"# {heading}" in document.read_text(encoding="utf-8")))
     checks = {"content": source_files == target_files,
               "notes": len(value["inventory"]["notes"]) == value["inventory"]["counts"]["notes"],
               "images": len(value["inventory"]["images"]) == value["inventory"]["counts"]["images"],
@@ -297,7 +305,7 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
                                    for item in converted["record"]["threads"].values())
                   == value["inventory"]["counts"]["entry_history"],
               "locators": len(converted["legacy_locators"])
-                  == value["inventory"]["counts"]["locators"],
+                  == value["inventory"]["counts"]["locators"] and all(locator_checks),
               "legacy_source_version": converted["legacy_source_version"]
                   == value["inventory"].get("source_version"),
               "target_source_version": converted["source_version"]
@@ -344,29 +352,41 @@ def _ownership(config: WorkspaceConfig) -> dict[str, Any]:
     return read_json(path) if path.is_file() else {"schema_version": 1, "batches": {}}
 
 
-def _set_legacy_read_only(package: Path) -> dict[str, int]:
+def _legacy_modes(package: Path, thread_path: Path) -> dict[str, Any]:
     modes: dict[str, int] = {}
     for path in sorted((package, *package.rglob("*"))):
         if path.is_symlink(): continue
         relative = "." if path == package else path.relative_to(package).as_posix()
-        mode = path.stat().st_mode & 0o777
-        modes[relative] = mode
-        path.chmod(mode & ~0o222)
-    return modes
+        modes[relative] = path.stat().st_mode & 0o777
+    return {"package": modes, "thread": thread_path.stat().st_mode & 0o777}
 
 
-def _restore_legacy_modes(package: Path, modes: dict[str, int]) -> None:
-    for relative, mode in sorted(modes.items(), key=lambda item: item[0].count("/"), reverse=True):
+def _set_legacy_read_only(package: Path, thread_path: Path, modes: dict[str, Any]) -> None:
+    for relative, mode in modes["package"].items():
+        path = package if relative == "." else package / relative
+        if path.exists() and not path.is_symlink(): path.chmod(int(mode) & ~0o222)
+    thread_path.chmod(int(modes["thread"]) & ~0o222)
+
+
+def _restore_legacy_modes(package: Path, thread_path: Path, modes: dict[str, Any]) -> None:
+    thread_path.chmod(int(modes["thread"]))
+    for relative, mode in sorted(modes["package"].items(), key=lambda item: item[0].count("/"), reverse=True):
         path = package if relative == "." else package / relative
         if path.exists() and not path.is_symlink(): path.chmod(mode)
 
 
-def cutover(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
+def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> dict[str, Any]:
     from . import learning
     from .source_registry import register
     results, _ = _require_workspace(config); root, value = _state(config, batch)
     if value["status"] not in {"verified", "cutover"}:
         raise ValueError("batch must pass verify before cutover")
+    authorization = read_json(authorization_path.expanduser().resolve())
+    expected_authorization = {"batch": batch, "legacy_package": value["legacy_package"],
+                              "legacy_thread": value["legacy_thread"], "approved": True}
+    if any(authorization.get(key) != expected for key, expected in expected_authorization.items()):
+        raise ValueError("cutover authorization must explicitly approve this batch, package, and thread")
+    authorization_sha256 = _digest(authorization)
     converted = read_json(root / "converted/conversion.json")
     if not _unchanged(value):
         value["events"].append(_event("migration cutover", "failed",
@@ -427,12 +447,24 @@ def cutover(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
                     merged[key][identity] = item; changed = True
         published = learning._publish(config, previous, merged) if changed else previous
     baseline = _tree(target)
-    legacy_modes = _set_legacy_read_only(Path(value["legacy_package"]))
+    package_path, thread_path = Path(value["legacy_package"]), Path(value["legacy_thread"])
+    legacy_modes = value.get("legacy_modes_before_cutover")
+    if legacy_modes is None:
+        legacy_modes = _legacy_modes(package_path, thread_path)
+        value["legacy_modes_before_cutover"] = legacy_modes
+        value["authorization_sha256"] = authorization_sha256
+        value["acceptance"]["real_pilot"] = "authorized_for_cutover"
+        atomic_write_json(root / "batch.json", value)
+    _set_legacy_read_only(package_path, thread_path, legacy_modes)
+    if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_legacy_read_only":
+        raise OSError("injected failure after legacy read-only transition")
     owners["batches"][batch] = {"owner": "new", "legacy_read_only": True,
-        "legacy_package": value["legacy_package"], "migrated_course": str(target),
+        "legacy_package": value["legacy_package"], "legacy_thread": value["legacy_thread"],
+        "migrated_course": str(target),
         "source_id": converted["source_id"], "source_version": actual_version,
         "learning_commit_id": published["commit_id"], "cutover_at": _now(), "cutover_baseline": baseline,
-        "legacy_modes": legacy_modes}
+        "legacy_modes": legacy_modes, "locators": converted["legacy_locators"],
+        "authorization_sha256": authorization_sha256}
     atomic_write_json(_ownership_path(config), owners)
     value.update(status="cutover", cutover_at=_now(), migrated_course=str(target),
                  learning_commit_id=published["commit_id"])
@@ -479,7 +511,7 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
         "learning_changed": learning_changed,
         "operation_receipts": [path.relative_to(receipt_root).as_posix() for path in receipts],
         "policy": "preserve_only_no_remote_replay"})
-    _restore_legacy_modes(Path(owner["legacy_package"]), owner["legacy_modes"])
+    _restore_legacy_modes(Path(owner["legacy_package"]), Path(owner["legacy_thread"]), owner["legacy_modes"])
     owner.update(owner="legacy", legacy_read_only=False, new_read_only=True,
                  replay_required=bool(changed or deleted or receipts or learning_changed), rollback_at=_now(),
                  preserved_increment=str(preserved))
@@ -496,3 +528,18 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
         "replay_required": bool(changed or deleted or receipts or learning_changed)},
         validation={"increment_preserved": "passed", "new_store_not_overwritten": "passed",
                     "remote_operations_replayed": "no"})
+
+
+def locate_migrated_question(config: WorkspaceConfig, question_id: str) -> dict[str, Any] | None:
+    owners = _ownership(config)
+    for batch, owner in owners["batches"].items():
+        locator = owner.get("locators", {}).get(question_id)
+        if owner.get("owner") != "new" or not isinstance(locator, dict): continue
+        relative = locator.get("path")
+        if not isinstance(relative, str): continue
+        course = Path(owner["migrated_course"]).resolve(strict=False)
+        document = (course / relative).resolve(strict=False)
+        if course not in document.parents or not document.is_file(): continue
+        return {"batch": batch, "document_path": str(document),
+                "heading": locator.get("heading"), "kind": "legacy_migrated_locator"}
+    return None

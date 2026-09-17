@@ -8,11 +8,11 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 
 
-def cli(*args: object) -> tuple[int, dict]:
+def cli(*args: object, env: dict[str, str] | None = None) -> tuple[int, dict]:
     completed = subprocess.run(
         [sys.executable, "-m", "video_extract.cli", *map(str, args)],
         cwd=ROOT,
-        env=os.environ.copy(),
+        env={**os.environ, **(env or {})},
         capture_output=True,
         text=True,
     )
@@ -70,6 +70,14 @@ def legacy_pilot(root: Path) -> Path:
     return root
 
 
+def authorize(root: Path, batch: str, legacy: Path) -> Path:
+    path = root / f"{batch}-authorization.json"
+    path.write_text(json.dumps({"batch": batch, "legacy_package": str((legacy / "course").resolve()),
+                                "legacy_thread": str((legacy / "thread.json").resolve()),
+                                "approved": True}), encoding="utf-8")
+    return path
+
+
 def test_public_migration_stops_cutover_when_source_changed(tmp_path: Path) -> None:
     config = workspace(tmp_path / "workspace")
     legacy = legacy_pilot(tmp_path / "legacy")
@@ -100,8 +108,9 @@ def test_public_migration_stops_cutover_when_source_changed(tmp_path: Path) -> N
     assert verified["result"]["identity_map"]["q001"].startswith("question-")
 
     (legacy / "course/notes/lesson.md").write_text("# changed after verification\n", encoding="utf-8")
+    authorization = authorize(tmp_path, batch, legacy)
     cutover_code, blocked = cli("migration", "cutover", "--batch", batch,
-                                "--workspace", config, "--json")
+                                "--workspace", config, "--authorization", authorization, "--json")
     assert cutover_code != 0
     assert blocked["status"] == "recoverable_failure"
     assert blocked["validation"]["source_unchanged"] == "failed"
@@ -121,15 +130,21 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
                "--legacy-thread", legacy / "thread.json", *common)[0] == 0
     assert cli("migration", "convert", *common)[0] == 0
     assert cli("migration", "verify", *common)[0] == 0
-    code, cutover = cli("migration", "cutover", *common)
+    authorization = authorize(tmp_path, batch, legacy)
+    failed_code, failed = cli("migration", "cutover", *common, "--authorization", authorization,
+                              env={"VIDEO_EXTRACT_MIGRATION_TEST_FAULT": "after_legacy_read_only"})
+    assert failed_code != 0 and "injected failure" in failed["diagnostics"][0]
+    assert not (config.parent / "results/migration-ownership.json").exists()
+    code, cutover = cli("migration", "cutover", *common, "--authorization", authorization)
     assert code == 0 and cutover["status"] == "completed"
-    retry_code, retried = cli("migration", "cutover", *common)
+    retry_code, retried = cli("migration", "cutover", *common, "--authorization", authorization)
     assert retry_code == 0 and retried["result"]["reconciled"] is True
 
     ownership = json.loads((config.parent / "results/migration-ownership.json").read_text())
     assert ownership["batches"][batch]["owner"] == "new"
     assert ownership["batches"][batch]["legacy_read_only"] is True
     assert (legacy / "course/manifest.json").stat().st_mode & 0o222 == 0
+    assert (legacy / "thread.json").stat().st_mode & 0o222 == 0
     migrated = Path(cutover["result"]["migrated_course"])
     assert (migrated / "notes/lesson.md").read_text(encoding="utf-8").startswith("# 第一课")
     assert (migrated / "notes/images/frame.png").read_bytes() == b"legacy-image"
@@ -148,9 +163,14 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     assert all(state["feedback_history"] == [] for state in shown["result"]["question_states"].values())
     assert len(shown["result"]["thread"]["return_route"]) == 1
     assert len(shown["result"]["thread"]["entry_history"]) == 1
-
     root_question = next(item["question_id"] for item in shown["result"]["questions"]
                          if item["original_question"] == "为什么要变换坐标？")
+    locate_code, located = cli("learning", "locate", root_question,
+                               "--workspace", config, "--json")
+    assert locate_code == 0
+    assert located["result"]["explanation_state"] == "legacy_migrated"
+    assert Path(located["result"]["locations"][0]["document_path"]).is_file()
+
     feedback_code, _ = cli("learning", "feedback", "--question-id", root_question,
                            "--state", "confused", "--text", "切换后仍有疑惑",
                            "--workspace", config, "--json")
@@ -172,3 +192,4 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     assert ownership["batches"][batch]["replay_required"] is True
     assert increment.is_file()
     assert (legacy / "course/manifest.json").stat().st_mode & 0o200
+    assert (legacy / "thread.json").stat().st_mode & 0o200

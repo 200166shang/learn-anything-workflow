@@ -415,7 +415,7 @@ def cmd_migration(args: argparse.Namespace) -> int:
         elif args.migration_action == "verify":
             result = verify(workspace, args.batch)
         elif args.migration_action == "cutover":
-            result = cutover(workspace, args.batch)
+            result = cutover(workspace, args.batch, args.authorization)
         else:
             result = rollback(workspace, args.batch)
     except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
@@ -853,6 +853,9 @@ def parser() -> argparse.ArgumentParser:
     for action_parser in migration_parsers:
         action_parser.add_argument("--batch", required=True); action_parser.add_argument("--workspace", type=Path, required=True)
         action_parser.add_argument("--json", action="store_true"); action_parser.set_defaults(func=cmd_migration)
+    next(item for item in migration_parsers if item.prog.endswith(" cutover")).add_argument(
+        "--authorization", type=Path, required=True,
+        help="JSON explicitly approving this batch and its exact legacy package/thread paths")
     backup = commands.add_parser("backup", help="create, verify, or restore a complete result-only generation")
     backup_actions = backup.add_subparsers(dest="backup_action", required=True)
     backup_create = backup_actions.add_parser("create"); backup_create.add_argument("backup", type=Path); backup_create.add_argument("--workspace", type=Path); backup_create.add_argument("--json", action="store_true"); backup_create.set_defaults(func=cmd_backup)

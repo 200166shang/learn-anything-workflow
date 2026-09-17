@@ -827,6 +827,14 @@ def locate(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
     cross_root_references = _cross_root_states(record, question)
     if not question["explanation_refs"]:
+        from .pilot_migration import locate_migrated_question
+        migrated = locate_migrated_question(config, question_id)
+        if migrated is not None:
+            return response(status="completed", workspace=str(config.config_path), result={
+                "question": question, "explanation_state": "legacy_migrated",
+                "locations": [migrated], "source_checks": [],
+                "cross_root_references": cross_root_references},
+                validation={"legacy_migrated_locator": "passed"})
         return response(status="awaiting_model", workspace=str(config.config_path), result={
             "question": question, "explanation_state": "pending",
             "cross_root_references": cross_root_references},
