@@ -95,6 +95,32 @@ Identical validated input/parameter fingerprints are cache hits. Browser capture
 
 The stable interface adds `plan` and `ensure` while preserving `doctor|scan|acquire|transcribe|prepare-evidence|verify|status`; `--help` owns current defaults and platform parameters.
 
+## Result-only backup generation v1
+
+`backup create TARGET` publishes a new directory only after deeply validating and
+pinning one complete source, authoritative-notes, and learning generation.  Its
+`backup-commit-*` manifest records the engineering revision, every authority's
+schema/commit/revision/root digest, and the size and SHA-256 of every copied
+file.  Current manifests contain their complete formal version history; every
+object reachable from those manifests and every sanitized result-side operation
+receipt is included.
+
+The backup is intentionally result-only.  Source media and referenced source
+trees, local operation state, leases and locks, candidates/drafts, derived
+indexes and views, temporary files, installation state, and credentials are not
+copied.  A referenced source which is absent after restore remains identified by
+its stable source ID/version and is reported as `missing_external_source`; it is
+never substituted with a different version.
+
+`backup verify` rejects missing, extra, symbolic, digest-mismatched, or
+association-broken payloads. `backup restore` accepts an explicit workspace-v2
+configuration whose results root does not yet exist, validates in a sibling
+staging directory, and atomically publishes the complete results root.  It does
+not merge with or overwrite an existing target.  Restore writes only a recovery
+state which pauses delivery and external operations until the user verifies a
+unique host; rebuildable indexes and views remain the responsibility of their
+registered capabilities.
+
 ## Manifest v5 media language requests
 
 For `--media audio --language zh-CN`, an existing Chinese track is materialized as source audio. Without that track, extraction records `missing_requested_language_track`; it never starts synthesis.

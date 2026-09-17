@@ -263,6 +263,19 @@ def cmd_explanation(args: argparse.Namespace) -> int:
     emit(result, args.json); return exit_code(result)
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    from .backup import create_backup, restore_backup, verify_backup
+    from .command_response import exit_code
+    if args.backup_action == "verify":
+        result = verify_backup(args.backup)
+    else:
+        workspace = discover_workspace(args.workspace)
+        result = (create_backup(workspace, args.backup) if args.backup_action == "create"
+                  else restore_backup(args.backup, workspace))
+    emit(result, args.json)
+    return exit_code(result)
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     from .command_response import exit_code
     from .installation import apply, inspect, plan
@@ -644,6 +657,11 @@ def parser() -> argparse.ArgumentParser:
     explanation_actions = explanation.add_subparsers(dest="explanation_action", required=True)
     explanation_prepare = explanation_actions.add_parser("prepare"); explanation_prepare.add_argument("--question-id", required=True); explanation_prepare.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_prepare.add_argument("--workspace", type=Path); explanation_prepare.add_argument("--json", action="store_true"); explanation_prepare.set_defaults(func=cmd_explanation)
     explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--preparation-id", required=True); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
+    backup = commands.add_parser("backup", help="create, verify, or restore a complete result-only generation")
+    backup_actions = backup.add_subparsers(dest="backup_action", required=True)
+    backup_create = backup_actions.add_parser("create"); backup_create.add_argument("backup", type=Path); backup_create.add_argument("--workspace", type=Path); backup_create.add_argument("--json", action="store_true"); backup_create.set_defaults(func=cmd_backup)
+    backup_verify = backup_actions.add_parser("verify"); backup_verify.add_argument("backup", type=Path); backup_verify.add_argument("--json", action="store_true"); backup_verify.set_defaults(func=cmd_backup, workspace=None)
+    backup_restore = backup_actions.add_parser("restore"); backup_restore.add_argument("backup", type=Path); backup_restore.add_argument("--workspace", type=Path, required=True); backup_restore.add_argument("--json", action="store_true"); backup_restore.set_defaults(func=cmd_backup)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):
