@@ -1,0 +1,69 @@
+<!-- Throwaway UI comparison: local relationships vs module overview. Fictional data; no persistence. -->
+<div id="learning-map-demo" aria-label="学习地图视图对比">
+<style>
+#learning-map-demo{color-scheme:light dark;--lm-bg:light-dark(#faf9fc,#202025);--lm-panel:light-dark(#ffffff,#292930);--lm-text:light-dark(#26232d,#eeeaf5);--lm-muted:light-dark(#645f70,#bab3c6);--lm-line:light-dark(#c7c0d3,#666071);--lm-accent:light-dark(#7251b5,#c0a1ff);--lm-selected:light-dark(#f0e9fc,#3b3050);font:14px/1.5 system-ui,sans-serif;color:var(--lm-text);background:var(--lm-bg);border:1px solid var(--lm-line);border-radius:12px;overflow:hidden}
+#learning-map-demo *{box-sizing:border-box}
+#learning-map-demo .lm-top{padding:16px 20px;border-bottom:1px solid var(--lm-line);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+#learning-map-demo .lm-sub{color:var(--lm-muted);font-size:12px}
+#learning-map-demo .lm-tabs{display:flex;gap:8px;flex-wrap:wrap;padding:14px 20px 0}
+#learning-map-demo button{font:inherit;color:inherit;cursor:pointer}
+#learning-map-demo .lm-tabs button{background:var(--lm-panel);border:1px solid var(--lm-line);border-radius:6px;padding:8px 14px}
+#learning-map-demo .lm-tabs button[aria-pressed=true]{background:var(--lm-selected);border-color:var(--lm-accent)}
+#learning-map-demo .lm-resume{padding:14px 20px 8px}
+#learning-map-demo .lm-route{color:var(--lm-muted);margin-top:4px}
+#learning-map-demo .lm-map{position:relative;margin:0 12px;background-image:radial-gradient(var(--lm-line) .6px,transparent .6px);background-size:18px 18px}
+#learning-map-demo .lm-map svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+#learning-map-demo .lm-node{position:absolute;border:1px solid var(--lm-line);border-radius:8px;background:var(--lm-panel);padding:10px 12px;text-align:left;min-height:78px;display:flex;flex-direction:column;justify-content:center;gap:5px}
+#learning-map-demo .lm-node[data-current=true]{border:2px solid var(--lm-accent);background:var(--lm-selected)}
+#learning-map-demo .lm-node[aria-pressed=true]{box-shadow:0 0 0 3px var(--lm-line)}
+#learning-map-demo .lm-node small{font-size:12px;color:var(--lm-muted)}
+#learning-map-demo .lm-group{position:absolute;font-size:12px;color:var(--lm-muted);font-weight:500}
+#learning-map-demo .lm-legend{display:flex;gap:18px;flex-wrap:wrap;padding:8px 20px;color:var(--lm-muted);font-size:12px}
+#learning-map-demo .lm-preview{margin:6px 20px 18px;padding:14px 0 0;border-top:1px solid var(--lm-line)}
+#learning-map-demo .lm-preview p{margin:6px 0;color:var(--lm-muted)}
+#learning-map-demo .lm-preview strong{font-weight:500}
+@media(max-width:450px){#learning-map-demo .lm-top,#learning-map-demo .lm-resume{padding-left:12px;padding-right:12px}#learning-map-demo .lm-tabs{padding-left:12px}#learning-map-demo .lm-preview{margin-left:12px;margin-right:12px}}
+</style>
+<div class="lm-top"><span>小沫视觉 / 学习地图</span><span class="lm-sub">视图原型 · 示例数据</span></div>
+<div class="lm-tabs" aria-label="视图选择"><button type="button" data-view="local" aria-pressed="true">局部问题图</button><button type="button" data-view="overview" aria-pressed="false">模块全景图</button></div>
+<div class="lm-resume"><div>续学位置：<strong>线性变换是什么意思？</strong> · 暂放</div><div class="lm-route">本次返回路线：标定 → 投影 → 线性变换</div></div>
+<div class="lm-map" aria-label="可点击的问题关系图"></div>
+<div class="lm-legend"><span>实线箭头：实际追问</span><span>虚线箭头：跨根引用</span><span>紫色边框：续学位置</span></div>
+<div class="lm-preview" aria-live="polite"><strong class="lm-preview-title">线性变换是什么意思？</strong><p class="lm-preview-state">当前问题 · 暂放</p><p class="lm-preview-text">未解疑惑：矩阵的两列为什么表示基向量的去向？</p><div class="lm-sub">点击节点只预览；续学位置保持在线性变换。</div></div>
+<script>
+(()=>{
+const root=document.getElementById('learning-map-demo');
+const map=root.querySelector('.lm-map');
+const data={
+ calibration:{title:'相机怎样标定？',status:'未确认',group:'相机标定',text:'根问题：通过已知空间点与图像点的对应关系，理解相机参数如何确定。'},
+ projection:{title:'三维点怎样投影到图像？',status:'理解了',group:'相机标定',text:'示例讲解位置：投影与坐标变换 → 透视投影。与线性变换可以合并在同一篇讲解中，问题仍独立保留。'},
+ linear:{title:'线性变换是什么意思？',status:'暂放',group:'相机标定',text:'未解疑惑：矩阵的两列为什么表示基向量的去向？示例讲解位置：投影与坐标变换 → 线性变换。'},
+ basis:{title:'矩阵的列为什么对应基向量？',status:'仍不理解',group:'相机标定',text:'示例疑惑：知道如何算矩阵乘法，但还不能从基向量的去向解释结果。'},
+ translation:{title:'平移为什么不是线性变换？',status:'未确认',group:'相机标定',text:'示例讲解：从原点是否保持不变出发，区分线性变换与仿射变换。'},
+ coordinates:{title:'相机坐标系怎样定义？',status:'未确认',group:'相机标定',text:'曾从此问题再次进入已有的线性变换问题。该关系保留，但不改变当前返回路线。'},
+ control:{title:'视觉结果怎样参与控制？',status:'未确认',group:'视觉控制',text:'另一个根问题：从识别结果追踪到控制输入。它与相机标定拥有独立的问题和反馈。'},
+ robot:{title:'识别坐标怎样转成机械臂坐标？',status:'未确认 · 待讲解',group:'视觉控制',text:'已保存实际提问，尚无讲解。引用相机标定根下的线性变换，不继承它的理解反馈。'}
+};
+const edges=[['calibration','projection'],['calibration','coordinates'],['projection','linear'],['coordinates','linear'],['linear','basis'],['linear','translation'],['control','robot'],['robot','linear','reference']];
+let view='local',selected='linear';
+const design={showFeedback:true};
+function preview(id){selected=id;const n=data[id];root.querySelector('.lm-preview-title').textContent=n.title;root.querySelector('.lm-preview-state').textContent=(id==='linear'?'当前问题 · ':'查看中 · ')+n.status+' · '+n.group;root.querySelector('.lm-preview-text').textContent=n.text;map.querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.id===id)));}
+function draw(){
+const w=map.clientWidth,narrow=w<540,h=view==='local'?(narrow?810:530):(narrow?1010:670);map.style.height=h+'px';map.replaceChildren();
+const pos=view==='local'?{
+ projection:[.21,45],coordinates:[.79,45],linear:[.5,205],robot:[.82,360],basis:[.21,430],translation:[.53,430]
+}:{calibration:[.25,45],control:[.78,45],projection:[.15,205],coordinates:[.44,205],robot:[.78,205],linear:[.29,390],basis:[.15,560],translation:[.47,560]};
+const order=view==='local'?['projection','coordinates','linear','basis','translation','robot']:['calibration','projection','coordinates','linear','basis','translation','control','robot'];
+if(narrow)order.forEach((id,i)=>pos[id]=[.56,20+i*120]);
+const width=narrow?Math.min(w-75,270):Math.min(198,w*.265),boxes={};
+const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('aria-hidden','true');svg.innerHTML='<defs><marker id="lm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lm-line)"/></marker></defs>';map.append(svg);
+if(!narrow&&view==='overview'){[['相机标定 · 根问题 A',.02],['视觉控制 · 根问题 B',.65]].forEach(([t,x])=>{const label=document.createElement('div');label.className='lm-group';label.textContent=t;label.style.left=(w*x)+'px';label.style.top='8px';map.append(label);});}
+Object.entries(pos).forEach(([id,[x,y]])=>{const n=data[id],b=document.createElement('button');b.type='button';b.className='lm-node';b.dataset.id=id;b.dataset.current=String(id==='linear');b.setAttribute('aria-pressed',String(id===selected));b.style.width=width+'px';b.style.left=(w*x-width/2)+'px';b.style.top=y+'px';const title=document.createElement('span');title.textContent=(id==='linear'?'📍 ':'')+n.title;b.append(title);if(design.showFeedback){const status=document.createElement('small');status.textContent=n.status;b.append(status);}if(id==='robot'&&view==='local'){const source=document.createElement('small');source.textContent='跨根：视觉控制';b.append(source);}b.addEventListener('click',()=>preview(id));map.append(b);boxes[id]={x:w*x-width/2,y,width,height:b.offsetHeight};});
+edges.forEach(([a,b,type],index)=>{if(!boxes[a]||!boxes[b])return;const A=boxes[a],B=boxes[b],p=document.createElementNS(svg.namespaceURI,'path');let d;if(narrow){const lane=12+(index%4)*8;d=`M ${A.x} ${A.y+A.height/2} H ${lane} V ${B.y+B.height/2} H ${B.x}`;}else if(type==='reference'){d=`M ${A.x} ${A.y+A.height/2} C ${A.x-40} ${A.y+A.height/2},${B.x+B.width+40} ${B.y+B.height/2},${B.x+B.width} ${B.y+B.height/2}`;}else{const ax=A.x+A.width/2,ay=A.y+A.height,bx=B.x+B.width/2,by=B.y;d=`M ${ax} ${ay} C ${ax} ${(ay+by)/2},${bx} ${(ay+by)/2},${bx} ${by}`;}p.setAttribute('d',d);p.setAttribute('fill','none');p.setAttribute('stroke','var(--lm-line)');p.setAttribute('stroke-width','1.5');p.setAttribute('marker-end','url(#lm-arrow)');if(type==='reference')p.setAttribute('stroke-dasharray','6 5');svg.append(p);});
+}
+root.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>{view=b.dataset.view;root.querySelectorAll('[data-view]').forEach(t=>t.setAttribute('aria-pressed',String(t===b)));draw();}));
+new ResizeObserver(draw).observe(map);draw();
+if(globalThis.Tweak){const tweak=new Tweak({container:root,onChange:draw});tweak.addToggle(design,'showFeedback',{label:'节点显示理解反馈'});}
+})();
+</script>
+</div>
