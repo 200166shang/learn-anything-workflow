@@ -673,6 +673,73 @@ def test_t07_snapshot_without_navigation_fields_remains_readable(tmp_path: Path)
     assert code == 0 and shown["result"]["thread"]["return_route"] == []
 
 
+def test_stale_reentry_candidate_preserves_complete_intent_and_can_be_replayed(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, known = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                   "--relation", "deepens", "--question", "投影是什么？", "--workspace", config, "--json")
+    known_id = known["result"]["question"]["question_id"]; stale = known["result"]["revision"]
+    cli("learning", "feedback", "--question-id", root_id, "--state", "understood", "--text", "懂了",
+        "--workspace", config, "--json")
+    code, conflict = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                         "--existing-question-id", known_id, "--actual-question", "那它如何落到像素坐标？",
+                         "--relation", "applies", "--expected-revision", stale, "--workspace", config, "--json")
+    assert code == 3
+    candidate = Path(conflict["result"]["candidate"]); proposal = json.loads(candidate.read_text())["proposal"]
+    assert proposal == {"thread_id": thread_id, "from_question_id": root_id,
+                        "existing_question_id": known_id, "question": None,
+                        "actual_question": "那它如何落到像素坐标？", "relation": "applies",
+                        "independent": False,
+                        "position_effect": {"set_current_question_id": known_id, "push_return_question_id": root_id}}
+    code, replayed = cli("learning", "replay", "--candidate", candidate, "--workspace", config, "--json")
+    assert code == 0
+    assert replayed["result"]["entry"]["original_text"] == "那它如何落到像素坐标？"
+    assert replayed["result"]["question"]["original_question"] == "投影是什么？"
+
+
+def test_stale_new_question_candidate_replays_independent_intent(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json"); stale = shown["result"]["revision"]
+    cli("learning", "feedback", "--question-id", root_id, "--state", "understood", "--text", "懂了",
+        "--workspace", config, "--json")
+    code, conflict = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                         "--question", "新的独立疑问", "--independent", "--relation", "related",
+                         "--expected-revision", stale, "--workspace", config, "--json")
+    assert code == 3
+    candidate = Path(conflict["result"]["candidate"]); proposal = json.loads(candidate.read_text())["proposal"]
+    assert proposal["question"] == "新的独立疑问" and proposal["independent"] is True
+    code, replayed = cli("learning", "replay", "--candidate", candidate, "--workspace", config, "--json")
+    assert code == 0 and replayed["result"]["question"]["original_question"] == "新的独立疑问"
+
+
+def test_paraphrase_reentry_across_processes_keeps_question_and_actual_words(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, known = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                   "--relation", "deepens", "--question", "矩阵列为什么是基向量？", "--workspace", config, "--json")
+    known_id = known["result"]["question"]["question_id"]
+    _, reentered = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                       "--existing-question-id", known_id, "--actual-question", "换句话说，每一列究竟表示什么？",
+                       "--relation", "related", "--workspace", config, "--json")
+    _, restored = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert reentered["result"]["question"]["original_question"] == "矩阵列为什么是基向量？"
+    assert restored["result"]["thread"]["entry_history"][-1]["original_text"] == "换句话说，每一列究竟表示什么？"
+
+
+def test_learning_capability_forwards_actual_question_for_existing_identity(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, known = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                   "--relation", "deepens", "--question", "原问题", "--workspace", config, "--json")
+    request = tmp_path / "reentry.json"; request.write_text(json.dumps({
+        "contract_version": 1, "action": "pursue", "workspace": str(config), "thread_id": thread_id,
+        "from_question_id": root_id, "existing_question_id": known["result"]["question"]["question_id"],
+        "actual_question": "本次换一种问法", "relation": "related"}))
+    code, result = cli("capability", "run", "learning.learn", "--request", request, "--json")
+    assert code == 0 and result["result"]["entry"]["original_text"] == "本次换一种问法"
+
+
 def _linear_inputs(tmp_path: Path, source: dict, marker: str) -> tuple[Path, Path, Path]:
     draft = tmp_path / f"draft-{__import__('uuid').uuid4()}.md"
     draft.write_text(f"# 解释\n{marker}\n直觉和因果机制：基向量决定矩阵列。例子 (1,2) 变 (2,6)。条件边界：平移需要仿射或齐次坐标。\n")

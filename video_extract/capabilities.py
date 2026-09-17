@@ -283,7 +283,8 @@ def run_learning(request: dict[str, Any]) -> dict[str, Any]:
         if action == "pursue":
             return pursue(workspace, request["thread_id"], request["from_question_id"], request["relation"],
                           request.get("question"), request.get("expected_revision"),
-                          request.get("existing_question_id"), bool(request.get("independent", False)))
+                          request.get("existing_question_id"), bool(request.get("independent", False)),
+                          request.get("actual_question"))
         if action == "feedback":
             return record_feedback(workspace, request["question_id"], request["state"], request["text"],
                                    request.get("confusion"), request.get("expected_revision"))

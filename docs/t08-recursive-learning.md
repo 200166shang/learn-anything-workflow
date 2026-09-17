@@ -2,10 +2,11 @@
 
 Issue: `learn-anything-workflow#20`.
 
-The public seams are `learning pursue/feedback/resume/back/show/locate`. Actual questions are
+The public seams are `learning pursue/feedback/resume/back/show/locate` plus conflict `replay`. Actual questions are
 persisted before an explanation. A caller explicitly re-enters an existing opaque question identity;
 matching wording is only an ambiguity signal and never an automatic merge. Each entry records the
-actual source question separately from the historical relationship.
+user's actual wording and actual source question separately from the historical relationship, without
+overwriting the question's first wording.
 
 Explicit understanding feedback has three states: `understood`, `confused`, and `parked`. The latest
 value is a projection over an immutable feedback history. Confusions remain question facts. Silence,
@@ -21,7 +22,9 @@ T08 extends `learning-record-v2` only with optional thread navigation fields, so
 valid and readers project missing fields as empty lists. Publishing still uses immutable objects and
 manifests plus one atomic current pointer. A stale same-question feedback or position mutation is
 preserved as a conflict candidate. Feedback to a different, unchanged question may be revalidated
-against the expected snapshot and merged without overwriting shared state.
+against the expected snapshot and merged without overwriting shared state. Pursue candidates contain
+the normalized full intent and declared position effect, so a user-selected candidate can be replayed
+without reconstructing missing identity or wording from chat history.
 
 Automated fixtures simulate a controlled session restart and F-navigation behavior. They do not claim
 the real next-day A07 evidence reserved for T26.

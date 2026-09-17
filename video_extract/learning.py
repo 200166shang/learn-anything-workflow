@@ -464,7 +464,8 @@ def create_thread(config: WorkspaceConfig, module_id: str, root_text: str,
 
 def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relation: str,
            text: str | None, expected_revision: int | None = None,
-           existing_question_id: str | None = None, independent: bool = False) -> dict[str, Any]:
+           existing_question_id: str | None = None, independent: bool = False,
+           actual_question: str | None = None) -> dict[str, Any]:
     if not existing_question_id and not (text or "").strip():
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=["actual question must be non-empty"])
@@ -473,8 +474,18 @@ def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relat
                         diagnostics=["relation must be deepens, applies, or related"])
     with package_lock(_roots(config)[2].parent):
         snapshot = _load(config); record = snapshot["record"]
+        normalized_actual = (actual_question or text or "").strip()
+        if existing_question_id and not normalized_actual:
+            existing = record["questions"].get(existing_question_id)
+            normalized_actual = existing["original_question"] if existing else ""
+        target_effect = existing_question_id or "new_question"
+        intent = {"thread_id": thread_id, "from_question_id": from_question_id,
+                  "existing_question_id": existing_question_id, "question": text.strip() if text else None,
+                  "actual_question": normalized_actual, "relation": relation, "independent": bool(independent),
+                  "position_effect": {"set_current_question_id": target_effect,
+                                      "push_return_question_id": from_question_id}}
         if expected_revision is not None:
-            conflict = _revision_conflict(config, snapshot, expected_revision, "learning.pursue", {"thread_id": thread_id, "question": text})
+            conflict = _revision_conflict(config, snapshot, expected_revision, "learning.pursue", intent)
             if conflict: return conflict
         thread = record["threads"].get(thread_id); source = record["questions"].get(from_question_id)
         if thread is None or source is None or source["thread_id"] != thread_id:
@@ -501,7 +512,8 @@ def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relat
                         "from_question_id": from_question_id, "to_question_id": question_id,
                         "type": relation, "created_at": _now()}
         entry = {"entry_id": "entry-" + str(uuid.uuid4()), "from_question_id": from_question_id,
-                 "to_question_id": question_id, "relation": relation, "created_at": _now()}
+                 "to_question_id": question_id, "original_text": normalized_actual,
+                 "relation": relation, "created_at": _now()}
         navigable = _thread_with_navigation(thread)
         updated_thread = {**navigable, "current_question_id": question_id, "revision": thread["revision"] + 1,
                           "return_route": [*navigable["return_route"], {"module_id": thread["module_id"],
@@ -519,6 +531,28 @@ def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relat
                     "relationship": relationship, "entry": entry, "thread": updated_thread,
                     "revision": published["revision"], "commit_id": published["commit_id"]},
                     validation={"learning_record": "passed"})
+
+
+def replay_candidate(config: WorkspaceConfig, candidate: Path) -> dict[str, Any]:
+    candidates = _roots(config)[3].resolve(strict=False)
+    resolved = candidate.resolve(strict=True)
+    if resolved.parent != candidates or resolved.name.startswith("candidate-") is False:
+        return response(status="missing_input", workspace=str(config.config_path),
+                        diagnostics=["candidate must be a learning conflict candidate from this workspace"])
+    value = read_json(resolved)
+    if value.get("schema_version") != 2 or value.get("operation") != "learning.pursue" \
+            or not isinstance(value.get("proposal"), dict):
+        return response(status="missing_input", workspace=str(config.config_path),
+                        diagnostics=["candidate is not a replayable learning.pursue intent"])
+    proposal = value["proposal"]
+    required = {"thread_id", "from_question_id", "existing_question_id", "question",
+                "actual_question", "relation", "independent", "position_effect"}
+    if set(proposal) != required:
+        return response(status="missing_input", workspace=str(config.config_path),
+                        diagnostics=["candidate pursue intent is incomplete"])
+    return pursue(config, proposal["thread_id"], proposal["from_question_id"], proposal["relation"],
+                  proposal["question"], value.get("observed_revision"), proposal["existing_question_id"],
+                  proposal["independent"], proposal["actual_question"])
 
 
 def show_thread(config: WorkspaceConfig, thread_id: str) -> dict[str, Any]:
