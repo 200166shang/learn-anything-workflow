@@ -315,9 +315,18 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
             located_source_id = _source_at_location(snapshot, locations, path)
             if recovery_source_id and located_source_id and recovery_source_id != located_source_id:
                 raise ValueError("recovery source_id conflicts with the source already registered at this location")
-            if (recovery_source_id in snapshot["sources"] and locations.get(recovery_source_id)
-                    and locations[recovery_source_id] != str(path)):
-                raise ValueError("recovery source_id belongs to another location; use source relocate")
+            if recovery_source_id in snapshot["sources"]:
+                trusted_location = locations.get(recovery_source_id)
+                if trusted_location is None:
+                    raise ValueError(
+                        "committed recovery source_id has no trusted local mapping; use source relocate "
+                        "with same-version evidence or a formal association flow"
+                    )
+                if str(Path(trusted_location).expanduser().resolve()) != str(path):
+                    raise ValueError(
+                        "committed recovery source_id belongs to another canonical path; use source relocate "
+                        "with same-version evidence or a formal association flow"
+                    )
             source_id = located_source_id or recovery_source_id or "source-" + str(uuid.uuid4())
             current = snapshot["sources"].get(source_id)
             proposed = {"source_version": source_version, "content_sha256": digest, "kind": kind,

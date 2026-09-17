@@ -465,6 +465,56 @@ def test_pre_publish_retry_replays_source_id_title_and_operation_identity(tmp_pa
     assert verified["result"]["title"] == title
 
 
+def test_committed_source_id_cannot_be_recovered_to_unmapped_different_source(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    first = tmp_path / "first.txt"
+    first.write_text("first source\n", encoding="utf-8")
+    _, registered = cli("source", "register", first, "--workspace", config_path, "--json")
+    location_map = config_path.parent / "local" / "source-locations.json"
+    location_map.unlink()
+    other = tmp_path / "other.txt"
+    other.write_text("unrelated source B\n", encoding="utf-8")
+
+    code, rejected = cli("source", "register", other, "--source-id",
+                         registered["result"]["source_id"], "--expected-revision",
+                         registered["result"]["revision"], "--workspace", config_path, "--json")
+
+    assert code == 1
+    assert rejected["status"] == "failed"
+    assert "source relocate" in rejected["diagnostics"][0]
+    assert "formal association" in rejected["diagnostics"][0]
+
+
+def test_committed_source_update_retry_accepts_matching_trusted_mapping(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    workspace = WorkspaceConfig.load(config_path)
+    source = tmp_path / "fixture.txt"
+    source.write_text("one\n", encoding="utf-8")
+    first = register(workspace, source, title="Stable title")
+    source.write_text("two\n", encoding="utf-8")
+    real_sync = __import__("video_extract.source_registry", fromlist=["_sync_directory"])._sync_directory
+    failed_once = False
+
+    def fail_first_hash_dir(path: Path) -> None:
+        nonlocal failed_once
+        if Path(path).parent.name == "objects" and not failed_once:
+            failed_once = True
+            raise OSError("first hash directory sync failed")
+        real_sync(path)
+
+    with patch("video_extract.source_registry._sync_directory", side_effect=fail_first_hash_dir):
+        failed = register(workspace, source, title="Stable title",
+                          expected_revision=first["result"]["revision"])
+    completed = subprocess.run(shlex.split(failed["next_action"]["command"]),
+                               cwd=Path(__file__).parents[1], capture_output=True, text=True)
+    retried = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert retried["result"]["source_id"] == first["result"]["source_id"]
+    assert retried["result"]["title"] == "Stable title"
+    assert retried["operation_id"] == failed["operation_id"]
+
+
 def test_new_source_commands_reject_unconverted_workspace_v1(tmp_path: Path) -> None:
     config = tmp_path / "workspace.toml"
     config.write_text('''schema_version = 1
