@@ -158,7 +158,8 @@ def cmd_source(args: argparse.Namespace) -> int:
             evidence = read_json(args.evidence) if args.evidence else None
             result = associate_sources(workspace, args.source_id, args.related_source_id, evidence)
         elif args.source_action == "register":
-            result = register(workspace, args.input, args.title, args.expected_revision, args.source_id)
+            provenance = read_json(args.provenance) if args.provenance else None
+            result = register(workspace, args.input, args.title, args.expected_revision, args.source_id, provenance)
         elif args.source_action == "verify":
             result = verify(workspace, args.source_id, args.source_version)
         elif args.source_action == "relocate":
@@ -595,6 +596,7 @@ def parser() -> argparse.ArgumentParser:
     source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--source-id"); source_import.add_argument("--expected-revision", type=int); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
     source_register = source_actions.add_parser("register", help="register a document or in-place source tree")
     source_register.add_argument("input", type=Path); source_register.add_argument("--title"); source_register.add_argument("--source-id")
+    source_register.add_argument("--provenance", type=Path, help="public source provenance JSON")
     source_register.add_argument("--expected-revision", type=int); source_register.add_argument("--workspace", type=Path)
     source_register.add_argument("--json", action="store_true"); source_register.set_defaults(func=cmd_source)
     source_verify = source_actions.add_parser("verify", help="verify a registered source version")

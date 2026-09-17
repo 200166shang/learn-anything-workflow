@@ -30,7 +30,18 @@
           "properties": {
             "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "git_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
-            "working_tree_dirty": {"type": ["boolean", "null"]}
+            "working_tree_dirty": {"type": ["boolean", "null"]},
+            "dirty_files": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "object", "required": ["modified", "added", "deleted"],
+                 "properties": {
+                   "modified": {"type": "array", "items": {"type": "string"}},
+                   "added": {"type": "array", "items": {"type": "string"}},
+                   "deleted": {"type": "array", "items": {"type": "string"}}
+                 }, "additionalProperties": false}
+              ]
+            }
           },
           "additionalProperties": false
         },
@@ -47,7 +58,22 @@
           }
         },
         "storage": {"enum": ["object", "reference"]},
-        "object_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "object_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance": {
+          "type": "object",
+          "required": ["origin", "author_or_organization", "published_version_or_date", "accessed_at", "summary", "locator", "applicability", "verification"],
+          "properties": {
+            "origin": {"type": "string", "minLength": 1},
+            "author_or_organization": {"type": "string", "minLength": 1},
+            "published_version_or_date": {"type": "string", "minLength": 1},
+            "accessed_at": {"type": "string", "format": "date-time"},
+            "summary": {"type": "string", "minLength": 1},
+            "locator": {"type": "string", "minLength": 1},
+            "applicability": {"type": "string", "minLength": 1},
+            "verification": {"enum": ["manual_review_required", "manually_verified"]}
+          },
+          "additionalProperties": false
+        }
       },
       "allOf": [
         {

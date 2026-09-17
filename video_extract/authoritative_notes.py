@@ -167,6 +167,15 @@ def _looks_like_srt(text: str) -> bool:
 def prepare_note(config: WorkspaceConfig, source_id: str, source_version: str | None = None) -> dict[str, Any]:
     _, local = _require_v2(config)
     package, version = _source_version(config, source_id, source_version)
+    if version["source_version"] != package["current_version"]:
+        return response(
+            status="awaiting_user", workspace=str(config.config_path),
+            result={"source_id": source_id, "source_version": version["source_version"],
+                    "current_version": package["current_version"], "source_check": "needs_review"},
+            validation={"source": "passed", "source_version": "historical"},
+            diagnostics=["the pinned source version is historical; review the changed source before reusing this note"],
+            next_action={"type": "user", "reason": "compare the pinned and current source versions; preserve the old note and corrections"},
+        )
     text = _source_text(config, version)
     operation = "operation-" + _digest(f"notes.prepare:{config.workspace_id}:{source_id}:{version['source_version']}".encode())[:24]
     directory = _safe(local, "note-operations", operation)
