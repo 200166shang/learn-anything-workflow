@@ -55,6 +55,18 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _sync_object_barrier(path: Path) -> None:
+    """Idempotently make an immutable object's directory entries durable."""
+    _sync_directory(path.parent)
+    _sync_directory(path.parent.parent)
+
+
+def _sync_commit_barrier(commits: Path) -> None:
+    """Idempotently make commit-manifest directory entries durable."""
+    _sync_directory(commits)
+    _sync_directory(commits.parent)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -171,6 +183,7 @@ def _write_object(config: WorkspaceConfig, value: bytes) -> tuple[str, Path]:
     if path.is_file():
         if _sha256_bytes(path.read_bytes()) != digest:
             raise WorkspaceError(f"immutable object digest mismatch: {path}")
+        _sync_object_barrier(path)
         return digest, path
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -179,8 +192,7 @@ def _write_object(config: WorkspaceConfig, value: bytes) -> tuple[str, Path]:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
-    _sync_directory(path.parent)
-    _sync_directory(path.parent.parent)
+    _sync_object_barrier(path)
     return digest, path
 
 
@@ -244,8 +256,7 @@ def _publish(config: WorkspaceConfig, previous: dict[str, Any], sources: dict[st
     else:
         with commit_path.open("xb") as stream:
             stream.write(manifest_bytes); stream.flush(); os.fsync(stream.fileno())
-        _sync_directory(commits)
-        _sync_directory(commits.parent)
+    _sync_commit_barrier(commits)
     if os.environ.get("VIDEO_EXTRACT_TEST_FAULT") == "before_publish":
         raise OSError("injected failure before snapshot publish")
     pointer_value = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "commit_id": commit_id,
@@ -328,8 +339,10 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
             return _result(config, published, source_id, proposed, path, "registered")
     except OSError as exc:
         observed: dict[str, Any] | None = None
+        recovery_revision: int | None = None
         try:
             current = _load_snapshot(config)
+            recovery_revision = current["revision"]
             package = current.get("sources", {}).get(source_id)
             if package and package.get("current_version") == source_version:
                 observed = {"workspace_id": config.workspace_id, "source_id": source_id,
@@ -338,9 +351,17 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
                             "logical_visibility": "current", "durability": "unknown"}
         except (OSError, ValueError, WorkspaceError):
             pass
-        reconcile_command = (f"video-extract source reconcile {shlex.quote(source_id)} "
-                             f"--source-version {shlex.quote(source_version)} "
-                             f"--workspace {shlex.quote(str(config.config_path))} --json")
+        if observed:
+            recovery_command = (f"video-extract source reconcile {shlex.quote(source_id)} "
+                                f"--source-version {shlex.quote(source_version)} "
+                                f"--workspace {shlex.quote(str(config.config_path))} --json")
+            recovery_type = "reconcile"
+        else:
+            revision_argument = f" --expected-revision {recovery_revision}" if recovery_revision is not None else ""
+            recovery_command = (f"video-extract source register {shlex.quote(str(path))}"
+                                f"{revision_argument} --workspace "
+                                f"{shlex.quote(str(config.config_path))} --json")
+            recovery_type = "retry"
         return response(status="recoverable_failure", workspace=str(config.config_path),
                         operation_id=_operation("source.register", config, source_id, source_version),
                         result=observed or {"workspace_id": config.workspace_id, "source_id": source_id,
@@ -348,7 +369,7 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
                                            "logical_visibility": "not_current", "durability": "unknown"},
                         validation={"snapshot": "uncertain", "durability": "unknown"},
                         diagnostics=[str(exc)],
-                        next_action={"type": "reconcile", "command": reconcile_command,
+                        next_action={"type": recovery_type, "command": recovery_command,
                                      "source_id": source_id, "source_version": source_version})
 
 
@@ -396,10 +417,8 @@ def reconcile(config: WorkspaceConfig, source_id: str, source_version: str) -> d
     _validate_snapshot_objects(config, snapshot)
     objects, commits, pointer, _ = _store_roots(config)
     for digest in snapshot["objects"]:
-        _sync_directory(_safe_path(objects.parent, "objects", digest[:2]))
-    if snapshot["objects"]:
-        _sync_directory(objects)
-    _sync_directory(commits)
+        _sync_object_barrier(_safe_path(objects.parent, "objects", digest[:2], digest))
+    _sync_commit_barrier(commits)
     _sync_directory(pointer.parent)
     return response(status="completed", workspace=str(config.config_path), operation_id=operation_id,
                     result={"workspace_id": config.workspace_id, "source_id": source_id,

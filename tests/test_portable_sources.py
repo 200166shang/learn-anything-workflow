@@ -359,6 +359,75 @@ def test_pointer_directory_sync_failure_is_visibility_not_durability(tmp_path: P
     assert reconciled["result"]["durability"] == "confirmed"
 
 
+def test_retry_resyncs_existing_object_directories_after_first_barrier_failure(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    workspace = WorkspaceConfig.load(config_path)
+    source = tmp_path / "fixture.txt"
+    source.write_text("one\n", encoding="utf-8")
+    first = register(workspace, source)
+    source.write_text("two\n", encoding="utf-8")
+    digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+    failed_dir = workspace.results / "objects" / digest[:2]
+    real_sync = __import__("video_extract.source_registry", fromlist=["_sync_directory"])._sync_directory
+    failed_once = False
+
+    def fail_object_once(path: Path) -> None:
+        nonlocal failed_once
+        if Path(path) == failed_dir and not failed_once:
+            failed_once = True
+            raise OSError("object hash directory sync failed")
+        real_sync(path)
+
+    with patch("video_extract.source_registry._sync_directory", side_effect=fail_object_once):
+        failed = register(workspace, source, expected_revision=first["result"]["revision"])
+    assert failed["status"] == "recoverable_failure"
+    assert failed["next_action"]["type"] == "retry"
+
+    synced: list[Path] = []
+    with patch("video_extract.source_registry._sync_directory",
+               side_effect=lambda path: (synced.append(Path(path)), real_sync(path))[1]):
+        retried = register(workspace, source, expected_revision=first["result"]["revision"])
+
+    assert retried["status"] == "completed"
+    assert failed_dir in synced
+    assert workspace.results / "objects" in synced
+
+
+def test_retry_resyncs_existing_commit_directories_after_first_barrier_failure(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    workspace = WorkspaceConfig.load(config_path)
+    source = tmp_path / "fixture.txt"
+    source.write_text("one\n", encoding="utf-8")
+    first = register(workspace, source)
+    source.write_text("two\n", encoding="utf-8")
+    commits = workspace.results / "commits"
+    real_sync = __import__("video_extract.source_registry", fromlist=["_sync_directory"])._sync_directory
+    failed_once = False
+
+    def fail_commit_once(path: Path) -> None:
+        nonlocal failed_once
+        if Path(path) == commits and not failed_once:
+            failed_once = True
+            raise OSError("commit directory sync failed")
+        real_sync(path)
+
+    fixed_time = "2026-09-17T00:00:00+00:00"
+    with patch("video_extract.source_registry._now", return_value=fixed_time), \
+            patch("video_extract.source_registry._sync_directory", side_effect=fail_commit_once):
+        failed = register(workspace, source, expected_revision=first["result"]["revision"])
+    assert failed["status"] == "recoverable_failure"
+
+    synced: list[Path] = []
+    with patch("video_extract.source_registry._now", return_value=fixed_time), \
+            patch("video_extract.source_registry._sync_directory",
+                  side_effect=lambda path: (synced.append(Path(path)), real_sync(path))[1]):
+        retried = register(workspace, source, expected_revision=first["result"]["revision"])
+
+    assert retried["status"] == "completed"
+    assert commits in synced
+    assert workspace.results in synced
+
+
 def test_new_source_commands_reject_unconverted_workspace_v1(tmp_path: Path) -> None:
     config = tmp_path / "workspace.toml"
     config.write_text('''schema_version = 1
