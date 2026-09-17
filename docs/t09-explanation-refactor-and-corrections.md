@@ -10,12 +10,21 @@ JSON inputs make a same-root refactor explicit:
 - `--revision-metadata` records a short change summary and the exact affected
   question IDs.
 - `--corrections` records confirmed original claims, corrected claims,
-  source-grounded evidence, and affected conclusions. Confirmed corrections
+  their applicability boundary, source-grounded evidence, and affected conclusions. Confirmed corrections
   live on the explanation, independently of an individual prose revision.
+
+Every later commit must retain each corrected claim and its structured
+applicability text, and must not reintroduce the original claim. A violating
+candidate pauses for user revision without publication.
 
 The publication updates Markdown, locators, revision history, and correction
 facts in one learning snapshot. A stale `--expected-revision` preserves the
-request as a conflict candidate without changing the current snapshot.
+complete request as a conflict candidate without changing the current
+snapshot. The candidate embeds evidence, review, mapping, revision metadata,
+corrections, profile, and preparation identity, while its Markdown is a
+durable content-addressed object. `explanation replay --candidate PATH`
+verifies both, uses the candidate's observed revision as a compare-and-swap
+guard, and does not depend on the original temporary files.
 
 `explanation restore --question-id ID --revision N` creates a new revision. It
 uses the selected revision's expression and section map, then overlays every

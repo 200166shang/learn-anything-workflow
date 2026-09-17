@@ -249,7 +249,7 @@ def cmd_learning(args: argparse.Namespace) -> int:
 def cmd_explanation(args: argparse.Namespace) -> int:
     from .command_response import exit_code, response
     from .learning import (LearningPublishError, commit_explanation, prepare_explanation,
-                           publish_failure_response, restore_explanation)
+                           publish_failure_response, replay_explanation_candidate, restore_explanation)
     from .workspace import WorkspaceError
     workspace = discover_workspace(args.workspace)
     try:
@@ -257,6 +257,8 @@ def cmd_explanation(args: argparse.Namespace) -> int:
             result = prepare_explanation(workspace, args.question_id, args.profile)
         elif args.explanation_action == "restore":
             result = restore_explanation(workspace, args.question_id, args.revision, args.expected_revision)
+        elif args.explanation_action == "replay":
+            result = replay_explanation_candidate(workspace, args.candidate)
         else:
             result = commit_explanation(workspace, args.question_id, args.draft, args.evidence,
                                         args.teaching_review, args.profile, args.preparation_id,
@@ -652,6 +654,7 @@ def parser() -> argparse.ArgumentParser:
     explanation_prepare = explanation_actions.add_parser("prepare"); explanation_prepare.add_argument("--question-id", required=True); explanation_prepare.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_prepare.add_argument("--workspace", type=Path); explanation_prepare.add_argument("--json", action="store_true"); explanation_prepare.set_defaults(func=cmd_explanation)
     explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--preparation-id", required=True); explanation_commit.add_argument("--section-map", type=Path); explanation_commit.add_argument("--revision-metadata", type=Path); explanation_commit.add_argument("--corrections", type=Path); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
     explanation_restore = explanation_actions.add_parser("restore", help="restore an earlier expression while preserving confirmed corrections and learning state"); explanation_restore.add_argument("--question-id", required=True); explanation_restore.add_argument("--revision", type=int, required=True); explanation_restore.add_argument("--expected-revision", type=int); explanation_restore.add_argument("--workspace", type=Path); explanation_restore.add_argument("--json", action="store_true"); explanation_restore.set_defaults(func=cmd_explanation)
+    explanation_replay = explanation_actions.add_parser("replay", help="replay a complete immutable explanation conflict candidate"); explanation_replay.add_argument("--candidate", type=Path, required=True); explanation_replay.add_argument("--workspace", type=Path); explanation_replay.add_argument("--json", action="store_true"); explanation_replay.set_defaults(func=cmd_explanation)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):

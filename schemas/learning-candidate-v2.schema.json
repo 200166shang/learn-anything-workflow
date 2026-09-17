@@ -1,0 +1,25 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://video-extract.local/schemas/learning-candidate-v2.schema.json",
+  "title":"Learning conflict candidate v2",
+  "type":"object",
+  "required":["schema_version","operation","expected_revision","observed_revision","proposal"],
+  "properties":{
+    "schema_version":{"const":2},
+    "operation":{"type":"string","minLength":1},
+    "expected_revision":{"type":"integer","minimum":0},
+    "observed_revision":{"type":"integer","minimum":0},
+    "proposal_format":{"const":"immutable-v1"},
+    "proposal_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+    "proposal":{"type":"object"}
+  },
+  "allOf":[{
+    "if":{"required":["proposal_format"],"properties":{"operation":{"const":"explanation.commit"},"proposal_format":{"const":"immutable-v1"}}},
+    "then":{"required":["proposal_sha256"],"properties":{"proposal":{"$ref":"#/$defs/explanationCommit"}}}
+  }],
+  "$defs":{
+    "objectRef":{"type":"object","required":["sha256","logical_path","size"],"properties":{"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"logical_path":{"type":"string","pattern":"^learning/objects/[0-9a-f]{2}/[0-9a-f]{64}$"},"size":{"type":"integer","minimum":1}},"additionalProperties":false},
+    "explanationCommit":{"type":"object","required":["question_id","draft_object","evidence_refs","teaching_review","section_map","revision_kind","change_summary","affected_question_ids","corrections","profile","preparation_id"],"properties":{"question_id":{"type":"string","pattern":"^question-"},"draft_object":{"$ref":"#/$defs/objectRef"},"evidence_refs":{"type":"array","minItems":1},"teaching_review":{"type":"object"},"section_map":{"type":"object","minProperties":1},"revision_kind":{"enum":["initial","revision","refactor","correction"]},"change_summary":{"type":"string","minLength":1},"affected_question_ids":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string","pattern":"^question-"}},"corrections":{"type":"array"},"profile":{"enum":["linear_transform","recognition_to_action","frame_pipeline"]},"preparation_id":{"type":"string","pattern":"^preparation-"}},"additionalProperties":false}
+  },
+  "additionalProperties":false
+}

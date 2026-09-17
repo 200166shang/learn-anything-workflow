@@ -249,6 +249,9 @@ def test_stale_learning_revision_preserves_a_conflict_candidate(tmp_path: Path) 
     candidate = Path(conflict["result"]["candidate"])
     assert candidate.is_file()
     assert json.loads(candidate.read_text(encoding="utf-8"))["proposal"]["question"] == "不会覆盖的问题"
+    replay_code, unsupported = cli("explanation", "replay", "--candidate", candidate,
+                                   "--workspace", config, "--json")
+    assert replay_code == 1 and unsupported["status"] == "unsupported"
     _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
     assert [item["question_id"] for item in shown["result"]["questions"]] == [root_id]
 
@@ -700,14 +703,27 @@ def test_restore_old_expression_overlays_confirmed_correction_without_moving_pro
     corrections = tmp_path / "corrections.json"
     corrections.write_text(json.dumps([{
         "original_claim": "矩阵行是基向量的像", "corrected_claim": "矩阵列是基向量的像",
+        "applicability": "在线性映射采用列向量坐标约定时",
         "evidence_refs": json.loads(correction_evidence.read_text()),
         "affected_conclusions": ["列向量与基向量像的对应关系"]}]))
-    corrected.write_text(corrected.read_text().replace("基向量决定矩阵列", "矩阵列是基向量的像"))
+    corrected.write_text(corrected.read_text().replace(
+        "基向量决定矩阵列", "矩阵列是基向量的像；在线性映射采用列向量坐标约定时"))
     code, revised = cli("explanation", "commit", "--question-id", root_id, "--draft", corrected,
                         "--evidence", correction_evidence, "--teaching-review", correction_review,
                         "--profile", "linear_transform", "--preparation-id", correction_prepare["result"]["preparation_id"],
                         "--corrections", corrections, "--workspace", config, "--json")
     assert code == 0
+
+    _, rollback_prepare = cli("explanation", "prepare", "--question-id", root_id,
+                              "--profile", "linear_transform", "--workspace", config, "--json")
+    rollback, rollback_evidence, rollback_review = _linear_inputs(
+        tmp_path, source, rollback_prepare["result"]["required_marker"])
+    code, rejected = cli("explanation", "commit", "--question-id", root_id, "--draft", rollback,
+                         "--evidence", rollback_evidence, "--teaching-review", rollback_review,
+                         "--profile", "linear_transform", "--preparation-id", rollback_prepare["result"]["preparation_id"],
+                         "--workspace", config, "--json")
+    assert code == 3 and rejected["status"] == "awaiting_user"
+    assert rejected["validation"]["confirmed_corrections"] == "conflict"
 
     code, restored = cli("explanation", "restore", "--question-id", root_id,
                          "--revision", first["result"]["explanation"]["revision"],
@@ -744,11 +760,23 @@ def test_refactor_conflict_and_pre_publish_failure_keep_the_formal_revision_comp
                          "--expected-revision", 0, "--workspace", config, "--json")
     assert code == 3 and conflict["status"] == "awaiting_user"
     assert Path(conflict["result"]["candidate"]).is_file()
+    candidate_path = Path(conflict["result"]["candidate"])
+    candidate = json.loads(candidate_path.read_text())
+    assert candidate["proposal"]["draft_object"]["sha256"]
+    assert candidate["proposal"]["evidence_refs"] == json.loads(revised_evidence.read_text())
+    assert candidate["proposal"]["profile"] == "linear_transform"
+    revised.unlink(); revised_evidence.unlink(); revised_review.unlink()
 
-    code, failed = cli("explanation", "commit", "--question-id", question_id, "--draft", revised,
-                       "--evidence", revised_evidence, "--teaching-review", revised_review,
-                       "--profile", "linear_transform", "--preparation-id", update["result"]["preparation_id"],
-                       "--workspace", config, "--json", env={"VIDEO_EXTRACT_LEARNING_TEST_FAULT": "before_publish"})
-    assert code == 1 and failed["status"] == "recoverable_failure"
-    _, located = cli("learning", "locate", question_id, "--workspace", config, "--json")
-    assert located["result"]["locations"][0]["explanation_revision"] == initial["result"]["explanation"]["revision"]
+    code, replayed = cli("explanation", "replay", "--candidate", candidate_path,
+                         "--workspace", config, "--json")
+    assert code == 0
+    assert replayed["result"]["candidate_replayed"] == str(candidate_path)
+    _, replay_location = cli("learning", "locate", question_id, "--workspace", config, "--json")
+    assert replay_location["result"]["locations"][0]["explanation_revision"] == 2
+    code, repeated = cli("explanation", "replay", "--candidate", candidate_path,
+                         "--workspace", config, "--json")
+    assert code == 3 and repeated["validation"]["candidate_cas"] == "conflict"
+    _, unchanged = cli("learning", "locate", question_id, "--workspace", config, "--json")
+    assert unchanged["result"]["locations"][0]["explanation_revision"] == 2
+
+    assert initial["result"]["explanation"]["revision"] == 1
