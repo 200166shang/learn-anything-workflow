@@ -519,6 +519,33 @@ def test_completed_authority_precedes_derived_receipt_and_show_repairs_interrupt
     assert rejected["validation"]["authoritative_record"] == "failed"
 
 
+def _assert_commit_metadata_tamper_is_rejected_without_receipt_reprojection(tmp_path, capsys, field, value):
+    request_path, _ = request_fixture(tmp_path)
+    use_adapter(FixtureAdapter())
+    _, completed = invoke(capsys, "ensure", "--request", str(request_path))
+    operation_path = tmp_path / "local" / "operations" / f"{completed['operation_id']}.json"
+    receipt_path = tmp_path / "results" / "operation-receipts" / f"{completed['operation_id']}.json"
+    receipt_before = receipt_path.read_bytes()
+    authority = json.loads(operation_path.read_text())
+    authority["commit"][field] = value
+    operation_path.write_text(json.dumps(authority))
+
+    code, rejected = invoke(capsys, "ensure", "--request", str(request_path))
+    assert code == 3 and rejected["status"] == "uncertain"
+    assert rejected["validation"]["authoritative_record"] == "failed"
+    assert receipt_path.read_bytes() == receipt_before
+
+
+def test_tampered_authority_revision_is_rejected_without_receipt_reprojection(tmp_path, capsys):
+    _assert_commit_metadata_tamper_is_rejected_without_receipt_reprojection(tmp_path, capsys, "revision", 999)
+
+
+def test_tampered_authority_committed_at_is_rejected_without_receipt_reprojection(tmp_path, capsys):
+    _assert_commit_metadata_tamper_is_rejected_without_receipt_reprojection(
+        tmp_path, capsys, "committed_at", "2099-01-01T00:00:00+00:00"
+    )
+
+
 def test_independent_service_ledger_drives_three_way_recovery_without_blind_resubmit(tmp_path, capsys):
     request_path, _ = request_fixture(tmp_path)
     ledger = tmp_path.parent / f"{tmp_path.name}-remote-ledger.json"

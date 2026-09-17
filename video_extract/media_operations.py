@@ -351,7 +351,10 @@ def _write_result_receipt(config: WorkspaceConfig, record: dict[str, Any], recei
 
 
 def _authority_digest(record: dict[str, Any]) -> str:
-    authoritative = {key: value for key, value in record.items() if key != "commit"}
+    authoritative = dict(record)
+    commit = dict(record.get("commit", {}))
+    commit.pop("digest", None)
+    authoritative["commit"] = commit
     encoded = json.dumps(authoritative, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
