@@ -3,7 +3,6 @@ import multiprocessing
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 from video_extract.cli import parser
 from video_extract.source_registry import register
@@ -21,6 +20,45 @@ local = "local"
 '''
 
 
+class FixtureAdapter:
+    def __init__(self, *, fail=False, reconcile_state="retry_safe", counter=None, delay=0, on_acquire=None):
+        self.fail = fail
+        self.reconcile_state = reconcile_state
+        self.counter = counter if counter is not None else []
+        self.delay = delay
+        self.on_acquire = on_acquire
+        self.tokens = []
+        self.kinds = []
+
+    def acquire(self, item, kinds, target, *, language, quality, idempotency_token):
+        self.counter.append(item["id"])
+        self.tokens.append(idempotency_token)
+        self.kinds.append(list(kinds))
+        if self.on_acquire:
+            self.on_acquire()
+        if self.delay:
+            time.sleep(self.delay)
+        if self.fail:
+            raise RuntimeError("connection lost")
+        target.mkdir(parents=True, exist_ok=True)
+        outputs = {}
+        for kind in kinds:
+            path = target / f"{kind}.fixture"; path.write_bytes(f"{item['id']}:{kind}".encode()); outputs[kind] = path
+        return {"artifacts": outputs, "query_handle": idempotency_token}
+
+    def reconcile(self, attempt, target):
+        result = {"state": self.reconcile_state, "query_handle": attempt["query_handle"], "evidence": "fixture ledger"}
+        if self.reconcile_state == "available":
+            result["artifacts"] = {kind: target / f"{kind}.fixture" for kind in attempt["media"]}
+        return result
+
+
+def use_adapter(adapter):
+    from video_extract.media_operations import register_media_adapter
+    register_media_adapter("fixture.media-v1", adapter)
+    return adapter
+
+
 def invoke(capsys, *args):
     parsed = parser().parse_args([*args, "--json"])
     code = parsed.func(parsed)
@@ -29,18 +67,12 @@ def invoke(capsys, *args):
 
 def _process_worker(request_path: str, counter_path: str, queue) -> None:
     import video_extract.media_operations as operations
-
-    def fake(item, kinds, target, **_):
-        with Path(counter_path).open("a", encoding="utf-8") as stream:
-            stream.write(item["id"] + "\n")
-        time.sleep(0.25)
-        target.mkdir(parents=True, exist_ok=True)
-        outputs = {}
-        for kind in kinds:
-            path = target / f"{kind}.fixture"; path.write_bytes(kind.encode()); outputs[kind] = path
-        return outputs
-
-    operations._materialize_item = fake
+    class ProcessAdapter(FixtureAdapter):
+        def acquire(self, item, kinds, target, **kwargs):
+            with Path(counter_path).open("a", encoding="utf-8") as stream:
+                stream.write(item["id"] + "\n")
+            return super().acquire(item, kinds, target, **kwargs)
+    operations.register_media_adapter("fixture.media-v1", ProcessAdapter(delay=0.25))
     queue.put(operations.ensure_request(json.loads(Path(request_path).read_text())))
 
 
@@ -49,8 +81,8 @@ def request_fixture(tmp_path: Path) -> tuple[Path, dict]:
     workspace.write_text(WORKSPACE, encoding="utf-8")
     catalog = tmp_path / "catalog.json"
     catalog.write_text(json.dumps({"items": [
-        {"id": "chapter-1", "source": "https://example.test/1", "title": "One"},
-        {"id": "chapter-2", "source": "https://example.test/2", "title": "Two"},
+        {"id": "chapter-1", "source": "https://example.test/1", "title": "One", "adapter": "fixture.media-v1"},
+        {"id": "chapter-2", "source": "https://example.test/2", "title": "Two", "adapter": "fixture.media-v1"},
     ]}), encoding="utf-8")
     registered = register(discover_workspace(workspace), catalog)
     request = {
@@ -81,24 +113,13 @@ def test_plan_limits_work_to_explicit_scope_and_never_requests_dubbing(tmp_path,
 
 def test_same_logical_request_reuses_completed_operation_after_workspace_move(tmp_path, capsys):
     request_path, request = request_fixture(tmp_path)
-    calls = []
-
-    def fake(item, kinds, target, **_):
-        calls.append(item["id"])
-        target.mkdir(parents=True, exist_ok=True)
-        outputs = {}
-        for kind in kinds:
-            path = target / f"{kind}.fixture"
-            path.write_bytes(f"{item['id']}:{kind}".encode())
-            outputs[kind] = path
-        return outputs
-
-    with patch("video_extract.media_operations._materialize_item", side_effect=fake):
-        first_code, first = invoke(capsys, "ensure", "--request", str(request_path))
-        second_code, second = invoke(capsys, "capability", "run", "media.acquire", "--request", str(request_path))
+    adapter = use_adapter(FixtureAdapter())
+    first_code, first = invoke(capsys, "ensure", "--request", str(request_path))
+    second_code, second = invoke(capsys, "capability", "run", "media.acquire", "--request", str(request_path))
     assert first_code == second_code == 0
     assert first["operation_id"] == second["operation_id"]
-    assert calls == ["chapter-2"]
+    assert adapter.counter == ["chapter-2"]
+    assert adapter.kinds[-1] == ["audio", "subtitles"]
     assert second["result"]["reuse"] == "verified_operation"
 
     moved = tmp_path.parent / f"{tmp_path.name}-moved"
@@ -107,8 +128,7 @@ def test_same_logical_request_reuses_completed_operation_after_workspace_move(tm
     data = json.loads(moved_request.read_text())
     data["workspace"] = str(moved / "workspace.toml")
     moved_request.write_text(json.dumps(data))
-    with patch("video_extract.media_operations._materialize_item", side_effect=AssertionError("must reuse")):
-        code, relocated = invoke(capsys, "operation", "show", first["operation_id"], "--workspace", str(moved / "workspace.toml"))
+    code, relocated = invoke(capsys, "operation", "show", first["operation_id"], "--workspace", str(moved / "workspace.toml"))
     assert code == 0
     assert relocated["operation_id"] == first["operation_id"]
     assert relocated["status"] == "completed"
@@ -116,25 +136,15 @@ def test_same_logical_request_reuses_completed_operation_after_workspace_move(tm
 
 def test_missing_artifact_resumes_only_the_gap(tmp_path, capsys):
     request_path, _ = request_fixture(tmp_path)
-    calls = []
-
-    def fake(item, kinds, target, **_):
-        calls.extend(kinds)
-        target.mkdir(parents=True, exist_ok=True)
-        result = {}
-        for kind in kinds:
-            path = target / f"{kind}.fixture"; path.write_bytes(kind.encode()); result[kind] = path
-        return result
-
-    with patch("video_extract.media_operations._materialize_item", side_effect=fake):
-        _, first = invoke(capsys, "ensure", "--request", str(request_path))
+    adapter = use_adapter(FixtureAdapter())
+    _, first = invoke(capsys, "ensure", "--request", str(request_path))
     audio = next(Path(ref) for ref in first["artifact_refs"] if "audio" in Path(ref).name)
     audio.unlink()
-    calls.clear()
-    with patch("video_extract.media_operations._materialize_item", side_effect=fake):
-        code, resumed = invoke(capsys, "operation", "resume", first["operation_id"], "--workspace", str(tmp_path / "workspace.toml"))
+    adapter.counter.clear()
+    code, resumed = invoke(capsys, "operation", "resume", first["operation_id"], "--workspace", str(tmp_path / "workspace.toml"))
     assert code == 0
-    assert calls == ["audio"]
+    assert adapter.counter == ["chapter-2"]
+    assert adapter.kinds[-1] == ["audio"]
     assert resumed["status"] == "completed"
 
 
@@ -144,11 +154,12 @@ def test_busy_returns_same_operation_without_starting_second_adapter(tmp_path, c
 
     operation_id = operation_identity(json.loads(request_path.read_text()))
     write_test_lease(discover_workspace(tmp_path / "workspace.toml"), operation_id, json.loads(request_path.read_text()))
-    with patch("video_extract.media_operations._materialize_item", side_effect=AssertionError("duplicate")):
-        code, result = invoke(capsys, "ensure", "--request", str(request_path))
+    adapter = use_adapter(FixtureAdapter())
+    code, result = invoke(capsys, "ensure", "--request", str(request_path))
     assert code == 3
     assert result["status"] == "busy"
     assert result["operation_id"] == operation_id
+    assert adapter.counter == []
 
 
 def test_two_processes_share_one_operation_and_one_adapter_run(tmp_path):
@@ -168,27 +179,109 @@ def test_two_processes_share_one_operation_and_one_adapter_run(tmp_path):
 
 def test_adapter_failure_is_uncertain_until_reconciled_as_not_submitted(tmp_path, capsys):
     request_path, _ = request_fixture(tmp_path)
-    with patch("video_extract.media_operations._materialize_item", side_effect=RuntimeError("connection lost")):
-        code, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    adapter = use_adapter(FixtureAdapter(fail=True, reconcile_state="not_submitted"))
+    code, failed = invoke(capsys, "ensure", "--request", str(request_path))
     assert code == 3
     assert failed["status"] == "uncertain"
     assert failed["next_action"]["type"] == "reconcile"
 
-    with patch("video_extract.media_operations._check_adapter_result", return_value={"state": "not_submitted", "evidence": "fixture ledger"}):
-        code, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"], "--workspace", str(tmp_path / "workspace.toml"))
+    code, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"], "--workspace", str(tmp_path / "workspace.toml"))
     assert code == 1
     assert reconciled["status"] == "recoverable_failure"
     assert reconciled["next_action"]["type"] == "resume"
+    assert adapter.counter == ["chapter-2"]
 
 
 def test_uncertain_operation_cannot_resume_without_reconciliation(tmp_path, capsys):
     request_path, _ = request_fixture(tmp_path)
-    with patch("video_extract.media_operations._materialize_item", side_effect=RuntimeError("connection lost")):
-        _, failed = invoke(capsys, "ensure", "--request", str(request_path))
-    with patch("video_extract.media_operations._materialize_item", side_effect=AssertionError("must not retry")):
-        code, result = invoke(capsys, "operation", "resume", failed["operation_id"], "--workspace", str(tmp_path / "workspace.toml"))
+    adapter = use_adapter(FixtureAdapter(fail=True))
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    code, result = invoke(capsys, "operation", "resume", failed["operation_id"], "--workspace", str(tmp_path / "workspace.toml"))
     assert code == 3
     assert result["status"] == "uncertain"
+    assert adapter.counter == ["chapter-2"]
+
+
+def test_committed_reconciliation_never_allows_resume_or_second_adapter_call(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+    adapter = use_adapter(FixtureAdapter(fail=True, reconcile_state="committed"))
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    _, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                           "--workspace", str(tmp_path / "workspace.toml"))
+    assert reconciled["status"] == "uncertain"
+    assert reconciled["next_action"]["type"] == "reconcile"
+    code, resumed = invoke(capsys, "operation", "resume", failed["operation_id"],
+                           "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 3
+    assert resumed["status"] == "uncertain"
+    assert adapter.counter == ["chapter-2"]
+
+
+def test_unsupported_reconciliation_stays_uncertain_and_requires_user_action(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+    from video_extract.media_operations import MEDIA_ADAPTERS
+    MEDIA_ADAPTERS.pop("fixture.media-v1", None)
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    code, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                              "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 3
+    assert reconciled["status"] == "uncertain"
+    assert reconciled["next_action"]["type"] == "user"
+
+
+def test_adapter_protocol_recovers_available_result_without_reacquiring(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+
+    class CompletedThenDisconnected(FixtureAdapter):
+        def acquire(self, *args, **kwargs):
+            result = super().acquire(*args, **kwargs)
+            raise RuntimeError("response lost after completion")
+
+    adapter = use_adapter(CompletedThenDisconnected(reconcile_state="available"))
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    code, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                              "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 0
+    assert reconciled["status"] == "completed"
+    assert len(reconciled["artifact_refs"]) == 2
+    assert adapter.counter == ["chapter-2"]
+
+
+def test_idempotency_token_is_stable_across_reconciled_resume(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+    adapter = use_adapter(FixtureAdapter(fail=True, reconcile_state="retry_safe"))
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    _, reconciled = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                           "--workspace", str(tmp_path / "workspace.toml"))
+    adapter.fail = False
+    code, completed = invoke(capsys, "operation", "resume", failed["operation_id"],
+                             "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 0
+    assert completed["status"] == "completed"
+    assert len(adapter.tokens) == 2
+    assert adapter.tokens[0] == adapter.tokens[1]
+
+
+def test_stale_fence_adapter_result_is_rejected_before_operation_commit(tmp_path, capsys):
+    request_path, request = request_fixture(tmp_path)
+    from video_extract.manifest import atomic_write_json, read_json
+    from video_extract.media_operations import operation_identity
+    operation_id = operation_identity(request)
+    operation_path = tmp_path / "local" / "operations" / f"{operation_id}.json"
+
+    def steal_fence():
+        record = read_json(operation_path)
+        record["lease"]["owner"] = "new-owner"
+        record["lease"]["fencing"] += 1
+        atomic_write_json(operation_path, record)
+
+    use_adapter(FixtureAdapter(on_acquire=steal_fence))
+    code, result = invoke(capsys, "ensure", "--request", str(request_path))
+    persisted = read_json(operation_path)
+    assert code == 3
+    assert result["status"] == "busy"
+    assert persisted.get("artifacts") == {}
+    assert persisted["lease"]["owner"] == "new-owner"
 
 
 def test_stale_running_lease_becomes_uncertain_instead_of_permanent_busy(tmp_path, capsys):

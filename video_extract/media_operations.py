@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
@@ -26,6 +26,53 @@ CONTRACT_VERSION = 1
 KINDS = ("video", "audio", "subtitles")
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas" / "media-acquire-request-v1.schema.json").read_text(encoding="utf-8"))
 LEASE_SECONDS = 30
+
+
+class MediaAdapter(Protocol):
+    def acquire(self, item: dict[str, Any], kinds: list[str], target: Path, *, language: str,
+                quality: str, idempotency_token: str) -> dict[str, Any]: ...
+
+    def reconcile(self, attempt: dict[str, Any], target: Path) -> dict[str, Any]: ...
+
+
+class BuiltinMediaAdapter:
+    """Read-only media adapter with a durable local receipt query protocol."""
+
+    def acquire(self, item: dict[str, Any], kinds: list[str], target: Path, *, language: str,
+                quality: str, idempotency_token: str) -> dict[str, Any]:
+        outputs = _materialize_item(item, kinds, target, language=language, quality=quality,
+                                    idempotency_token=idempotency_token)
+        receipt = target / ".adapter-receipts" / f"{idempotency_token}.json"
+        atomic_write_json(receipt, {"idempotency_token": idempotency_token,
+                                   "artifacts": {kind: path.relative_to(target).as_posix()
+                                                 for kind, path in outputs.items()}})
+        return {"artifacts": outputs, "query_handle": idempotency_token}
+
+    def reconcile(self, attempt: dict[str, Any], target: Path) -> dict[str, Any]:
+        token = attempt["idempotency_token"]
+        receipt = target / ".adapter-receipts" / f"{token}.json"
+        if not receipt.is_file():
+            return {"state": "retry_safe", "query_handle": token,
+                    "evidence": "adapter is read-only and no durable local completion receipt exists"}
+        saved = read_json(receipt)
+        if saved.get("idempotency_token") != token:
+            return {"state": "unsupported", "evidence": "adapter receipt identity mismatch"}
+        artifacts = {kind: target / raw for kind, raw in saved.get("artifacts", {}).items()}
+        return {"state": "available", "query_handle": token, "artifacts": artifacts,
+                "evidence": "durable adapter receipt"}
+
+
+MEDIA_ADAPTERS: dict[str, MediaAdapter] = {"builtin.media-v1": BuiltinMediaAdapter()}
+
+
+def register_media_adapter(adapter_id: str, adapter: MediaAdapter) -> None:
+    """Register an adapter implementation; primarily an integration/test seam."""
+    MEDIA_ADAPTERS[adapter_id] = adapter
+
+
+def _adapter(item: dict[str, Any]) -> tuple[str, MediaAdapter | None]:
+    adapter_id = str(item.get("adapter") or "builtin.media-v1")
+    return adapter_id, MEDIA_ADAPTERS.get(adapter_id)
 
 
 def _validate_request(request: Any) -> dict[str, Any]:
@@ -182,6 +229,26 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _owns_lease(path: Path, owner: str, fencing: int) -> bool:
+    if not path.is_file():
+        return False
+    current = read_json(path)
+    lease = current.get("lease", {})
+    return current.get("status") == "running" and lease.get("owner") == owner and lease.get("fencing") == fencing
+
+
+def _record_outputs(config: WorkspaceConfig, record: dict[str, Any], item_id: str,
+                    outputs: dict[str, Path]) -> None:
+    assert config.results is not None
+    for kind, artifact in outputs.items():
+        key = f"{item_id}:{kind}"
+        record["artifacts"][key] = artifact.relative_to(config.results).as_posix()
+        record.setdefault("artifact_facts", {})[key] = {
+            "sha256": _sha256(artifact), "size": artifact.stat().st_size,
+            "validation": "content_digest_and_size"
+        }
+
+
 def _public(config: WorkspaceConfig, record: dict[str, Any], reuse: str | None = None) -> dict[str, Any]:
     result = {"progress": record.get("progress", {}), "reuse": reuse,
               "source_id": record["request"]["source_id"], "source_version": record["request"]["source_version"]}
@@ -226,8 +293,10 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
         if record.get("status") == "completed" and not missing_any:
             return _public(config, record, "verified_operation")
         record["status"] = "running"
-        fencing = int(record.get("lease", {}).get("fencing", 0)) + 1
+        fencing = int(record.get("fencing", 0)) + 1
+        record["fencing"] = fencing
         record["lease"] = _new_lease(fencing)
+        owner = record["lease"]["owner"]
         atomic_write_json(path, record)
         try:
             for item in items:
@@ -238,22 +307,28 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
                 if not kinds:
                     continue
                 attempt_token = hashlib.sha256(
-                    f"{operation_id}:{fencing}:{item_id}:{','.join(kinds)}".encode()
+                    f"{operation_id}:{item_id}:{','.join(normalized['media'])}".encode()
                 ).hexdigest()
+                adapter_id, adapter = _adapter(item)
                 record["current_attempt"] = {"item_id": item_id, "media": kinds,
-                                             "idempotency_token": attempt_token, "fencing": fencing}
+                                             "idempotency_token": attempt_token,
+                                             "query_handle": attempt_token,
+                                             "adapter_id": adapter_id, "fencing": fencing, "owner": owner}
                 atomic_write_json(path, record)
-                outputs = _materialize_item(item, kinds, _target(config, operation_id, item_id),
-                                            language=normalized["language"], quality=normalized["quality"],
-                                            idempotency_token=attempt_token)
-                assert config.results is not None
-                for kind, artifact in outputs.items():
-                    key = f"{item_id}:{kind}"
-                    record["artifacts"][key] = artifact.relative_to(config.results).as_posix()
-                    record.setdefault("artifact_facts", {})[key] = {
-                        "sha256": _sha256(artifact), "size": artifact.stat().st_size,
-                        "validation": "content_digest_and_size"
-                    }
+                if adapter is None:
+                    raise RuntimeError(f"media adapter reconciliation is unsupported: {adapter_id}")
+                acquired_result = adapter.acquire(
+                    item, kinds, _target(config, operation_id, item_id), language=normalized["language"],
+                    quality=normalized["quality"], idempotency_token=attempt_token)
+                if not _owns_lease(path, owner, fencing):
+                    latest = read_json(path)
+                    latest["diagnostics"] = ["stale fenced adapter result was rejected"]
+                    return _public(config, latest)
+                outputs = acquired_result.get("artifacts")
+                if not isinstance(outputs, dict):
+                    raise RuntimeError("media adapter returned no artifact mapping")
+                record["current_attempt"]["query_handle"] = acquired_result.get("query_handle", attempt_token)
+                _record_outputs(config, record, item_id, outputs)
                 record["progress"][item_id] = {"completed": sorted(set(normalized["media"]) - set(_missing(config, record, item_id, normalized["media"]))) }
                 record.setdefault("attempts", []).append({**record.pop("current_attempt"), "result": "verified_local"})
                 atomic_write_json(path, record)
@@ -269,6 +344,10 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
             atomic_write_json(path, record)
             return _public(config, record)
         except Exception as exc:
+            if not _owns_lease(path, owner, fencing):
+                latest = read_json(path)
+                latest["diagnostics"] = ["stale fenced adapter failure was rejected"]
+                return _public(config, latest)
             record["status"] = "uncertain"
             record["diagnostics"] = [str(exc)]
             record["next_action"] = {"type": "reconcile", "operation_id": operation_id}
@@ -323,8 +402,20 @@ def _lease_active(record: dict[str, Any]) -> bool:
 
 
 def _check_adapter_result(config: WorkspaceConfig, record: dict[str, Any]) -> dict[str, Any]:
-    """Adapter reconciliation seam. Default is conservative until an adapter supplies evidence."""
-    return {"state": "unknown", "evidence": "adapter exposes no result query"}
+    attempt = record.get("current_attempt")
+    if not isinstance(attempt, dict):
+        return {"state": "unsupported", "evidence": "operation has no queryable adapter attempt"}
+    adapter_id = attempt.get("adapter_id")
+    adapter = MEDIA_ADAPTERS.get(adapter_id)
+    if adapter is None:
+        return {"state": "unsupported", "adapter_id": adapter_id,
+                "evidence": "adapter does not implement reconciliation"}
+    target = _target(config, record["operation_id"], attempt["item_id"])
+    result = adapter.reconcile(attempt, target)
+    if result.get("state") not in {"not_submitted", "retry_safe", "committed", "available", "unsupported"}:
+        return {"state": "unsupported", "adapter_id": adapter_id,
+                "evidence": "adapter returned an invalid reconciliation state"}
+    return {"adapter_id": adapter_id, **result}
 
 
 def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
@@ -337,15 +428,34 @@ def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str,
         record = read_json(path)
         checked = _check_adapter_result(config, record)
         state = checked.get("state")
-        record.setdefault("reconciliation", []).append(checked)
+        record.setdefault("reconciliation", []).append({key: value for key, value in checked.items()
+                                                         if key != "artifacts"})
         if state in {"not_submitted", "retry_safe"}:
             record["status"] = "recoverable_failure"
             record["next_action"] = {"type": "resume", "operation_id": operation_id}
             record["diagnostics"] = []
+        elif state == "available":
+            attempt = record["current_attempt"]
+            outputs = checked.get("artifacts")
+            if not isinstance(outputs, dict) or not all(isinstance(path, Path) and path.is_file() for path in outputs.values()):
+                record["status"] = "uncertain"
+                record["next_action"] = {"type": "reconcile", "operation_id": operation_id,
+                                         "reason": "adapter result is not locally verifiable"}
+            else:
+                _record_outputs(config, record, attempt["item_id"], outputs)
+                record.setdefault("attempts", []).append({**record.pop("current_attempt"), "result": "reconciled_available"})
+                items, _ = _catalog(config, record["request"])
+                remaining = any(_missing(config, record, str(item["id"]), record["request"]["media"]) for item in items)
+                record["status"] = "recoverable_failure" if remaining else "completed"
+                record["next_action"] = ({"type": "resume", "operation_id": operation_id} if remaining else None)
+                record["validation"] = {"source_version": "passed", "artifacts": "failed" if remaining else "passed"}
         elif state == "committed":
-            record["status"] = "recoverable_failure"
+            record["status"] = "uncertain"
             record["next_action"] = {"type": "reconcile", "operation_id": operation_id,
-                                     "reason": "adapter result must be materialized and verified locally"}
+                                     "reason": "committed adapter result must be queried/materialized, never resubmitted"}
+        elif state == "unsupported":
+            record["status"] = "uncertain"
+            record["next_action"] = {"type": "user", "reason": "adapter result reconciliation is unsupported"}
         else:
             record["status"] = "uncertain"
             record["next_action"] = {"type": "reconcile", "operation_id": operation_id}
@@ -360,7 +470,8 @@ def write_test_lease(config: WorkspaceConfig, operation_id: str, request: dict[s
     if expires_at:
         lease["expires_at"] = expires_at
     atomic_write_json(_path(config, operation_id, create_root=True), {"schema_version": 1, "operation_id": operation_id,
-                      "request": _normalized(request), "status": "running", "artifacts": {}, "artifact_facts": {}, "progress": {},
+                      "request": _normalized(request), "status": "running", "fencing": 1,
+                      "artifacts": {}, "artifact_facts": {}, "progress": {},
                       "lease": lease})
 
 

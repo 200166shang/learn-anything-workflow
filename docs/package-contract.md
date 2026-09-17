@@ -19,6 +19,15 @@ the results role and are reusable only while their recorded size and SHA-256
 facts still match. `operation show` is read-only and `operation resume`
 rechecks those facts before filling only missing or invalid artifacts.
 
+Every media adapter implements acquisition plus reconciliation by stable
+idempotency token/query handle. Reconciliation reports `not_submitted`,
+`retry_safe`, `committed`, `available`, or `unsupported`; only the first two
+permit resubmission. `committed` remains uncertain until the existing result is
+queryable and locally verified. The operation store separately maintains a
+monotonic fencing counter and lease owner. Adapter results are accepted only
+while both still match the persisted lease, so an expired worker cannot publish
+over a newer attempt.
+
 ## Current public workflows and retained validation goals
 
 - New acquisition uses `plan/ensure --media`; it never synthesizes a missing language track.
