@@ -410,7 +410,15 @@ def cmd_delivery(args: argparse.Namespace) -> int:
     from .package_lock import PackageBusyError
     workspace = discover_workspace(args.workspace)
     try:
-        if args.delivery_action == "enable":
+        if args.delivery_action.startswith("schedule-"):
+            from .delivery_schedule import install as schedule_install, remove as schedule_remove, status as schedule_status
+            if args.delivery_action == "schedule-install":
+                result = schedule_install(workspace)
+            elif args.delivery_action == "schedule-remove":
+                result = schedule_remove(workspace)
+            else:
+                result = schedule_status(workspace)
+        elif args.delivery_action == "enable":
             result = enable(workspace, args.logical_target, args.adapter,
                             args.authorization_ref, args.effective_from)
         elif args.delivery_action == "disable":
@@ -826,7 +834,11 @@ def parser() -> argparse.ArgumentParser:
     delivery_tick = delivery_actions.add_parser("tick"); delivery_tick.add_argument("--on-date")
     delivery_status = delivery_actions.add_parser("status"); delivery_status.add_argument("--operation-id")
     delivery_reconcile = delivery_actions.add_parser("reconcile"); delivery_reconcile.add_argument("--operation-id", required=True)
-    for parser in (delivery_enable, delivery_disable, delivery_tick, delivery_status, delivery_reconcile):
+    delivery_schedule_install = delivery_actions.add_parser("schedule-install", help="install the user launchd job")
+    delivery_schedule_remove = delivery_actions.add_parser("schedule-remove", help="remove the user launchd job")
+    delivery_schedule_status = delivery_actions.add_parser("schedule-status", help="diagnose the user launchd job")
+    for parser in (delivery_enable, delivery_disable, delivery_tick, delivery_status, delivery_reconcile,
+                   delivery_schedule_install, delivery_schedule_remove, delivery_schedule_status):
         parser.add_argument("--workspace", type=Path); parser.add_argument("--json", action="store_true"); parser.set_defaults(func=cmd_delivery)
     review = commands.add_parser("review", help="prepare active recall before revealing and record independent Review facts")
     review_actions = review.add_subparsers(dest="review_action", required=True)
