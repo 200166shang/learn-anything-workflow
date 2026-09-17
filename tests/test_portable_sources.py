@@ -273,6 +273,49 @@ def test_git_provenance_cross_scope_renames_record_only_the_in_scope_side(tmp_pa
         "modified": [], "added": ["moves-in.py"], "deleted": ["moves-out.py"]}
 
 
+def test_git_provenance_uses_literal_pathspec_for_special_registered_directory(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "monorepo"; scope = repo / "pkg[*]"; sibling = repo / "pkga"
+    scope.mkdir(parents=True); sibling.mkdir()
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    (scope / "inside.py").write_text("inside = 1\n"); (sibling / "outside.py").write_text("outside = 1\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+    (scope / "inside.py").write_text("inside = 2\n")
+    (sibling / "outside.py").write_text("outside = 2\n")
+
+    registered = register(WorkspaceConfig.load(config), scope)
+
+    assert registered["result"]["version_basis"]["dirty_files"] == {
+        "modified": ["inside.py"], "added": [], "deleted": []}
+
+
+def test_git_copy_status_records_only_destination_as_added(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "repo"; scope = repo / "scope"; scope.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "status.renames", "copies"], check=True)
+    original = "\n".join(f"shared_{index} = 'copy me'" for index in range(20)) + "\n"
+    (scope / "source.py").write_text(original)
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+    (scope / "copied.py").write_text(original)
+    (scope / "source.py").write_text(original + "source_changed = True\n")
+    subprocess.run(["git", "-C", repo, "add", "scope/copied.py", "scope/source.py"], check=True)
+
+    raw = subprocess.check_output(
+        ["git", "--literal-pathspecs", "-C", repo, "status", "--porcelain=v1", "-z", "--", "scope"])
+    assert b"C  scope/copied.py\x00scope/source.py\x00" in raw, raw
+    registered = register(WorkspaceConfig.load(config), scope)
+
+    assert registered["result"]["version_basis"]["dirty_files"] == {
+        "modified": ["source.py"], "added": ["copied.py"], "deleted": []}
+
+
 def test_relocate_finds_same_version_and_does_not_accept_different_content(tmp_path: Path) -> None:
     config = write_workspace(tmp_path / "workspace")
     source = tmp_path / "one.md"

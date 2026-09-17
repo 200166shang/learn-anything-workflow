@@ -107,8 +107,9 @@ def _git_basis(path: Path) -> dict[str, Any]:
         return {"git_commit": None, "working_tree_dirty": None}
     scope_pathspec = scope.as_posix() or "."
     commit = run(repository, "rev-parse", "HEAD")
-    dirty = run(repository, "status", "--porcelain=v1", "-z", "--untracked-files=all",
-                "--", scope_pathspec)
+    dirty = subprocess.run(
+        ["git", "--literal-pathspecs", "-C", str(repository), "status", "--porcelain=v1", "-z",
+         "--untracked-files=all", "--", scope_pathspec], capture_output=True, text=True)
     dirty_files = {"modified": [], "added": [], "deleted": []}
     if dirty.returncode == 0:
         records = dirty.stdout.split("\0"); index = 0
@@ -130,7 +131,7 @@ def _git_basis(path: Path) -> dict[str, Any]:
             if "R" in state or "C" in state:
                 source = records[index] if index < len(records) else ""; index += 1
                 old_path, new_path = scoped(source), scoped(destination)
-                if old_path:
+                if "R" in state and old_path:
                     dirty_files["deleted"].append(old_path)
                 if new_path:
                     dirty_files["added"].append(new_path)
