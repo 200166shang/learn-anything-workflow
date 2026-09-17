@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import uuid
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 SCHEMA_VERSION = 1
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/backup-manifest-v1.schema.json").read_text())
 MANIFEST = "backup-manifest.json"
+STORE_PREFIXES = {"sources": "", "notes": "source-notes", "learning": "learning",
+                  "review": "review", "practice": "practices"}
 
 
 def _now() -> str:
@@ -65,7 +68,7 @@ def _validate_manifest(value: Any) -> None:
 
 
 def _pointer_generation(results: Path, store: str) -> tuple[dict[str, Any], list[Path]]:
-    prefix = Path() if store == "sources" else Path("source-notes" if store == "notes" else "learning")
+    prefix = Path(STORE_PREFIXES[store])
     pointer = _safe(results, (prefix / "current.json").as_posix())
     if not pointer.is_file():
         commits = _safe(results, (prefix / "commits").as_posix())
@@ -87,6 +90,19 @@ def _pointer_generation(results: Path, store: str) -> tuple[dict[str, Any], list
         objects.append(path)
     return {"store": store, "commit_id": commit_id, "revision": value.get("revision"),
             "schema_version": value.get("schema_version")}, [pointer, manifest, *objects]
+
+
+def _generation(config: WorkspaceConfig, store: str) -> tuple[dict[str, Any], list[Path]]:
+    authority, paths = _pointer_generation(config.results, store)
+    if store in {"review", "practice"}:
+        from .review import backup_entries as review_entries
+        from .practice import backup_entries as practice_entries
+        exported = (review_entries if store == "review" else practice_entries)(config)
+        if exported["commit_id"] != authority["commit_id"]:
+            raise WorkspaceError(f"{store} generation changed while enumerating backup entries")
+        paths = [_safe(config.results, Path(raw).relative_to(config.results).as_posix())
+                 for raw in exported["entries"]]
+    return authority, paths
 
 
 def _receipt_files(results: Path) -> list[Path]:
@@ -164,13 +180,24 @@ def _deep_validate_payload(root: Path, manifest: dict[str, Any]) -> None:
     learning = _load(config)
     expected = manifest["authorities"]
     observed = {"sources": source, "notes": notes, "learning": learning}
+    from .review import _load as load_review
+    from .practice import _load as load_practice
+    for name, loader in (("review", load_review), ("practice", load_practice)):
+        snapshot = loader(config)
+        if name in expected:
+            observed[name] = snapshot
+        elif snapshot.get("commit_id") is not None:
+            raise WorkspaceError(f"backup contains an undeclared {name} authority")
     for name, value in observed.items():
         authority = expected[name]
-        generation, _ = _pointer_generation(payload, name)
+        generation, paths = _generation(config, name)
         if any(authority[key] != generation[key] for key in generation):
             raise WorkspaceError(f"{name} authority metadata does not match its stored generation")
         if authority["commit_id"] != value.get("commit_id") or authority["revision"] != value.get("revision"):
             raise WorkspaceError(f"{name} authority does not match the pinned backup generation")
+        if "entry_paths" in authority and set(authority["entry_paths"]) != {
+                path.relative_to(root).as_posix() for path in paths}:
+            raise WorkspaceError(f"{name} authority entries do not match its reachable objects")
     # Foreign keys remain tied to the pinned source generation even when its external location is absent.
     versions = {(source_id, version_id) for source_id, package in source.get("sources", {}).items()
                 for version_id in package.get("versions", {})}
@@ -182,6 +209,10 @@ def _deep_validate_payload(root: Path, manifest: dict[str, Any]) -> None:
         for ref in module.get("source_refs", []):
             if (ref["source_id"], ref["source_version"]) not in versions:
                 raise WorkspaceError("learning record has a broken source-version association")
+    for preparation in observed.get("review", {}).get("record", {}).get("preparations", {}).values():
+        if any((ref["source_id"], ref["source_version"]) not in versions
+               for ref in preparation["pin"]["source_refs"]):
+            raise WorkspaceError("review pin has a broken source-version association")
     _receipt_files(payload)
 
 
@@ -196,18 +227,25 @@ def create_backup(config: WorkspaceConfig, target: Path) -> dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     try:
-        with package_lock(config.results):
-            before = {name: _pointer_generation(config.results, name) for name in ("sources", "notes", "learning")}
+        with ExitStack() as locks:
+            for prefix in STORE_PREFIXES.values():
+                locks.enter_context(package_lock(config.results / prefix))
+            before = {name: _generation(config, name) for name in STORE_PREFIXES}
             payload = stage / "payload"; entries: list[dict[str, Any]] = []
             payload.mkdir()
             authorities: dict[str, Any] = {}
+            copied_paths: dict[str, dict[str, Any]] = {}
             for name, (authority, paths) in before.items():
                 store_entries = []
                 for source in paths:
                     relative = source.relative_to(config.results)
-                    item = _entry(source, payload / relative, payload)
-                    entries.append(item); store_entries.append(item)
-                authorities[name] = {**authority, "root_sha256": _root_digest(store_entries)}
+                    key = relative.as_posix()
+                    if key not in copied_paths:
+                        copied_paths[key] = _entry(source, payload / relative, payload)
+                        entries.append(copied_paths[key])
+                    store_entries.append(copied_paths[key])
+                authorities[name] = {**authority, "root_sha256": _root_digest(store_entries),
+                                     "entry_paths": sorted(item["path"] for item in store_entries)}
             receipt_entries = []
             for source in _receipt_files(config.results):
                 item = _entry(source, payload / source.relative_to(config.results), payload)
@@ -215,7 +253,7 @@ def create_backup(config: WorkspaceConfig, target: Path) -> dict[str, Any]:
             authorities["operation_receipts"] = {"store": "operation_receipts", "commit_id": None,
                 "revision": len(receipt_entries), "schema_version": 1,
                 "root_sha256": _root_digest(receipt_entries)}
-            after = {name: _pointer_generation(config.results, name)[0] for name in ("sources", "notes", "learning")}
+            after = {name: _generation(config, name)[0] for name in STORE_PREFIXES}
             if any(before[name][0] != after[name] for name in after):
                 raise WorkspaceError("an authoritative generation changed while backup was being prepared")
         unsigned = {"schema_version": SCHEMA_VERSION, "workspace_id": config.workspace_id,
@@ -276,14 +314,23 @@ def verify_backup(root: Path) -> dict[str, Any]:
             validation["digests"] = "failed"
             raise WorkspaceError("backup contains unlisted or missing payload files")
         validation["digests"] = "passed"
+        entries_by_path = {item["path"]: item for item in manifest["entries"]}
+        covered_paths = set()
         for name, authority in manifest["authorities"].items():
-            selected = [item for item in manifest["entries"] if (
+            if "entry_paths" in authority:
+                if any(path not in entries_by_path for path in authority["entry_paths"]):
+                    raise WorkspaceError(f"{name} authority references a missing backup entry")
+                selected = [entries_by_path[path] for path in authority["entry_paths"]]
+            else:
+                selected = [item for item in manifest["entries"] if (
                 item["path"].startswith("payload/operation-receipts/") if name == "operation_receipts" else
-                item["path"].startswith("payload/source-notes/") if name == "notes" else
-                item["path"].startswith("payload/learning/") if name == "learning" else
+                item["path"].startswith(f"payload/{STORE_PREFIXES[name]}/") if name != "sources" else
                 item["path"].startswith("payload/objects/") or item["path"].startswith("payload/commits/") or item["path"] == "payload/current.json")]
             if _root_digest(selected) != authority["root_sha256"]:
                 raise WorkspaceError(f"{name} authority root digest mismatch")
+            covered_paths.update(item["path"] for item in selected)
+        if covered_paths != actual_paths:
+            raise WorkspaceError("backup contains entries outside declared authorities")
         _deep_validate_payload(root, manifest); validation["associations"] = "passed"
         return response(status="completed", result={"backup": str(root), "commit_id": manifest["commit_id"],
             "workspace_id": manifest["workspace_id"], "entries": len(manifest["entries"])}, validation=validation,

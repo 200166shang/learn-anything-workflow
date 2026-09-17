@@ -141,7 +141,7 @@ def test_create_pins_and_deeply_verifies_complete_results_generation(tmp_path: P
     assert created["status"] == checked["status"] == "completed"
     manifest = json.loads((backup / "backup-manifest.json").read_text())
     assert manifest["commit_id"].startswith("backup-commit-")
-    assert set(manifest["authorities"]) == {"sources", "notes", "learning", "operation_receipts"}
+    assert set(manifest["authorities"]) == {"sources", "notes", "learning", "review", "practice", "operation_receipts"}
     assert all(authority["root_sha256"] for authority in manifest["authorities"].values())
     assert manifest["authorities"]["sources"]["commit_id"].startswith("commit-")
     assert manifest["authorities"]["notes"]["commit_id"].startswith("note-commit-")
