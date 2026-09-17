@@ -509,12 +509,22 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     if not owner:
         raise ValueError("only a cut-over batch owned by the new store can be rolled back")
     receipt_root = results / "operation-receipts"
-    if owner["owner"] == "legacy" and not owner.get("receipt_modes_restored", True):
-        _restore_directory_modes(receipt_root, owner["receipt_modes_before_rollback"])
-        owner["receipt_modes_restored"] = True
-        atomic_write_json(_ownership_path(config), owners)
+    if owner["owner"] == "legacy":
+        if not owner.get("receipt_modes_restored", True):
+            _restore_directory_modes(receipt_root, owner["receipt_modes_before_rollback"])
+            owner["receipt_modes_restored"] = True
+            atomic_write_json(_ownership_path(config), owners)
+        value.update(status="rolled_back", rollback_at=owner["rollback_at"],
+                     preserved_increment=owner["preserved_increment"])
+        if not any(event["operation"] == "migration rollback" and event["status"] == "passed"
+                   for event in value["events"]):
+            value["events"].append(_event("migration rollback", "passed",
+                                          "reconcile durable legacy ownership",
+                                          "batch state reconstructed after interrupted rollback"))
+        atomic_write_json(root / "batch.json", value)
         return response(status="completed", workspace=str(config.config_path), result={
-            "batch": batch, "reconciled": True, "receipt_modes_restored": True},
+            "batch": batch, "reconciled": True, "receipt_modes_restored": True,
+            "preserved_increment": owner["preserved_increment"]},
             validation={"rollback_recovery": "passed"})
     if value["status"] != "cutover" or owner["owner"] not in {"new", "rolling_back"}:
         raise ValueError("only a cut-over batch owned by the new store can be rolled back")
@@ -567,9 +577,13 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
                  replay_required=bool(changed or deleted or receipts or learning_changed), rollback_at=_now(),
                  preserved_increment=str(preserved))
     atomic_write_json(_ownership_path(config), owners)
+    if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_rollback_owner":
+        raise OSError("injected failure after rollback ownership transition")
     _restore_directory_modes(receipt_root, owner["receipt_modes_before_rollback"])
     owner["receipt_modes_restored"] = True
     atomic_write_json(_ownership_path(config), owners)
+    if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_receipt_modes_restored":
+        raise OSError("injected failure after receipt mode restoration")
     value.update(status="rolled_back", rollback_at=_now(), preserved_increment=str(preserved))
     value["events"].append(_event("migration rollback", "passed",
                                   "preserve post-cutover results and receipts without overwrite/replay",

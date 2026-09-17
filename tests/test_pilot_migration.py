@@ -214,3 +214,23 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     unrelated_receipt = receipts / "unrelated-after-rollback.json"
     unrelated_receipt.write_text('{"status":"new operation"}', encoding="utf-8")
     assert unrelated_receipt.is_file()
+
+
+def test_rollback_reconciles_batch_after_owner_or_mode_publish_crash(tmp_path: Path) -> None:
+    for fault in ("after_rollback_owner", "after_receipt_modes_restored"):
+        case = tmp_path / fault; case.mkdir()
+        config = workspace(case / "workspace"); legacy = legacy_pilot(case / "legacy")
+        batch = fault; common = ("--batch", batch, "--workspace", config, "--json")
+        assert cli("migration", "plan", "--legacy-package", legacy / "course",
+                   "--legacy-thread", legacy / "thread.json", *common)[0] == 0
+        assert cli("migration", "convert", *common)[0] == 0
+        assert cli("migration", "verify", *common)[0] == 0
+        authorization = authorize(case, batch, legacy)
+        assert cli("migration", "cutover", *common, "--authorization", authorization)[0] == 0
+        failed, _ = cli("migration", "rollback", *common,
+                        env={"VIDEO_EXTRACT_MIGRATION_TEST_FAULT": fault})
+        assert failed != 0
+        recovered, result = cli("migration", "rollback", *common)
+        assert recovered == 0 and result["result"]["reconciled"] is True
+        state = json.loads((config.parent / "local/migration-batches" / batch / "batch.json").read_text())
+        assert state["status"] == "rolled_back"
