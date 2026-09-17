@@ -495,18 +495,23 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
 def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     results, local = _require_workspace(config); root, value = _state(config, batch)
     owners = _ownership(config); owner = owners["batches"].get(batch)
-    if value["status"] != "cutover" or not owner or owner["owner"] != "new":
+    if value["status"] != "cutover" or not owner or owner["owner"] not in {"new", "rolling_back"}:
         raise ValueError("only a cut-over batch owned by the new store can be rolled back")
     target = Path(owner["migrated_course"]); baseline = {item["path"]: item for item in owner["cutover_baseline"]}
-    owner["new_modes_before_rollback"] = _freeze_directory(target)
+    owner["owner"] = "rolling_back"
+    owner.setdefault("new_modes_before_rollback", _freeze_directory(target))
+    receipt_root = results / "operation-receipts"
+    receipt_root.mkdir(parents=True, exist_ok=True)
+    owner.setdefault("receipt_modes_before_rollback", _freeze_directory(receipt_root))
     atomic_write_json(_ownership_path(config), owners)
+    if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_rollback_frozen":
+        raise OSError("injected failure after rollback write freeze")
     current = {item["path"]: item for item in _tree(target)}
     changed = sorted(path for path, fact in current.items() if baseline.get(path) != fact)
     deleted = sorted(set(baseline) - set(current))
-    receipt_root = results / "operation-receipts"
     cutover_ns = int(datetime.fromisoformat(owner["cutover_at"]).timestamp() * 1_000_000_000)
-    receipt_snapshot = _tree(receipt_root) if receipt_root.is_dir() else []
-    receipts = [path for path in receipt_root.rglob("*") if path.is_file() and path.stat().st_mtime_ns >= cutover_ns] if receipt_root.is_dir() else []
+    receipt_snapshot = _tree(receipt_root)
+    receipts = [path for path in receipt_root.rglob("*") if path.is_file() and path.stat().st_mtime_ns >= cutover_ns]
     stamp = str(time.time_ns()); preserved = local / "migration-preserved" / batch / stamp
     for relative in changed:
         destination = preserved / relative; destination.parent.mkdir(parents=True, exist_ok=True)
@@ -525,7 +530,7 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
                 shutil.copytree(results / "learning", preserved / "learning")
     if _tree(target) != list(current.values()):
         raise RuntimeError("migrated course changed while rollback was preserving it")
-    if receipt_root.is_dir() and _tree(receipt_root) != receipt_snapshot:
+    if _tree(receipt_root) != receipt_snapshot:
         raise RuntimeError("operation receipts changed while rollback was preserving them")
     preserved.mkdir(parents=True, exist_ok=True)
     atomic_write_json(preserved / "rollback-manifest.json", {"schema_version": 1, "batch": batch,

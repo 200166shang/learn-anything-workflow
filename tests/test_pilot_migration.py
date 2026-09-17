@@ -181,6 +181,18 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     receipts = config.parent / "results/operation-receipts"
     receipts.mkdir()
     (receipts / "publish.json").write_text('{"status":"confirmed"}', encoding="utf-8")
+    failed_rollback_code, _ = cli(
+        "migration", "rollback", *common,
+        env={"VIDEO_EXTRACT_MIGRATION_TEST_FAULT": "after_rollback_frozen"},
+    )
+    assert failed_rollback_code != 0
+    blocked_during_code, blocked_during = cli(
+        "learning", "feedback", "--question-id", root_question,
+        "--state", "understood", "--text", "回退冻结后不应写入",
+        "--workspace", config, "--json",
+    )
+    assert blocked_during_code != 0
+    assert "owned by the legacy store" in blocked_during["diagnostics"][0]
     code, rolled_back = cli("migration", "rollback", *common)
     assert code == 0
     preserved = Path(rolled_back["result"]["preserved_increment"])
