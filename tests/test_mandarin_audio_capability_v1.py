@@ -429,6 +429,37 @@ def test_new_source_version_requires_explicit_safe_adoption_and_never_repays(tmp
     assert adopted["provenance"]["adopted_operation_id"] == first["operation_id"]
 
 
+@pytest.mark.parametrize("damage", ["commit_digest", "receipt_missing", "receipt_digest"])
+def test_adoption_rejects_untrustworthy_prior_authority_or_receipt(tmp_path, capsys, damage):
+    _, package, request = fixture(tmp_path, "en")
+    adapter = FakePaidAdapter(); register_mandarin_adapter("authority-adopt", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="authority-adopt", authorization_ref="approved-authority")
+    request.write_text(json.dumps(data))
+    _, first = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    operation_path = tmp_path / "local/operations" / f'{first["operation_id"]}.json'
+    receipt_path = tmp_path / "results/operation-receipts" / f'{first["operation_id"]}.json'
+    if damage == "commit_digest":
+        operation = json.loads(operation_path.read_text()); operation["commit"]["digest"] = "0" * 64
+        operation_path.write_text(json.dumps(operation))
+    elif damage == "receipt_missing":
+        receipt_path.unlink()
+    else:
+        receipt = json.loads(receipt_path.read_text()); receipt["authoritative_digest"] = "f" * 64
+        receipt_path.write_text(json.dumps(receipt))
+
+    (package / "media/transcript.txt").write_text("A new registered version needs new verification.")
+    data["source_version"] = "source-version-2"; request.write_text(json.dumps(data))
+    _, stopped = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert stopped["status"] == "uncertain" and len(adapter.calls) == 1
+    assert stopped["next_action"]["eligible_operation_ids"] == []
+    assert first["operation_id"] in stopped["next_action"]["rejected_operation_ids"]
+
+    data["adopt_operation_id"] = first["operation_id"]; request.write_text(json.dumps(data))
+    _, rejected = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert rejected["status"] == "uncertain" and rejected["validation"]["prior_authority"] == "failed"
+    assert len(adapter.calls) == 1
+
+
 def test_pyvideotrans_argparse_rejection_is_definitely_not_submitted(tmp_path, capsys):
     workspace, _, request = fixture(tmp_path, "en")
     cli = tmp_path / "fake-pyvideotrans.py"

@@ -267,9 +267,9 @@ def _mark_verification_stale(config: WorkspaceConfig, path: Path, record: dict[s
     return True
 
 
-def _adoption_candidates(config: WorkspaceConfig, operation_id: str, intent: dict[str, Any]) -> list[dict[str, Any]]:
+def _matching_prior_operations(config: WorkspaceConfig, operation_id: str, intent: dict[str, Any]) -> list[dict[str, Any]]:
     assert config.local is not None
-    candidates = []
+    matches = []
     for path in (config.local / "operations").glob("operation-*.json"):
         if path.stem == operation_id:
             continue
@@ -280,15 +280,46 @@ def _adoption_candidates(config: WorkspaceConfig, operation_id: str, intent: dic
                 and previous.get("package_identity") == intent.get("package_identity")
                 and previous.get("source_sha256") == intent.get("source_sha256")
                 and previous.get("effective_parameters") == intent.get("effective_parameters")
-                and prior.get("artifact_facts", {}).get("output", {}).get("sha256")):
-            candidates.append(prior)
-    return candidates
+                and previous.get("adapter_identity") == intent.get("adapter_identity")
+                and isinstance(prior.get("artifact_facts", {}).get("output", {}).get("sha256"), str)
+                and prior.get("artifact_facts", {}).get("output", {}).get("size", 0) > 0
+                and prior.get("artifact_facts", {}).get("output", {}).get("validation") == "ffprobe-48khz-mono-approx64kbps"):
+            matches.append(prior)
+    return matches
+
+
+def _prior_authority(config: WorkspaceConfig, prior: dict[str, Any]) -> tuple[bool, str]:
+    from .media_operations import _authority_digest
+    commit = prior.get("commit")
+    if prior.get("status") != "completed":
+        return False, "prior operation is not completed"
+    if (not isinstance(commit, dict) or not isinstance(commit.get("revision"), int)
+            or commit["revision"] < 1 or not isinstance(commit.get("committed_at"), str)
+            or not commit["committed_at"] or commit.get("digest") != _authority_digest(prior)):
+        return False, "prior authoritative commit is invalid"
+    assert config.results is not None
+    receipt_path = config.results / "operation-receipts" / f'{prior.get("operation_id")}.json'
+    if not receipt_path.is_file():
+        return False, "prior authoritative receipt is missing"
+    try: receipt = read_json(receipt_path)
+    except (OSError, json.JSONDecodeError): return False, "prior authoritative receipt is invalid"
+    if (receipt.get("status") != "completed"
+            or receipt.get("authoritative_revision") != commit["revision"]
+            or receipt.get("authoritative_digest") != commit["digest"]):
+        return False, "prior receipt does not match the authoritative commit"
+    return True, "verified authoritative operation and receipt"
+
+
+def _adoption_candidates(config: WorkspaceConfig, operation_id: str, intent: dict[str, Any]) -> list[dict[str, Any]]:
+    return [prior for prior in _matching_prior_operations(config, operation_id, intent)
+            if _prior_authority(config, prior)[0]]
 
 
 def _adopt_prior(config: WorkspaceConfig, path: Path, record: dict[str, Any], prior: dict[str, Any],
                  source: Path, output: Path, verification_path: str | None) -> dict[str, Any]:
     facts = prior.get("artifact_facts", {}).get("output", {})
-    if (not output.is_file() or facts.get("sha256") != _sha256(output)
+    if (not output.is_file() or facts.get("sha256") != _sha256(output) or facts.get("size") != output.stat().st_size
+            or facts.get("validation") != "ffprobe-48khz-mono-approx64kbps" or not audio_info(output).get("valid")
             or prior.get("intent", {}).get("adapter_identity") != record["intent"].get("adapter_identity")):
         record.update(status="uncertain", validation={"adopted_output": "failed"},
                       diagnostics=["prior operation output or adapter identity cannot be safely adopted"],
@@ -442,7 +473,7 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
                             next_action=None if _lease_active(existing) else {"type": "reconcile", "operation_id": operation_id})
             atomic_write_json(path, existing)
             return _public(config, existing)
-        if existing.get("status") == "uncertain":
+        if existing.get("status") == "uncertain" and not normalized.get("adopt_operation_id"):
             return _public(config, existing)
         if existing.get("status") == "awaiting_user" and (isinstance(existing.get("current_attempt"), dict)
                 or existing.get("validation", {}).get("source_transcript") == "verification_stale"):
@@ -473,20 +504,27 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
     if not native and normalized.get("adopt_operation_id"):
         prior_path = _operation_path(config, normalized["adopt_operation_id"])
         prior = read_json(prior_path) if prior_path.is_file() else None
-        eligible = {candidate["operation_id"] for candidate in _adoption_candidates(config, operation_id, intent)}
-        if not isinstance(prior, dict) or prior.get("operation_id") not in eligible:
-            record.update(status="awaiting_user", validation={"adopted_output": "failed"},
-                          diagnostics=["selected prior operation is not eligible for safe adoption"],
-                          next_action={"type": "user", "reason": "select an operation with the same package, source audio, adapter, and parameters"})
+        matching = {candidate["operation_id"]: candidate for candidate in _matching_prior_operations(config, operation_id, intent)}
+        authority_ok, authority_reason = _prior_authority(config, prior) if isinstance(prior, dict) else (False, "prior operation is missing")
+        if not isinstance(prior, dict) or prior.get("operation_id") not in matching or not authority_ok:
+            record.update(status="uncertain", validation={"adopted_output": "failed", "prior_authority": "failed"},
+                          diagnostics=[f"selected prior operation cannot be safely adopted: {authority_reason}"],
+                          next_action={"type": "user", "reason": "restore or select a completed operation with a matching authoritative receipt"})
             _complete_authority(path, record); _receipt(config, record)
             return _public(config, record)
         return _adopt_prior(config, path, record, prior, source, output, normalized.get("verification_report"))
+    matching = _matching_prior_operations(config, operation_id, intent) if not native else []
     candidates = _adoption_candidates(config, operation_id, intent) if not native else []
-    if existing is None and candidates:
-        record.update(status="awaiting_user", validation={"adopted_output": "pending"},
-                      diagnostics=["a prior paid output is eligible for adoption; automatic resubmission is disabled"],
+    if existing is None and matching:
+        rejected = [prior["operation_id"] for prior in matching if prior not in candidates]
+        record.update(status="awaiting_user" if candidates else "uncertain",
+                      validation={"adopted_output": "pending" if candidates else "failed",
+                                  "prior_authority": "passed" if candidates else "failed"},
+                      diagnostics=["a prior paid output is eligible for adoption; automatic resubmission is disabled"
+                                   if candidates else "matching prior paid output has no trustworthy authority/receipt; automatic resubmission is disabled"],
                       next_action={"type": "user", "reason": "rerun with adopt_operation_id after reviewing the source-version change",
-                                   "eligible_operation_ids": [candidate["operation_id"] for candidate in candidates]})
+                                   "eligible_operation_ids": [candidate["operation_id"] for candidate in candidates],
+                                   "rejected_operation_ids": rejected})
         _complete_authority(path, record); _receipt(config, record)
         return _public(config, record)
     if existing and not native and existing.get("intent", {}).get("adapter_identity") != adapter_identity:
