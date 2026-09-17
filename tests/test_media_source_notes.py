@@ -216,8 +216,8 @@ def test_public_capability_reports_asr_adapter_failure_without_claiming_completi
     result = run_capability("source.notes", request)
 
     assert result["status"] == "recoverable_failure"
-    assert result["result"]["validation"]["transcript"] == "failed"
-    assert result["result"]["diagnostics"] == ["transcript adapter failed; retry is available"]
+    assert result["validation"]["transcript"] == "failed"
+    assert result["diagnostics"] == ["transcript adapter failed; retry is available"]
 
 
 def test_dot_and_spaced_srt_cues_prepare_and_finalize_without_rewriting_source(tmp_path):

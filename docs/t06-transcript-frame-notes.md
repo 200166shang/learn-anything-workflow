@@ -32,6 +32,15 @@ existing non-media note requests remain compatible.
 Preparation paths reject symlinks, and restored notes continue enforcing their
 published approval history even when transient preparation files are unavailable.
 
+Publication parses rendered inline Markdown image/attachment links and rewrites
+their destinations to `../<object-prefix>/<object-digest>`, relative to the stored
+note object. Merely mentioning the filename in text, code or comments is not
+adoption. Inline destinations can be bare or angle-wrapped with optional titles;
+reference-style/HTML attachment embeds must be converted to inline Markdown.
+The body and links are computed from the same captured attachment bytes that
+are stored, and published history validates object links as well as digests.
+These relative links survive source removal and backup relocation.
+
 SRT locators normalize comma/dot milliseconds and horizontal spacing while
 preserving the original transcript bytes. ASR and frame cache receipts include
 the registered, versioned adapter ID; adapter authors must change that ID when

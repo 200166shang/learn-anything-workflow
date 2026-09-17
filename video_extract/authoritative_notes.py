@@ -27,6 +27,7 @@ from .source_registry import _load_snapshot
 from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 from .timed_cues import cue_ranges
 from .visual_approval import validate_approval, validate_published_review
+from .note_links import portable_markdown, validate_published_links
 
 SCHEMA_VERSION = 1
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/notes-snapshot-v1.schema.json").read_text())
@@ -265,8 +266,7 @@ def _validate_request(config: WorkspaceConfig, value: Any) -> tuple[dict[str, An
         attachment = Path(raw_attachment).expanduser().resolve()
         if not attachment.is_file():
             raise ValueError(f"adopted attachment is missing: {attachment}")
-        if attachment.name not in value["markdown"]:
-            raise ValueError(f"adopted attachment is not used by the note body: {attachment.name}")
+    portable_markdown(value["markdown"], value["attachments"])
     association = value["association"]
     if not isinstance(association, dict) or association.get("status") not in {
         "verified", "unverified", "not_applicable"
@@ -334,6 +334,8 @@ def _validate_commit(config: WorkspaceConfig, commit: dict[str, Any]) -> None:
                 raise WorkspaceError(f"note history object kind is invalid: {source_id}")
             _validate_published_association(source_snapshot, source_id, entry["source_version"], entry["association"])
             validate_published_review(entry.get("visual_review"), entry["attachment_objects"])
+            body = _safe(objects, entry["body_object"][:2], entry["body_object"]).read_text(encoding="utf-8")
+            validate_published_links(body, entry["attachment_objects"])
         latest = note["history"][-1]
         if note.get("visual_review") != latest.get("visual_review"):
             raise WorkspaceError("current visual approval does not match latest history")
@@ -442,11 +444,12 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                                         "observed_revision": note_revision},
                                 validation={"expected_revision": "conflict"},
                                 next_action={"type": "user", "reason": "resolve note revision conflict"})
+            markdown, attachment_blobs = portable_markdown(value["markdown"], value["attachments"])
             prospective = {
-                "body_object": _digest(value["markdown"].encode()),
+                "body_object": _digest(markdown.encode()),
                 "citations_object": _digest(json.dumps(value["citations"], ensure_ascii=False, sort_keys=True).encode()),
                 "corrections_object": _digest(json.dumps(value["corrections"], ensure_ascii=False, sort_keys=True).encode()),
-                "attachment_objects": [_digest(Path(item).expanduser().resolve().read_bytes()) for item in value["attachments"]],
+                "attachment_objects": [_digest(body) for _, body in attachment_blobs],
             }
             if existing and existing.get("source_version") == version["source_version"] and all(
                 existing.get(key) == expected for key, expected in prospective.items()
@@ -459,7 +462,7 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                                         "action": "reused"},
                                 validation={"commit": "passed", "objects": "passed", "source": "passed"})
             values: list[tuple[str, bytes, str]] = [
-                ("body", value["markdown"].encode(), "note_markdown"),
+                ("body", markdown.encode(), "note_markdown"),
                 ("citations", json.dumps(value["citations"], ensure_ascii=False, sort_keys=True).encode(), "citations"),
                 ("corrections", json.dumps(value["corrections"], ensure_ascii=False, sort_keys=True).encode(), "corrections"),
             ]
@@ -470,9 +473,8 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
             for label, body, kind in values:
                 digest, path = _put(config, body); stored[label] = (digest, path)
                 new_objects[digest] = {"kind": kind, "size": len(body)}
-            for raw_attachment in value["attachments"]:
-                attachment = Path(raw_attachment).expanduser().resolve()
-                body = attachment.read_bytes(); digest, stored_attachment = _put(config, body)
+            for _, body in attachment_blobs:
+                digest, stored_attachment = _put(config, body)
                 attachment_digests.append(digest); attachment_paths.append(stored_attachment)
                 new_objects[digest] = {"kind": "adopted_attachment", "size": len(body)}
             validate_published_review(value.get("visual_review"), attachment_digests)
