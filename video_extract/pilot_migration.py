@@ -22,6 +22,15 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 
 BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+KNOWN_THREAD_KEYS = {"schema_version", "module", "thread", "questions", "relationships",
+                     "feedbacks", "operation_receipts", "_legacy_format"}
+KNOWN_MODULE_KEYS = {"goal", "scope"}
+KNOWN_THREAD_STATE_KEYS = {"id", "root_question_id", "current_question_id", "return_route",
+                           "entry_history", "title"}
+KNOWN_QUESTION_KEYS = {"id", "text", "title", "parent_id", "relation", "locator",
+                       "created_at", "unresolved_confusions"}
+KNOWN_RELATIONSHIP_KEYS = {"id", "from", "to", "type", "created_at"}
+KNOWN_FEEDBACK_KEYS = {"id", "question_id", "state", "text", "created_at", "confusion"}
 
 
 def _now() -> str:
@@ -42,6 +51,29 @@ def _batch_root(config: WorkspaceConfig, batch: str) -> Path:
     if root.is_symlink():
         raise WorkspaceError("migration batch root must not be a symbolic link")
     return root
+
+
+def _campaign(config: WorkspaceConfig) -> dict[str, Any]:
+    _, local = _require_workspace(config)
+    root = local / "migration-batches"
+    batches: list[dict[str, Any]] = []
+    if root.is_dir() and not root.is_symlink():
+        for path in sorted(root.glob("*/batch.json")):
+            try:
+                value = read_json(path)
+            except (OSError, json.JSONDecodeError):
+                batches.append({"batch": path.parent.name, "status": "invalid"})
+                continue
+            batches.append({"batch": value.get("batch", path.parent.name),
+                            "status": value.get("status", "unknown"),
+                            "legacy_package": value.get("legacy_package"),
+                            "legacy_thread": value.get("legacy_thread"),
+                            "unknown_legacy_data": len(value.get("inventory", {}).get("unknown_legacy_data", [])),
+                            "deletion_authorized": False})
+    return {"schema_version": 1, "batches": batches,
+            "all_verified_or_cutover": bool(batches) and all(
+                item["status"] in {"verified", "cutover", "rolled_back"} for item in batches),
+            "legacy_deletion_authorized": False}
 
 
 def _tree(root: Path) -> list[dict[str, Any]]:
@@ -67,6 +99,37 @@ def _file_fact(path: Path) -> dict[str, Any]:
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode()).hexdigest()
+
+
+def _unknown_legacy_data(thread: dict[str, Any]) -> list[dict[str, Any]]:
+    """Report unsupported legacy facts without interpreting or discarding them."""
+    unknown: list[dict[str, Any]] = []
+
+    def add(pointer: str, value: Any) -> None:
+        unknown.append({"pointer": pointer, "value_type": type(value).__name__,
+                        "sha256": _digest(value), "disposition": "preserve_opaque",
+                        "replay_policy": "never_automatic"})
+
+    for key in sorted(set(thread) - KNOWN_THREAD_KEYS):
+        add(f"/{key}", thread[key])
+    for container, known in (("module", KNOWN_MODULE_KEYS), ("thread", KNOWN_THREAD_STATE_KEYS)):
+        value = thread.get(container)
+        if isinstance(value, dict):
+            for key in sorted(set(value) - known):
+                add(f"/{container}/{key}", value[key])
+    for index, value in enumerate(thread.get("questions") or []):
+        if isinstance(value, dict):
+            for key in sorted(set(value) - KNOWN_QUESTION_KEYS):
+                add(f"/questions/{index}/{key}", value[key])
+    for index, value in enumerate(thread.get("relationships") or []):
+        if isinstance(value, dict):
+            for key in sorted(set(value) - KNOWN_RELATIONSHIP_KEYS):
+                add(f"/relationships/{index}/{key}", value[key])
+    for index, value in enumerate(thread.get("feedbacks") or []):
+        if isinstance(value, dict):
+            for key in sorted(set(value) - KNOWN_FEEDBACK_KEYS):
+                add(f"/feedbacks/{index}/{key}", value[key])
+    return unknown
 
 
 def _event(operation: str, status: str, expected: str, actual: str) -> dict[str, str]:
@@ -177,6 +240,12 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any],
                                      "external": external, "present": bool(inside and resolved.is_file())})
     feedbacks = list(thread.get("feedbacks") or [])
     receipts = list(thread.get("operation_receipts") or [])
+    # These names resemble current domains but are not part of the supported v1
+    # thread contract.  They remain unknown extensions until a format-specific
+    # converter exists; the original thread is preserved byte-for-byte.
+    domain_values = {name: list(thread.get(name) or [])
+                     for name in ("explanations", "cards", "reviews", "practices")}
+    unknown = _unknown_legacy_data(thread)
     routes = list(thread.get("thread", {}).get("return_route") or [])
     entries = list(thread.get("thread", {}).get("entry_history") or [])
     locators = [item for item in questions if item.get("locator")]
@@ -192,6 +261,7 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any],
               "relationships": len(relations), "feedbacks": len(feedbacks),
               "operation_receipts": len(receipts), "return_route": len(routes),
               "entry_history": len(entries), "locators": len(locators)}
+    counts.update({name: len(value) for name, value in domain_values.items() if value})
     if thread_assets:
         counts["question_documents"] = len(question_documents)
         counts["thread_images"] = len(thread_images)
@@ -203,7 +273,17 @@ def _inventory(package: Path, manifest: dict[str, Any], thread: dict[str, Any],
             "question_ids": [str(item.get("id")) for item in questions],
             "current_question_id": thread.get("thread", {}).get("current_question_id"),
             "counts": counts,
-            "missing_facts": missing}
+            "missing_facts": missing, "unknown_legacy_data": unknown,
+            "domain_reconciliation": {
+                "notes_images": {"count": len(notes) + len(images), "disposition": "copy_and_verify"},
+                "questions_explanations": {"count": len(questions) + len(domain_values["explanations"]),
+                                           "disposition": "convert_questions_preserve_opaque_explanations"},
+                "practice_user_code": {"count": len(domain_values["practices"]),
+                                       "disposition": "preserve_opaque"},
+                "cards_review_history": {"count": len(domain_values["cards"]) + len(domain_values["reviews"]),
+                                         "disposition": "preserve_opaque"},
+                "operation_receipts": {"count": len(receipts), "disposition": "preserve_opaque_no_replay"},
+            }, "unsupported_domain_extensions": [name for name, items in domain_values.items() if items]}
 
 
 def plan(config: WorkspaceConfig, batch: str, package: Path, thread_path: Path) -> dict[str, Any]:
@@ -212,6 +292,10 @@ def plan(config: WorkspaceConfig, batch: str, package: Path, thread_path: Path) 
     if root.exists():
         raise ValueError(f"migration batch already exists: {batch}")
     package, thread_path = package.expanduser().resolve(), thread_path.expanduser().resolve()
+    campaign = _campaign(config)
+    for existing in campaign["batches"]:
+        if str(package) == existing.get("legacy_package") or str(thread_path) == existing.get("legacy_thread"):
+            raise ValueError(f"legacy input already belongs to migration batch {existing['batch']}")
     manifest, thread, thread_assets = _load_legacy(package, thread_path)
     inventory = _inventory(package, manifest, thread, thread_assets)
     value = {"schema_version": 1, "batch": batch, "status": "planned", "created_at": _now(),
@@ -223,12 +307,19 @@ def plan(config: WorkspaceConfig, batch: str, package: Path, thread_path: Path) 
              "acceptance": {"automated_fixture": "pending", "real_pilot": "pending_authorization"},
              "events": [_event("migration plan", "passed", "inventory one authorized pilot",
                                "legacy input unchanged; local plan recorded")],
-             "target_contracts": {"workspace": 2, "source_package": 6, "learning_record": 2}}
+             "target_contracts": {"workspace": 2, "source_package": 6, "learning_record": 2},
+             "retirement": {"legacy_discovery": "excluded_after_cutover",
+                            "legacy_copy": "read_only_preserved", "deletion": "not_authorized"}}
     root.mkdir(parents=True)
     atomic_write_json(root / "batch.json", value)
+    campaign = _campaign(config)
     return response(status="completed", workspace=str(config.config_path), result=value,
                     validation={"legacy_package": "passed", "legacy_thread": "passed",
-                                "scope": "one_package_one_thread"})
+                                "scope": "one_package_one_thread",
+                                "unknown_legacy_data": "preserved_opaque" if inventory["unknown_legacy_data"] else "none"},
+                    artifact_refs=[str(root / "batch.json")],
+                    next_action={"command": f"video-extract migration convert --batch {batch} --workspace {config.config_path} --json",
+                                 "campaign": campaign})
 
 
 def _state(config: WorkspaceConfig, batch: str) -> tuple[Path, dict[str, Any]]:
@@ -344,6 +435,19 @@ def convert(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     source_id = _id("source", config.workspace_id or "", batch, "course")
     source_version = "source-version-" + content_digest
     record, identity_map = _converted_record(config, batch, legacy_thread, source_id, source_version)
+    opaque_root = staging / "opaque-legacy"
+    opaque_root.mkdir()
+    original_thread = opaque_root / ("thread" + Path(value["legacy_thread"]).suffix.lower())
+    shutil.copy2(value["legacy_thread"], original_thread)
+    opaque_thread_fact = _file_fact(original_thread)
+    opaque_thread_fact["path"] = original_thread.relative_to(staging).as_posix()
+    preserved_domains = {
+        name: {"count": len(legacy_thread.get(name) or []),
+               "sha256": _digest(list(legacy_thread.get(name) or [])),
+               "disposition": "preserve_opaque",
+               "replay_policy": "never_automatic" if name == "operation_receipts" else "not_executable"}
+        for name in ("explanations", "cards", "reviews", "practices", "operation_receipts")
+    }
     converted = {"schema_version": 1, "batch": batch, "created_at": _now(),
                  "source_id": source_id, "source_version": source_version,
                  "record": record, "identity_map": identity_map,
@@ -351,7 +455,11 @@ def convert(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
                  "legacy_operation_receipts": list(legacy_thread.get("operation_receipts") or []),
                  "legacy_locators": {identity_map[str(item["id"])]: item["locator"]
                                      for item in legacy_thread["questions"] if item.get("locator")},
-                 "missing_facts": value["inventory"]["missing_facts"]}
+                 "missing_facts": value["inventory"]["missing_facts"],
+                 "unknown_legacy_data": value["inventory"]["unknown_legacy_data"],
+                 "opaque_thread": opaque_thread_fact,
+                 "preserved_domains": preserved_domains,
+                 "domain_reconciliation": value["inventory"]["domain_reconciliation"]}
     atomic_write_json(staging / "conversion.json", converted)
     value.update(status="converted", converted_at=_now(), identity_map=identity_map)
     value["events"].append(_event("migration convert", "passed", "target contracts and identity map",
@@ -359,8 +467,11 @@ def convert(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     atomic_write_json(root / "batch.json", value)
     return response(status="completed", workspace=str(config.config_path), result={
         "batch": batch, "identity_map": identity_map, "source_version": source_version,
-        "missing_facts": converted["missing_facts"]}, validation={"target_contract": "written",
-        "legacy_v1_modified": "no"})
+        "missing_facts": converted["missing_facts"],
+        "unknown_legacy_data": converted["unknown_legacy_data"],
+        "domain_reconciliation": converted["domain_reconciliation"]},
+        validation={"target_contract": "written", "opaque_legacy": "preserved",
+                    "legacy_v1_modified": "no"})
 
 
 def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
@@ -399,6 +510,15 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
                               {"path": f"legacy-thread/{Path(item['path']).relative_to(Path(value['legacy_thread']).parent).as_posix()}",
                                "size": item["size"], "sha256": item["sha256"]}
                               for item in value.get("thread_assets", [])}
+    opaque_path = root / "converted" / converted["opaque_thread"]["path"]
+    opaque_fact = _file_fact(opaque_path) if opaque_path.is_file() else None
+    if opaque_fact is not None:
+        opaque_fact["path"] = converted["opaque_thread"]["path"]
+    preserved_domains = {
+        name: {"count": len(legacy_thread.get(name) or []),
+               "sha256": _digest(list(legacy_thread.get(name) or []))}
+        for name in ("explanations", "cards", "reviews", "practices", "operation_receipts")
+    }
     checks = {"content": source_files == target_files,
               "notes": len(value["inventory"]["notes"]) == value["inventory"]["counts"]["notes"],
               "images": len(value["inventory"]["images"]) == value["inventory"]["counts"]["images"],
@@ -411,6 +531,13 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
               "feedbacks": len(converted["record"]["feedbacks"]) == value["inventory"]["counts"]["feedbacks"],
               "operation_receipts": len(converted["legacy_operation_receipts"])
                   == value["inventory"]["counts"]["operation_receipts"],
+              "opaque_legacy": opaque_fact == converted["opaque_thread"],
+              "unknown_legacy_data": converted.get("unknown_legacy_data")
+                  == value["inventory"].get("unknown_legacy_data", []),
+              "preserved_domains": all(
+                  converted.get("preserved_domains", {}).get(name, {}).get("count") == facts["count"]
+                  and converted.get("preserved_domains", {}).get(name, {}).get("sha256") == facts["sha256"]
+                  for name, facts in preserved_domains.items()),
               "return_route": sum(len(item.get("return_route", []))
                                   for item in converted["record"]["threads"].values())
                   == value["inventory"]["counts"]["return_route"],
@@ -453,7 +580,10 @@ def verify(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
         atomic_write_json(root / "batch.json", value)
     return response(status=status, workspace=str(config.config_path), result={
         "batch": batch, "identity_map": converted["identity_map"], "counts": value["inventory"]["counts"],
-        "missing_facts": converted["missing_facts"]},
+        "missing_facts": converted["missing_facts"],
+        "unknown_legacy_data": converted.get("unknown_legacy_data", []),
+        "domain_reconciliation": converted.get("domain_reconciliation", {}),
+        "campaign": _campaign(config)},
         validation={key: "passed" if passed else "failed" for key, passed in checks.items()},
         diagnostics=[] if status == "completed" else ["migration verification failed"])
 
@@ -531,6 +661,107 @@ def _restore_directory_modes(root: Path, modes: dict[str, int]) -> None:
         if path.exists() and not path.is_symlink(): path.chmod(int(mode))
 
 
+def _optional_tree(root: Path) -> list[dict[str, Any]]:
+    return _tree(root) if root.is_dir() else []
+
+
+def _contains_owned_identity(path: Path, identities: set[str]) -> bool:
+    if not identities or not path.is_dir():
+        return False
+    for item in path.rglob("*.json"):
+        if item.is_symlink() or not item.is_file():
+            continue
+        try:
+            body = item.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if any(identity in body for identity in identities):
+            return True
+    return False
+
+
+def _mentions_identity(value: Any, identities: set[str]) -> bool:
+    if isinstance(value, str):
+        return value in identities
+    if isinstance(value, dict):
+        return any(_mentions_identity(item, identities) for item in value.values())
+    if isinstance(value, list):
+        return any(_mentions_identity(item, identities) for item in value)
+    return False
+
+
+def _copy_stable_file(source: Path, destination: Path) -> dict[str, Any]:
+    before = source.read_bytes()
+    fact = {"size": len(before), "sha256": hashlib.sha256(before).hexdigest()}
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(before)
+    after = source.read_bytes()
+    if before != after or destination.read_bytes() != before:
+        raise RuntimeError(f"file changed while rollback was preserving it: {source}")
+    return fact
+
+
+def _preserve_linked_domain_records(config: WorkspaceConfig, preserved: Path,
+                                    identities: set[str]) -> dict[str, Any]:
+    """Export only records linked to this batch; leave shared stores writable."""
+    result: dict[str, Any] = {}
+    from . import cards, practice, review
+
+    card_snapshot = cards._load(config)
+    selected_cards = {identity: item for identity, item in card_snapshot["record"]["cards"].items()
+                      if _mentions_identity(item, identities)}
+    if selected_cards:
+        target = preserved / "domain-records/cards.json"
+        atomic_write_json(target, {"schema_version": 1, "cards": selected_cards})
+        result["cards"] = {"count": len(selected_cards), "path": str(target)}
+
+    review_snapshot = review._load(config)
+    selected_preparations = {identity: item for identity, item in
+                             review_snapshot["record"]["preparations"].items()
+                             if _mentions_identity(item, identities)}
+    selected_events = {identity: item for identity, item in review_snapshot["record"]["events"].items()
+                       if item.get("preparation_id") in selected_preparations
+                       or _mentions_identity(item, identities)}
+    if selected_preparations or selected_events:
+        target = preserved / "domain-records/review.json"
+        atomic_write_json(target, {"schema_version": 1, "preparations": selected_preparations,
+                                  "events": selected_events})
+        result["reviews"] = {"preparations": len(selected_preparations),
+                             "events": len(selected_events), "path": str(target)}
+
+    practice_snapshot = practice._load(config)
+    selected_practices = {identity: item for identity, item in practice_snapshot["practices"].items()
+                          if _mentions_identity(item, identities)}
+    if selected_practices:
+        practice_root = practice._root(config)
+        object_digests = {
+            digest for item in selected_practices.values()
+            for digest in (item["preparation_sha256"],
+                           *(checkpoint["object_sha256"] for checkpoint in item.get("checkpoints", [])))
+        }
+        object_facts = {}
+        for digest in sorted(object_digests):
+            source = practice._object(practice_root, digest)
+            relative = Path("practice-objects") / digest[:2] / digest
+            object_facts[digest] = _copy_stable_file(source, preserved / relative)
+        workspaces = []
+        for practice_id in sorted(selected_practices):
+            source = practice_root / "workspaces" / practice_id
+            if not source.is_dir():
+                continue
+            destination = preserved / "practice-workspaces" / practice_id
+            before = _tree(source); shutil.copytree(source, destination)
+            if _tree(source) != before or _tree(destination) != before:
+                raise RuntimeError(f"practice workspace changed while preserving it: {practice_id}")
+            workspaces.append(practice_id)
+        target = preserved / "domain-records/practices.json"
+        atomic_write_json(target, {"schema_version": 1, "practices": selected_practices,
+                                  "objects": object_facts, "workspaces": workspaces})
+        result["practices"] = {"count": len(selected_practices), "path": str(target),
+                               "workspaces": workspaces}
+    return result
+
+
 def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> dict[str, Any]:
     from . import learning
     from .source_registry import register
@@ -560,6 +791,11 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
         return response(status="recoverable_failure", workspace=str(config.config_path),
                         validation={"converted_generation": "failed"}, diagnostics=["converted generation changed"])
     owners = _ownership(config)
+    for other_batch, other in owners["batches"].items():
+        if other_batch == batch:
+            continue
+        if value["legacy_package"] == other.get("legacy_package") or value["legacy_thread"] == other.get("legacy_thread"):
+            raise ValueError(f"migration batch overlaps retained legacy input owned by {other_batch}")
     existing_owner = owners["batches"].get(batch)
     if existing_owner is not None:
         target = Path(existing_owner.get("migrated_course", ""))
@@ -614,15 +850,32 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
     _set_legacy_read_only(package_path, thread_path, legacy_modes)
     if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_legacy_read_only":
         raise OSError("injected failure after legacy read-only transition")
+    learning_ids = {key: sorted(record[key]) for key in
+                    ("modules", "threads", "questions", "relationships", "feedbacks",
+                     "preparations", "explanations")}
+    domain_baselines = {name: _optional_tree(results / name)
+                        for name in ("cards", "reviews", "practices", "operation-receipts")}
+    historical_receipt_archive = None
+    if converted.get("legacy_operation_receipts"):
+        historical_receipt_archive = results / "migration-historical-receipts" / f"{batch}.json"
+        atomic_write_json(historical_receipt_archive, {
+            "schema_version": 1, "batch": batch,
+            "source_thread_sha256": value["thread_snapshot"]["sha256"],
+            "receipts": converted["legacy_operation_receipts"],
+            "policy": "historical_evidence_only", "replay_policy": "never_automatic",
+        })
     owners["batches"][batch] = {"owner": "new", "legacy_read_only": True,
         "legacy_package": value["legacy_package"], "legacy_thread": value["legacy_thread"],
         "migrated_course": str(target),
         "source_id": converted["source_id"], "source_version": actual_version,
         "learning_commit_id": published["commit_id"], "cutover_at": _now(), "cutover_baseline": baseline,
         "legacy_modes": legacy_modes, "locators": converted["legacy_locators"],
-        "learning_ids": {key: sorted(record[key]) for key in
-                         ("modules", "threads", "questions", "relationships", "feedbacks",
-                          "preparations", "explanations")},
+        "learning_ids": learning_ids,
+        "learning_scope_sha256": _digest(learning.migration_scope(published["record"], learning_ids)),
+        "domain_baselines": domain_baselines,
+        "unknown_legacy_data": converted.get("unknown_legacy_data", []),
+        "preserved_domains": converted.get("preserved_domains", {}),
+        "historical_receipt_archive": str(historical_receipt_archive) if historical_receipt_archive else None,
         "authorization_sha256": authorization_sha256}
     atomic_write_json(_ownership_path(config), owners)
     value.update(status="cutover", cutover_at=_now(), migrated_course=str(target),
@@ -643,12 +896,7 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     owners = _ownership(config); owner = owners["batches"].get(batch)
     if not owner:
         raise ValueError("only a cut-over batch owned by the new store can be rolled back")
-    receipt_root = results / "operation-receipts"
     if owner["owner"] == "legacy":
-        if not owner.get("receipt_modes_restored", True):
-            _restore_directory_modes(receipt_root, owner["receipt_modes_before_rollback"])
-            owner["receipt_modes_restored"] = True
-            atomic_write_json(_ownership_path(config), owners)
         value.update(status="rolled_back", rollback_at=owner["rollback_at"],
                      preserved_increment=owner["preserved_increment"])
         if not any(event["operation"] == "migration rollback" and event["status"] == "passed"
@@ -664,59 +912,77 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     if value["status"] != "cutover" or owner["owner"] not in {"new", "rolling_back"}:
         raise ValueError("only a cut-over batch owned by the new store can be rolled back")
     target = Path(owner["migrated_course"]); baseline = {item["path"]: item for item in owner["cutover_baseline"]}
-    receipt_root.mkdir(parents=True, exist_ok=True)
     if owner["owner"] == "new":
         owner["owner"] = "rolling_back"
         owner["new_modes_before_rollback"] = _directory_modes(target)
-        owner["receipt_modes_before_rollback"] = _directory_modes(receipt_root)
-        owner["receipt_modes_restored"] = False
+        owner["receipt_modes_restored"] = True
         atomic_write_json(_ownership_path(config), owners)
     _set_directory_read_only(target, owner["new_modes_before_rollback"])
-    _set_directory_read_only(receipt_root, owner["receipt_modes_before_rollback"])
     if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_rollback_frozen":
         raise OSError("injected failure after rollback write freeze")
     current = {item["path"]: item for item in _tree(target)}
     changed = sorted(path for path, fact in current.items() if baseline.get(path) != fact)
     deleted = sorted(set(baseline) - set(current))
-    cutover_ns = int(datetime.fromisoformat(owner["cutover_at"]).timestamp() * 1_000_000_000)
-    receipt_snapshot = _tree(receipt_root)
-    receipts = [path for path in receipt_root.rglob("*") if path.is_file() and path.stat().st_mtime_ns >= cutover_ns]
     stamp = str(time.time_ns()); preserved = local / "migration-preserved" / batch / stamp
     for relative in changed:
         destination = preserved / relative; destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(target / relative, destination)
-    for receipt in receipts:
-        destination = preserved / "operation-receipts" / receipt.relative_to(receipt_root)
-        destination.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(receipt, destination)
+    protected_ids = {identity for values in owner["learning_ids"].values() for identity in values}
+    domain_deltas: dict[str, list[str]] = {}
+    preserved_records = _preserve_linked_domain_records(config, preserved, protected_ids)
+    for domain in ("cards", "reviews", "practices", "operation-receipts"):
+        domain_root = results / domain
+        before = {item["path"]: item for item in owner.get("domain_baselines", {}).get(domain, [])}
+        after_list = _optional_tree(domain_root)
+        after = {item["path"]: item for item in after_list}
+        delta = sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+        domain_deltas[domain] = delta
+    receipt_files: list[str] = []
+    unclassified_receipts: list[str] = []
+    receipt_root = results / "operation-receipts"
+    receipt_identities = {*protected_ids, owner["source_id"], owner["source_version"],
+                          owner["migrated_course"], batch}
+    for relative in domain_deltas.get("operation-receipts", []):
+        source = receipt_root / relative
+        if not source.is_file() or source.is_symlink():
+            continue
+        try:
+            receipt_value = read_json(source)
+        except (OSError, json.JSONDecodeError):
+            receipt_value = None
+        linked = _mentions_identity(receipt_value, receipt_identities)
+        destination_root = "operation-receipts" if linked else "unclassified-operation-receipts"
+        _copy_stable_file(source, preserved / destination_root / relative)
+        (receipt_files if linked else unclassified_receipts).append(relative)
     learning_changed = False
-    learning_pointer = results / "learning/current.json"
     from .package_lock import package_lock
     with package_lock(results / "learning"):
-        if learning_pointer.is_file():
-            current_learning = read_json(learning_pointer).get("commit_id")
-            learning_changed = current_learning != owner["learning_commit_id"]
-            if learning_changed:
-                shutil.copytree(results / "learning", preserved / "learning")
+        from . import learning
+        current_learning = learning._load(config)
+        learning_scope = learning.migration_scope(current_learning["record"], owner["learning_ids"])
+        learning_changed = _digest(learning_scope) != owner.get("learning_scope_sha256")
+        if learning_changed:
+            shutil.copytree(results / "learning", preserved / "learning")
+            if _tree(results / "learning") != _tree(preserved / "learning"):
+                raise RuntimeError("learning results changed while rollback was preserving them")
     if _tree(target) != list(current.values()):
         raise RuntimeError("migrated course changed while rollback was preserving it")
-    if _tree(receipt_root) != receipt_snapshot:
-        raise RuntimeError("operation receipts changed while rollback was preserving them")
     preserved.mkdir(parents=True, exist_ok=True)
     atomic_write_json(preserved / "rollback-manifest.json", {"schema_version": 1, "batch": batch,
         "created_at": _now(), "changed_course_files": changed, "deleted_course_files": deleted,
         "learning_changed": learning_changed,
-        "operation_receipts": [path.relative_to(receipt_root).as_posix() for path in receipts],
-        "policy": "preserve_only_no_remote_replay"})
+        "domain_deltas": domain_deltas, "preserved_records": preserved_records,
+        "operation_receipts": receipt_files,
+        "unclassified_operation_receipts": unclassified_receipts,
+        "unknown_legacy_data": owner.get("unknown_legacy_data", []),
+        "policy": "preserve_only_no_remote_replay", "replay_policy": "never_automatic"})
     _restore_legacy_modes(Path(owner["legacy_package"]), Path(owner["legacy_thread"]), owner["legacy_modes"])
     owner.update(owner="legacy", legacy_read_only=False, new_read_only=True,
-                 replay_required=bool(changed or deleted or receipts or learning_changed), rollback_at=_now(),
+                 replay_required=bool(changed or deleted or any(domain_deltas.values()) or learning_changed), rollback_at=_now(),
                  preserved_increment=str(preserved))
     atomic_write_json(_ownership_path(config), owners)
     if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_rollback_owner":
         raise OSError("injected failure after rollback ownership transition")
-    _restore_directory_modes(receipt_root, owner["receipt_modes_before_rollback"])
-    owner["receipt_modes_restored"] = True
-    atomic_write_json(_ownership_path(config), owners)
     if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_receipt_modes_restored":
         raise OSError("injected failure after receipt mode restoration")
     value.update(status="rolled_back", rollback_at=_now(), preserved_increment=str(preserved))
@@ -727,8 +993,8 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     return response(status="completed", workspace=str(config.config_path), result={
         "batch": batch, "preserved_increment": str(preserved), "changed_course_files": changed,
         "deleted_course_files": deleted, "learning_changed": learning_changed,
-        "operation_receipts": len(receipts),
-        "replay_required": bool(changed or deleted or receipts or learning_changed)},
+        "operation_receipts": len(receipt_files), "preserved_records": preserved_records,
+        "replay_required": bool(changed or deleted or any(domain_deltas.values()) or learning_changed)},
         validation={"increment_preserved": "passed", "new_store_not_overwritten": "passed",
                     "remote_operations_replayed": "no"})
 

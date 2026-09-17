@@ -34,17 +34,18 @@ class CliContractTests(unittest.TestCase):
         with patch("sys.argv", ["video-extract", "plan", "fixture", "--goal", "podcast_zh"]), self.assertRaises(SystemExit):
             main()
 
-    def test_status_reports_goal_state_without_legacy_video_failure(self):
+    def test_status_rejects_legacy_goal_package_with_migration_entry(self):
         with tempfile.TemporaryDirectory() as raw:
             package = Path(raw); audio = package / "audio/podcast.zh-CN.m4a"; audio.parent.mkdir()
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=0.1", "-c:a", "aac", str(audio)], check=True)
             atomic_write_json(package / "manifest.json", {"schema_version": 4, "platform": "youtube", "identity": "x", "request": {"goals": ["podcast_zh"]}, "artifacts": {"localized_audio": "audio/podcast.zh-CN.m4a"}, "provenance": {"localized_audio": {"kind": "native_chinese_track", "language": "zh-CN"}}})
             output = io.StringIO()
             with patch("sys.argv", ["video-extract", "status", str(package), "--json"]), contextlib.redirect_stdout(output):
-                self.assertEqual(main(), 0)
+                self.assertNotEqual(main(), 0)
             result = json.loads(output.getvalue())
-            self.assertTrue(result["goal_status"]["ok"])
-            self.assertNotIn("legacy", result)
+            self.assertEqual(result["status"], "unsupported")
+            self.assertEqual(result["validation"]["legacy_package"], "rejected")
+            self.assertEqual(result["next_action"]["command"], "video-extract migration plan")
 
 
 if __name__ == "__main__":

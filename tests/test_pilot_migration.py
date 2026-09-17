@@ -210,6 +210,47 @@ def test_public_migration_stops_cutover_when_source_changed(tmp_path: Path) -> N
     assert batch_state["events"][-1]["status"] == "failed"
 
 
+def test_unknown_legacy_domains_are_reported_and_preserved_opaque(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "workspace")
+    legacy = legacy_pilot(tmp_path / "legacy")
+    thread_path = legacy / "thread.json"
+    thread = json.loads(thread_path.read_text(encoding="utf-8"))
+    thread["custom_learning_state"] = {"vendor": "old", "value": 7}
+    thread["questions"][0]["private_annotation"] = "must survive"
+    thread["cards"] = [{"id": "old-card", "answer": "旧答案"}]
+    thread["reviews"] = [{"card_id": "old-card", "result": "again"}]
+    thread["practices"] = [{"question_id": "q001", "code": "print('kept')"}]
+    thread["operation_receipts"] = [{"operation_id": "old-op", "status": "uncertain"}]
+    thread_path.write_text(json.dumps(thread, ensure_ascii=False), encoding="utf-8")
+    common = ("--batch", "opaque", "--workspace", config, "--json")
+
+    code, planned = cli("migration", "plan", "--legacy-package", legacy / "course",
+                        "--legacy-thread", thread_path, *common)
+    assert code == 0
+    pointers = {item["pointer"] for item in planned["result"]["inventory"]["unknown_legacy_data"]}
+    assert pointers == {
+        "/cards",
+        "/custom_learning_state",
+        "/practices",
+        "/questions/0/private_annotation",
+        "/reviews",
+    }
+    assert all(item["disposition"] == "preserve_opaque"
+               for item in planned["result"]["inventory"]["unknown_legacy_data"])
+    assert planned["result"]["inventory"]["unsupported_domain_extensions"] == [
+        "cards",
+        "reviews",
+        "practices",
+    ]
+    assert cli("migration", "convert", *common)[0] == 0
+    verify_code, verified = cli("migration", "verify", *common)
+    assert verify_code == 0, json.dumps(verified, ensure_ascii=False, indent=2)
+    assert verified["validation"]["opaque_legacy"] == "passed"
+    assert verified["validation"]["preserved_domains"] == "passed"
+    preserved = config.parent / "local/migration-batches/opaque/converted/opaque-legacy/thread.json"
+    assert preserved.read_bytes() == thread_path.read_bytes()
+
+
 def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Path) -> None:
     config = workspace(tmp_path / "workspace")
     legacy = legacy_pilot(tmp_path / "legacy")
@@ -269,7 +310,8 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     increment.write_text("切换后的新成果", encoding="utf-8")
     receipts = config.parent / "results/operation-receipts"
     receipts.mkdir()
-    (receipts / "publish.json").write_text('{"status":"confirmed"}', encoding="utf-8")
+    (receipts / "publish.json").write_text(
+        json.dumps({"status": "confirmed", "migration_batch": batch}), encoding="utf-8")
     failed_rollback_code, _ = cli(
         "migration", "rollback", *common,
         env={"VIDEO_EXTRACT_MIGRATION_TEST_FAULT": "after_rollback_frozen"},
@@ -283,7 +325,7 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     assert blocked_during_code != 0
     assert "owned by the legacy store" in blocked_during["diagnostics"][0]
     code, rolled_back = cli("migration", "rollback", *common)
-    assert code == 0
+    assert code == 0, json.dumps(rolled_back, ensure_ascii=False, indent=2)
     preserved = Path(rolled_back["result"]["preserved_increment"])
     assert (preserved / "new-after-cutover.md").read_text(encoding="utf-8") == "切换后的新成果"
     assert (preserved / "operation-receipts/publish.json").is_file()
@@ -323,3 +365,47 @@ def test_rollback_reconciles_batch_after_owner_or_mode_publish_crash(tmp_path: P
         assert recovered == 0 and result["result"]["reconciled"] is True
         state = json.loads((config.parent / "local/migration-batches" / batch / "batch.json").read_text())
         assert state["status"] == "rolled_back"
+
+
+def test_failed_rollback_of_one_batch_does_not_block_another_batch(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "workspace")
+    migrated: dict[str, tuple[Path, str]] = {}
+    for batch in ("batch-a", "batch-b"):
+        legacy = legacy_pilot(tmp_path / batch)
+        common = ("--batch", batch, "--workspace", config, "--json")
+        assert cli("migration", "plan", "--legacy-package", legacy / "course",
+                   "--legacy-thread", legacy / "thread.json", *common)[0] == 0
+        assert cli("migration", "convert", *common)[0] == 0
+        assert cli("migration", "verify", *common)[0] == 0
+        authorization = authorize(tmp_path, batch, legacy)
+        assert cli("migration", "cutover", *common, "--authorization", authorization)[0] == 0
+        conversion = json.loads(
+            (config.parent / "local/migration-batches" / batch / "converted/conversion.json").read_text()
+        )
+        migrated[batch] = (legacy, conversion["identity_map"]["q001"])
+
+    failed, _ = cli("migration", "rollback", "--batch", "batch-a", "--workspace", config,
+                    "--json", env={"VIDEO_EXTRACT_MIGRATION_TEST_FAULT": "after_rollback_frozen"})
+    assert failed != 0
+
+    b_question = migrated["batch-b"][1]
+    feedback_code, _ = cli("learning", "feedback", "--question-id", b_question,
+                           "--state", "understood", "--text", "B remains writable",
+                           "--workspace", config, "--json")
+    assert feedback_code == 0
+    receipts = config.parent / "results/operation-receipts"
+    receipts.mkdir(exist_ok=True)
+    (receipts / "batch-b.json").write_text(
+        json.dumps({"status": "completed", "question_id": b_question}), encoding="utf-8")
+
+    rolled, _ = cli("migration", "rollback", "--batch", "batch-a", "--workspace", config, "--json")
+    assert rolled == 0
+    ownership = json.loads((config.parent / "results/migration-ownership.json").read_text())
+    assert ownership["batches"]["batch-a"]["owner"] == "legacy"
+    assert ownership["batches"]["batch-b"]["owner"] == "new"
+    show_code, shown = cli("learning", "thread", "show",
+                           next(iter(ownership["batches"]["batch-b"]["learning_ids"]["threads"])),
+                           "--workspace", config, "--json")
+    assert show_code == 0
+    assert any(item["original_text"] == "B remains writable"
+               for item in shown["result"]["question_states"][b_question]["feedback_history"])

@@ -406,10 +406,12 @@ def test_workspace_doctor_includes_capability_and_is_read_only(tmp_path: Path) -
     workspace = make_workspace(tmp_path)
     agents_root = tmp_path / "isolated-agents"
     codex_root = tmp_path / "isolated-codex"
+    obsidian_plugins_root = tmp_path / "isolated-obsidian-plugins"
 
     code, result = run_cli(
         "workspace", "doctor", "--workspace", str(workspace.config_path),
         "--agents-root", str(agents_root), "--codex-root", str(codex_root),
+        "--obsidian-plugins-root", str(obsidian_plugins_root),
     )
 
     assert code == 1
@@ -418,6 +420,7 @@ def test_workspace_doctor_includes_capability_and_is_read_only(tmp_path: Path) -
     assert result["result"]["installation"]["status"] == "recoverable_failure"
     assert not agents_root.exists()
     assert not codex_root.exists()
+    assert not obsidian_plugins_root.exists()
 
 
 def test_invalid_workspace_is_a_normalized_missing_input_response(tmp_path: Path) -> None:

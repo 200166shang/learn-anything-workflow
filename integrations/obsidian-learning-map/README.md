@@ -1,7 +1,8 @@
 # Video Extract Learning Map plugin
 
-Copy this directory to an isolated Vault's
-`.obsidian/plugins/video-extract-learning-map/`, enable the plugin, and run
+Publish this project-owned directory with
+`video-extract install apply --obsidian-plugins-root VAULT/.obsidian/plugins`,
+enable the plugin, and run
 **打开只读学习导航**. The Vault must be the workspace-v2 `derived` role and
 must already contain a generation published by `video-extract view build`.
 

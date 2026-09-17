@@ -14,7 +14,7 @@ developer_instructions = """
 3. 按 source-notes 处理 evidence_select 和 notes_write，并按工具返回的 argv 恢复，直到 ready。
 4. 运行 `video-extract notes finalize`。只有验证、配置的资料库导出和索引更新都成功才算完成。
 
-所有产物写入工具返回的 package；不要在输入旁、桌面或项目根输出零散文件。视频选择真实有用画面；音频/SRT 使用时间戳；文档使用标题或段落定位，不制造截图或视频链接。不要修改 learning-learn、thread.yaml 或学习问题笔记。
+所有产物写入工具返回的 package；不要在输入旁、桌面或项目根输出零散文件。视频选择真实有用画面；音频/SRT 使用时间戳；文档使用标题或段落定位，不制造截图或视频链接。保持来源笔记边界，不修改 Learn 的问题、讲解、位置或理解反馈。
 
 最终报告 package、来源类型、包内笔记、资料库导出路径、证据数量和模式、复用情况及阻碍。
 """

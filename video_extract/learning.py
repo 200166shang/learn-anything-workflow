@@ -1510,3 +1510,28 @@ def restore_explanation(config: WorkspaceConfig, question_id: str, source_revisi
                     "commit_id": published["commit_id"], "revision": published["revision"]},
                     artifact_refs=[str(object_path)], validation={"learning_record": "passed",
                     "corrections": "passed", "locations": "passed"})
+# Migration supplies stable owned identities; Learn owns the record traversal
+# needed to include later facts linked to those identities.
+def migration_scope(record: dict[str, Any], protected: dict[str, list[str]]) -> dict[str, Any]:
+    module_ids = set(protected.get("modules", []))
+    thread_ids = set(protected.get("threads", []))
+    question_ids = set(protected.get("questions", []))
+    scoped: dict[str, Any] = {}
+    for key, values in record.items():
+        if not isinstance(values, dict):
+            continue
+        selected = {
+            identity: item for identity, item in values.items()
+            if isinstance(item, dict) and (
+                identity in set(protected.get(key, []))
+                or item.get("module_id") in module_ids
+                or item.get("thread_id") in thread_ids
+                or item.get("question_id") in question_ids
+                or item.get("root_question_id") in question_ids
+                or item.get("from_question_id") in question_ids
+                or item.get("to_question_id") in question_ids
+            )
+        }
+        if selected:
+            scoped[key] = selected
+    return scoped
