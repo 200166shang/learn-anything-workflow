@@ -6,9 +6,14 @@ import fcntl
 import hashlib
 import json
 import os
+import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 
 from .command_response import response
 from .manifest import atomic_write_json, read_json
@@ -19,9 +24,22 @@ from .workspace import WorkspaceConfig, WorkspaceError, discover_workspace
 
 CONTRACT_VERSION = 1
 KINDS = ("video", "audio", "subtitles")
+SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas" / "media-acquire-request-v1.schema.json").read_text(encoding="utf-8"))
+LEASE_SECONDS = 30
+
+
+def _validate_request(request: Any) -> dict[str, Any]:
+    try:
+        Draft202012Validator(SCHEMA).validate(request)
+    except ValidationError as exc:
+        location = "/".join(map(str, exc.absolute_path)) or "<root>"
+        raise ValueError(f"media-acquire-request-v1.schema.json validation failed at {location}: {exc.message}") from exc
+    assert isinstance(request, dict)
+    return request
 
 
 def _normalized(request: dict[str, Any]) -> dict[str, Any]:
+    _validate_request(request)
     scope = request.get("scope")
     media = request.get("media")
     if not isinstance(scope, list) or not scope or not all(isinstance(x, str) and x for x in scope):
@@ -53,23 +71,24 @@ def operation_identity(request: dict[str, Any]) -> str:
     return _operation_id(CAPABILITIES["media.acquire"], request)
 
 
-def _root(config: WorkspaceConfig) -> Path:
+def _root(config: WorkspaceConfig, *, create: bool) -> Path:
     if config.local is None:
         raise WorkspaceError("media operations require workspace schema v2")
     root = config.local / "operations"
-    root.mkdir(parents=True, exist_ok=True)
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
     return root
 
 
-def _path(config: WorkspaceConfig, operation_id: str) -> Path:
+def _path(config: WorkspaceConfig, operation_id: str, *, create_root: bool = False) -> Path:
     if not operation_id.startswith("operation-") or not operation_id.removeprefix("operation-").isalnum():
         raise ValueError("invalid operation_id")
-    return _root(config) / f"{operation_id}.json"
+    return _root(config, create=create_root) / f"{operation_id}.json"
 
 
 @contextmanager
 def _lock(config: WorkspaceConfig, operation_id: str):
-    path = _root(config) / f"{operation_id}.lock"
+    path = _root(config, create=True) / f"{operation_id}.lock"
     with path.open("a+") as stream:
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -126,7 +145,8 @@ def _target(config: WorkspaceConfig, operation_id: str, item_id: str) -> Path:
     return config.results / "media" / operation_id / safe
 
 
-def _materialize_item(item: dict[str, Any], kinds: list[str], target: Path, *, language: str, quality: str) -> dict[str, Path]:
+def _materialize_item(item: dict[str, Any], kinds: list[str], target: Path, *, language: str, quality: str,
+                      idempotency_token: str) -> dict[str, Path]:
     from .media_workflow import ensure
     request = MediaRequest(tuple(MediaKind(kind) for kind in kinds), language, quality)
     result = ensure(item["source"], request, target)
@@ -165,7 +185,9 @@ def _sha256(path: Path) -> str:
 def _public(config: WorkspaceConfig, record: dict[str, Any], reuse: str | None = None) -> dict[str, Any]:
     result = {"progress": record.get("progress", {}), "reuse": reuse,
               "source_id": record["request"]["source_id"], "source_version": record["request"]["source_version"]}
-    public_status = "busy" if record["status"] == "running" else record["status"]
+    public_status = record["status"]
+    if public_status == "running":
+        public_status = "busy" if _lease_active(record) else "uncertain"
     return response(status=public_status, workspace=str(config.config_path), operation_id=record["operation_id"],
                     result=result, artifact_refs=_absolute_refs(config, record),
                     validation=record.get("validation", {}), provenance=record.get("provenance", {}),
@@ -173,10 +195,11 @@ def _public(config: WorkspaceConfig, record: dict[str, Any], reuse: str | None =
 
 
 def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str, Any]:
+    _validate_request(request)
     config = discover_workspace(Path(request["workspace"]))
     normalized = _normalized(request)
     operation_id = operation_identity(request)
-    path = _path(config, operation_id)
+    path = _path(config, operation_id, create_root=True)
     with _lock(config, operation_id) as acquired:
         if not acquired:
             record = read_json(path) if path.is_file() else {"operation_id": operation_id, "request": normalized,
@@ -184,8 +207,16 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
             record["status"] = "busy"
             return _public(config, record)
         record = read_json(path) if path.is_file() else None
-        if record and record.get("status") == "running" and not resume:
-            record["status"] = "busy"
+        if record and record.get("status") == "running":
+            if _lease_active(record):
+                record["status"] = "busy"
+                return _public(config, record)
+            record["status"] = "uncertain"
+            record["next_action"] = {"type": "reconcile", "operation_id": operation_id}
+            record["diagnostics"] = ["previous worker lease expired before its adapter result was confirmed"]
+            atomic_write_json(path, record)
+            return _public(config, record)
+        if record and record.get("status") == "uncertain":
             return _public(config, record)
         items, source = _catalog(config, normalized)
         if record is None:
@@ -195,16 +226,26 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
         if record.get("status") == "completed" and not missing_any:
             return _public(config, record, "verified_operation")
         record["status"] = "running"
-        record["lease"] = {"pid": os.getpid()}
+        fencing = int(record.get("lease", {}).get("fencing", 0)) + 1
+        record["lease"] = _new_lease(fencing)
         atomic_write_json(path, record)
         try:
             for item in items:
+                record["lease"] = _new_lease(fencing, owner=record["lease"]["owner"])
+                atomic_write_json(path, record)
                 item_id = str(item["id"])
                 kinds = _missing(config, record, item_id, normalized["media"])
                 if not kinds:
                     continue
+                attempt_token = hashlib.sha256(
+                    f"{operation_id}:{fencing}:{item_id}:{','.join(kinds)}".encode()
+                ).hexdigest()
+                record["current_attempt"] = {"item_id": item_id, "media": kinds,
+                                             "idempotency_token": attempt_token, "fencing": fencing}
+                atomic_write_json(path, record)
                 outputs = _materialize_item(item, kinds, _target(config, operation_id, item_id),
-                                            language=normalized["language"], quality=normalized["quality"])
+                                            language=normalized["language"], quality=normalized["quality"],
+                                            idempotency_token=attempt_token)
                 assert config.results is not None
                 for kind, artifact in outputs.items():
                     key = f"{item_id}:{kind}"
@@ -214,6 +255,7 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
                         "validation": "content_digest_and_size"
                     }
                 record["progress"][item_id] = {"completed": sorted(set(normalized["media"]) - set(_missing(config, record, item_id, normalized["media"]))) }
+                record.setdefault("attempts", []).append({**record.pop("current_attempt"), "result": "verified_local"})
                 atomic_write_json(path, record)
             remaining = {str(item["id"]): _missing(config, record, str(item["id"]), normalized["media"]) for item in items}
             remaining = {key: value for key, value in remaining.items() if value}
@@ -227,9 +269,9 @@ def ensure_request(request: dict[str, Any], *, resume: bool = False) -> dict[str
             atomic_write_json(path, record)
             return _public(config, record)
         except Exception as exc:
-            record["status"] = "recoverable_failure"
+            record["status"] = "uncertain"
             record["diagnostics"] = [str(exc)]
-            record["next_action"] = {"type": "resume", "operation_id": operation_id}
+            record["next_action"] = {"type": "reconcile", "operation_id": operation_id}
             record.pop("lease", None)
             atomic_write_json(path, record)
             return _public(config, record)
@@ -260,11 +302,66 @@ def resume_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, An
     return ensure_request(request, resume=True)
 
 
-def write_test_lease(config: WorkspaceConfig, operation_id: str, request: dict[str, Any]) -> None:
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _new_lease(fencing: int, *, owner: str | None = None) -> dict[str, Any]:
+    now = _now()
+    return {"owner": owner or str(uuid.uuid4()), "pid": os.getpid(), "fencing": fencing,
+            "heartbeat_at": now.isoformat(), "expires_at": (now + timedelta(seconds=LEASE_SECONDS)).isoformat()}
+
+
+def _lease_active(record: dict[str, Any]) -> bool:
+    lease = record.get("lease")
+    if not isinstance(lease, dict) or not all(key in lease for key in ("owner", "fencing", "heartbeat_at", "expires_at")):
+        return False
+    try:
+        return datetime.fromisoformat(lease["expires_at"]) > _now()
+    except (TypeError, ValueError):
+        return False
+
+
+def _check_adapter_result(config: WorkspaceConfig, record: dict[str, Any]) -> dict[str, Any]:
+    """Adapter reconciliation seam. Default is conservative until an adapter supplies evidence."""
+    return {"state": "unknown", "evidence": "adapter exposes no result query"}
+
+
+def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
+    path = _path(config, operation_id)
+    if not path.is_file():
+        return show_operation(config, operation_id)
+    with _lock(config, operation_id) as acquired:
+        if not acquired:
+            record = read_json(path); record["status"] = "busy"; return _public(config, record)
+        record = read_json(path)
+        checked = _check_adapter_result(config, record)
+        state = checked.get("state")
+        record.setdefault("reconciliation", []).append(checked)
+        if state in {"not_submitted", "retry_safe"}:
+            record["status"] = "recoverable_failure"
+            record["next_action"] = {"type": "resume", "operation_id": operation_id}
+            record["diagnostics"] = []
+        elif state == "committed":
+            record["status"] = "recoverable_failure"
+            record["next_action"] = {"type": "reconcile", "operation_id": operation_id,
+                                     "reason": "adapter result must be materialized and verified locally"}
+        else:
+            record["status"] = "uncertain"
+            record["next_action"] = {"type": "reconcile", "operation_id": operation_id}
+        record.pop("lease", None)
+        atomic_write_json(path, record)
+        return _public(config, record)
+
+
+def write_test_lease(config: WorkspaceConfig, operation_id: str, request: dict[str, Any], *, expires_at: str | None = None) -> None:
     """Create the same durable state left by a live worker; used by isolated fake-adapter tests."""
-    atomic_write_json(_path(config, operation_id), {"schema_version": 1, "operation_id": operation_id,
+    lease = _new_lease(1)
+    if expires_at:
+        lease["expires_at"] = expires_at
+    atomic_write_json(_path(config, operation_id, create_root=True), {"schema_version": 1, "operation_id": operation_id,
                       "request": _normalized(request), "status": "running", "artifacts": {}, "artifact_facts": {}, "progress": {},
-                      "lease": {"pid": os.getpid()}})
+                      "lease": lease})
 
 
 def run_media_acquire(request: dict[str, Any]) -> dict[str, Any]:

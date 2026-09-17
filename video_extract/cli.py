@@ -18,7 +18,7 @@ from . import media_workflow
 from .orchestrator import existing_capabilities
 from .playlists import build_playback_views, build_xiaoe_playback_views, verify_playback
 from .validate import validate, validate_goals, validate_media_request
-from .workspace import discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
+from .workspace import WorkspaceError, discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
 
 PROJECT = Path(__file__).resolve().parent.parent
 
@@ -94,9 +94,15 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     if args.request:
-        from .command_response import exit_code
+        from .command_response import exit_code, response
         from .media_operations import plan_request
-        result = plan_request(json.loads(args.request.read_text(encoding="utf-8")))
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = plan_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
         emit(result, args.json); return exit_code(result)
     result = media_workflow.plan(args.source, normalize_media_request(args.media, args.language, args.quality), args.output)
     emit(result, args.json); return 0 if not result.get("blockers") else 1
@@ -104,9 +110,15 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 def cmd_ensure(args: argparse.Namespace) -> int:
     if args.request:
-        from .command_response import exit_code
+        from .command_response import exit_code, response
         from .media_operations import ensure_request
-        result = ensure_request(json.loads(args.request.read_text(encoding="utf-8")))
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = ensure_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
         emit(result, args.json); return exit_code(result)
     workspace = discover_workspace(args.workspace)
     result = media_workflow.ensure(args.source, normalize_media_request(args.media, args.language, args.quality), args.output, workspace.media)
@@ -116,9 +128,14 @@ def cmd_ensure(args: argparse.Namespace) -> int:
 
 def cmd_operation(args: argparse.Namespace) -> int:
     from .command_response import exit_code
-    from .media_operations import resume_operation, show_operation
+    from .media_operations import reconcile_operation, resume_operation, show_operation
     workspace = discover_workspace(args.workspace)
-    result = show_operation(workspace, args.operation_id) if args.operation_action == "show" else resume_operation(workspace, args.operation_id)
+    if args.operation_action == "show":
+        result = show_operation(workspace, args.operation_id)
+    elif args.operation_action == "resume":
+        result = resume_operation(workspace, args.operation_id)
+    else:
+        result = reconcile_operation(workspace, args.operation_id)
     emit(result, args.json); return exit_code(result)
 
 
@@ -490,7 +507,7 @@ def parser() -> argparse.ArgumentParser:
     ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source", nargs="?"); ensuring.add_argument("--request", type=Path, help="versioned scoped media request JSON"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
     operation = commands.add_parser("operation", help="inspect or resume a persistent operation")
     operation_actions = operation.add_subparsers(dest="operation_action", required=True)
-    for action in ("show", "resume"):
+    for action in ("show", "resume", "reconcile"):
         p = operation_actions.add_parser(action); p.add_argument("operation_id"); p.add_argument("--workspace", type=Path, required=True); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_operation)
     source = commands.add_parser("source", help="import local source material into a managed package")
     source_actions = source.add_subparsers(dest="source_action", required=True)
