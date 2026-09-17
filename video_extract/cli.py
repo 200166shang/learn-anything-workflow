@@ -119,6 +119,20 @@ def cmd_notes(args: argparse.Namespace) -> int:
     return 0 if result.get("status") in {"ready", "complete", "awaiting_ai"} else 1
 
 
+def cmd_install(args: argparse.Namespace) -> int:
+    from .installation import apply, inspect, plan
+    agents_root = args.agents_root.expanduser().resolve()
+    codex_root = args.codex_root.expanduser().resolve()
+    if args.install_action == "plan":
+        result = plan(agents_root, codex_root)
+    elif args.install_action == "apply":
+        result = apply(agents_root, codex_root, args.backup_root)
+    else:
+        result = inspect(agents_root, codex_root)
+    emit(result, args.json)
+    return 0 if result.get("ok") else 1
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     if args.platform == "xiaoe":
         forwarded = [args.source, "--output", str(args.output)]
@@ -356,6 +370,15 @@ def parser() -> argparse.ArgumentParser:
     notes_actions = notes.add_subparsers(dest="notes_action", required=True)
     for action in ("prepare", "finalize"):
         p = notes_actions.add_parser(action); p.add_argument("package", type=Path); p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
+    install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
+    install_actions = install.add_subparsers(dest="install_action", required=True)
+    for action in ("plan", "apply", "check"):
+        p = install_actions.add_parser(action)
+        p.add_argument("--agents-root", type=Path, default=Path.home() / ".agents")
+        p.add_argument("--codex-root", type=Path, default=Path.home() / ".codex")
+        if action == "apply": p.add_argument("--backup-root", type=Path)
+        p.add_argument("--json", action="store_true")
+        p.set_defaults(func=cmd_install)
     scan = commands.add_parser("scan", help="scan a homogeneous collection inventory"); scan.add_argument("source"); scan.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); scan.add_argument("--output", type=Path, required=True); scan.add_argument("--visible", action="store_true"); scan.add_argument("--wait-seconds", type=int); scan.add_argument("--json", action="store_true"); scan.set_defaults(func=cmd_scan)
     acquire = commands.add_parser("acquire", help="acquire authorized media for one platform scope"); acquire.add_argument("source", nargs="?", default=""); acquire.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); acquire.add_argument("--urls-file", type=Path); acquire.add_argument("--output", type=Path, required=True); acquire.add_argument("--media", choices=("video", "audio", "both"), default="video"); acquire.add_argument("--quality", type=int); acquire.add_argument("--workers", type=int); acquire.add_argument("--session-dir", type=Path, default=Path("work/browser_session")); acquire.add_argument("--wait-seconds", type=int); acquire.add_argument("--headless", action="store_true"); acquire.add_argument("--cdp-url", help="连接已打开的 Chrome CDP 地址"); acquire.add_argument("--json", action="store_true"); acquire.set_defaults(func=cmd_acquire)
     xiaoe = commands.add_parser("xiaoe", help="persistent, resumable Xiaoe course downloads")

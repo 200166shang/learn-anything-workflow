@@ -64,6 +64,11 @@ brew install uv ffmpeg
 uv sync
 uv run playwright install chromium
 uv tool install --force --editable /path/to/video-extract-core
+video-extract install plan --json
+video-extract install apply --json
+video-extract install check --json
 ~~~
 
-移动工作区后更新 locator，并重新执行 editable 安装与 workspace doctor。不要在 skill 或 agent 中写入项目、Media、资料库或 Python 环境的机器路径。
+`integrations/skills/`、`.codex/agents/` 和 Python 工具都只在本工程维护。`install apply` 在链接宿主入口前备份已有副本；`install check` 报告源码修订、内容指纹、依赖、安装漂移和确切维护位置。不要直接修改链接目标之外的安装副本。
+
+移动工作区后更新 locator，并重新执行 editable 安装、`install check` 与 `workspace doctor`。不要在 skill 或 agent 中写入项目、Media、资料库或 Python 环境的机器路径。

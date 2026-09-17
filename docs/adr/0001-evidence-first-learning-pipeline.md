@@ -6,6 +6,8 @@
 
 稳定 `video-extract` CLI 与权威 validator 构成项目 interface。Collection 的目录/汇总状态与 item 状态分开，schema 1/2 只做非破坏兼容。单一 `video-learning` skill 在此 seam 上编排；acquisition 是按需 reference，不是独立 operational skill。各阶段采用独立并行策略，validated fingerprint 支持恢复与缓存复用。
 
+2026-09-17 clarification: the evidence-first rules, independently rerunnable stages, collection/item distinction, and distinction between `model_only` and `human` review remain accepted. The single-Skill boundary and permanent old-Schema compatibility are replaced by the approved learning-system specification and are not restored by this ADR.
+
 ## Considered options
 
 - 一次性把整段转写交给 AI：实现简单，但证据绑定、失败重跑和截图确认都不可控。

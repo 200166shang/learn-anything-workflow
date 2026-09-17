@@ -11,6 +11,9 @@ dependencies = [
     "pillow>=10.0",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -45,6 +48,8 @@ include = [
 "schemas/manifest-v3.schema.json" = "schemas/manifest-v3.schema.json"
 "schemas/manifest-v4.schema.json" = "schemas/manifest-v4.schema.json"
 "schemas/manifest-v5.schema.json" = "schemas/manifest-v5.schema.json"
+"integrations/skills" = "integrations/skills"
+".codex/agents" = ".codex/agents"
 
 [project.scripts]
 video-extract = "video_extract.cli:main"
