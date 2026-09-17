@@ -12,8 +12,9 @@ class LearningMapView extends ItemView {
     const statusPath = `learning-views/status/${pointer.module_id}.json`;
     let syncState = "unsynced";
     try { syncState = JSON.parse(await this.app.vault.adapter.read(statusPath)).sync_state; } catch (_) {}
+    const publication = syncState === "current" ? "已发布（是否最新请以 view status 核对）" : "未同步";
     content.createEl("p", { cls: `video-extract-learning-map-status ${syncState}`,
-      text: `同步状态：${syncState === "current" ? "已同步" : "未同步"} · 视图代：${pointer.generation_id} · 学习修订：${pointer.learning_commit_id}` });
+      text: `视图状态：${publication} · 视图代：${pointer.generation_id} · 学习修订：${pointer.learning_commit_id}` });
     const graphPath = `learning-views/generations/${pointer.generation_id}/局部问题图.html`;
     const frame = content.createEl("iframe", { cls: "video-extract-learning-map-frame" });
     frame.setAttr("sandbox", "allow-scripts allow-same-origin");

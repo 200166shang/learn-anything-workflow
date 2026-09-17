@@ -59,7 +59,8 @@ def _latest_feedback(record: dict[str, Any], question_id: str) -> str | None:
     return max(values, key=lambda item: item["created_at"])["state"] if values else None
 
 
-def _document(config: WorkspaceConfig, refs: list[dict[str, Any]], target: Path) -> dict[str, Any]:
+def _document(config: WorkspaceConfig, refs: list[dict[str, Any]], target: Path,
+              generation_id: str, learning_commit_id: str) -> dict[str, Any]:
     ref = refs[0]
     if any(item["logical_path"] != ref["logical_path"] or item["object_sha256"] != ref["object_sha256"]
            for item in refs):
@@ -68,7 +69,8 @@ def _document(config: WorkspaceConfig, refs: list[dict[str, Any]], target: Path)
     if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != ref["object_sha256"]:
         raise WorkspaceError(f"explanation object missing or corrupt: {ref['object_sha256']}")
     text = source.read_text(encoding="utf-8")
-    rendered = text
+    rendered = (f"> 视图代：`{generation_id}` · 学习修订：`{learning_commit_id}`\n\n"
+                f"{text}")
     for section_id in dict.fromkeys(item["section_id"] for item in refs):
         marker = f"<!-- section-id: {section_id} -->"
         if marker not in rendered:
@@ -89,6 +91,24 @@ def _render_html(module: dict[str, Any], thread: dict[str, Any] | None,
     parked_links = " · ".join(
         f'<a href="#{html.escape(node["question_id"])}">{html.escape(node["title"])}</a>'
         for node in parked) or "无"
+    node_ids = list(nodes)
+    depths = {question_id: 0 for question_id in node_ids}
+    for _ in node_ids:
+        changed = False
+        for edge in edges:
+            if edge["cross_root"]:
+                continue
+            proposed = depths[edge["from_question_id"]] + 1
+            if proposed > depths[edge["to_question_id"]]:
+                depths[edge["to_question_id"]] = proposed; changed = True
+        if not changed:
+            break
+    rows: dict[int, int] = {}
+    positions: dict[str, tuple[int, int]] = {}
+    for question_id in node_ids:
+        depth = depths[question_id]
+        row = rows.get(depth, 0); rows[depth] = row + 1
+        positions[question_id] = (30 + depth * 270, 30 + row * 120)
     cards = []
     for node in nodes.values():
         classes = "node current" if node["is_current"] else "node"
@@ -96,22 +116,29 @@ def _render_html(module: dict[str, Any], thread: dict[str, Any] | None,
         content = {"available": "完整讲解", "pending": "待讲解", "broken": "定位待修复"}[node["content_state"]]
         link = (f'<a href="{html.escape(node["href"])}">{html.escape(node["title"])}</a>'
                 if node.get("href") else f'<span>{html.escape(node["title"])}</span>')
-        boundary = " · 跨根引用" if node.get("cross_root") else ""
-        cards.append(f'<article id="{html.escape(node["question_id"])}" class="{classes}" data-question="{html.escape(node["question_id"])}">{link}'
-                     f'<small>{state} · {content}{boundary}</small></article>')
+        boundary = (f' · 跨根引用：{html.escape(node["source_root_title"])}'
+                    if node.get("cross_root") else "")
+        x, y = positions[node["question_id"]]
+        cards.append(f'<foreignObject x="{x}" y="{y}" width="230" height="92">'
+                     f'<article xmlns="http://www.w3.org/1999/xhtml" id="{html.escape(node["question_id"])}" class="{classes}" data-question="{html.escape(node["question_id"])}">{link}'
+                     f'<small>{state} · {content}{boundary}</small></article></foreignObject>')
     edge_lines = []
-    for index, edge in enumerate(edges):
-        y = 24 + index * 34
+    for edge in edges:
+        from_x, from_y = positions[edge["from_question_id"]]
+        to_x, to_y = positions[edge["to_question_id"]]
         dash = ' stroke-dasharray="8 6"' if edge["cross_root"] else ""
-        label = (f'{nodes[edge["from_question_id"]]["title"]} → '
-                 f'{nodes[edge["to_question_id"]]["title"]}')
-        edge_lines.append(f'<g class="edge {edge["kind"]}"><line x1="16" y1="{y}" x2="72" y2="{y}"{dash}/>'
-                          f'<text x="84" y="{y + 5}">{html.escape(label)}</text></g>')
-    svg_height = max(58, 42 + len(edges) * 34)
+        label = (f'引用·{nodes[edge["to_question_id"]].get("source_root_title") or "跨根"}'
+                 if edge["cross_root"] else edge["kind"])
+        middle_x = (from_x + 230 + to_x) // 2
+        middle_y = (from_y + to_y) // 2 + 40
+        edge_lines.append(f'<g class="edge {edge["kind"]}"><line x1="{from_x + 230}" y1="{from_y + 46}" '
+                          f'x2="{to_x}" y2="{to_y + 46}"{dash}/><text x="{middle_x}" y="{middle_y}">{html.escape(label)}</text></g>')
+    svg_width = max(320, max((x for x, _ in positions.values()), default=30) + 270)
+    svg_height = max(150, max((y for _, y in positions.values()), default=30) + 130)
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>{html.escape(module["goal"])} · 局部问题图</title><style>
-:root{{--bg:#f7f8fa;--paper:#fff;--ink:#20242b;--muted:#697386;--blue:#3485ff;--line:#cbd3df}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif}}header{{padding:20px 24px 12px}}h1{{margin:0 0 8px;font-size:22px}}.route,.generation{{color:var(--muted)}}.parked{{margin-top:6px}}.graph{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px;padding:20px 24px}}.node{{border:1px solid var(--line);border-radius:14px;background:var(--paper);padding:16px;box-shadow:0 4px 18px #172b4d12;scroll-margin-top:16px}}.node.current{{outline:3px solid #3485ff55;border-color:var(--blue)}}a{{color:var(--ink);font-weight:700;text-decoration:none}}small{{display:block;color:var(--muted);margin-top:8px}}.relations,.legend{{display:block;width:calc(100% - 48px);margin:0 24px 20px;padding:14px;background:var(--paper);border-radius:12px}}.relations line{{stroke:#60718a;stroke-width:3}}.relations .reference line{{stroke:#a25ad6}}.relations text{{fill:var(--ink);font-size:13px}}@media(max-width:520px){{header,.graph{{padding-left:12px;padding-right:12px}}.relations,.legend{{width:calc(100% - 24px);margin-left:12px;margin-right:12px}}}}
-</style></head><body><header><h1>{html.escape(module["goal"])} · 局部问题图</h1><div>续学位置：<strong>{html.escape(current["title"] if current else "尚未开始")}</strong> · {"暂放" if current and current["feedback"] == "parked" else "进行中"}</div><div class="route">本次返回路线：{html.escape(route or "当前线程")}</div><div class="parked">暂放入口：{parked_links}</div><div class="generation">视图代：{generation_id} · 学习修订：{learning_commit_id}</div></header><main class="graph">{''.join(cards)}</main><svg class="relations" viewBox="0 0 900 {svg_height}" role="img" aria-label="实际追问与跨根引用关系">{''.join(edge_lines)}</svg><p class="legend">实线：实际追问 · 虚线：跨根引用 · 点击仅查看，不改学习状态 · 跨根引用保持边界</p></body></html>'''
+:root{{--bg:#f7f8fa;--paper:#fff;--ink:#20242b;--muted:#697386;--blue:#3485ff;--line:#cbd3df}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif}}header{{padding:20px 24px 12px}}h1{{margin:0 0 8px;font-size:22px}}.route,.generation{{color:var(--muted)}}.parked{{margin-top:6px}}.graph-scroll{{overflow:auto;padding:8px 24px 20px}}.node{{height:88px;border:1px solid var(--line);border-radius:14px;background:var(--paper);padding:14px;box-shadow:0 4px 18px #172b4d12;scroll-margin-top:16px}}.node.current{{outline:3px solid #3485ff55;border-color:var(--blue)}}a{{color:var(--ink);font-weight:700;text-decoration:none}}small{{display:block;color:var(--muted);margin-top:8px}}.relations{{display:block;background:var(--paper);border-radius:12px;min-width:100%}}.relations line{{stroke:#60718a;stroke-width:3}}.relations .reference line{{stroke:#a25ad6}}.relations text{{fill:var(--ink);font-size:12px}}.legend{{margin:0 24px 20px;padding:14px 20px;background:var(--paper);border-radius:12px}}@media(max-width:520px){{header,.graph-scroll{{padding-left:12px;padding-right:12px}}.legend{{margin-left:12px;margin-right:12px}}}}
+</style></head><body><header><h1>{html.escape(module["goal"])} · 局部问题图</h1><div>续学位置：<strong>{html.escape(current["title"] if current else "尚未开始")}</strong> · {"暂放" if current and current["feedback"] == "parked" else "进行中"}</div><div class="route">本次返回路线：{html.escape(route or "当前线程")}</div><div class="parked">暂放入口：{parked_links}</div><div class="generation">视图代：{generation_id} · 学习修订：{learning_commit_id}</div></header><main class="graph-scroll"><svg class="relations" width="{svg_width}" height="{svg_height}" viewBox="0 0 {svg_width} {svg_height}" role="img" aria-label="实际追问与跨根引用关系">{''.join(edge_lines)}{''.join(cards)}</svg></main><p class="legend">实线：实际追问 · 虚线：跨根引用 · 点击仅查看，不改学习状态 · 跨根引用保持边界</p></body></html>'''
 
 
 def _validated_manifest(generation: Path, module_id: str) -> dict[str, Any] | None:
@@ -133,12 +160,6 @@ def _validated_manifest(generation: Path, module_id: str) -> dict[str, Any] | No
         return manifest
     except (OSError, KeyError, TypeError, ValueError, ValidationError):
         return None
-
-
-def _generation_valid(generation: Path, module_id: str) -> bool:
-    return _validated_manifest(generation, module_id) is not None
-
-
 def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
     root, generations, current_root, status_root = _roots(config)
     snapshot = load_learning(config); record = snapshot["record"]
@@ -178,7 +199,8 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
         projected: dict[str, dict[str, Any] | None] = {}
         for filename, refs in grouped_refs.items():
             try:
-                projected[filename] = _document(config, refs, docs / filename)
+                projected[filename] = _document(config, refs, docs / filename, generation_id,
+                                                 snapshot["commit_id"])
             except WorkspaceError:
                 projected[filename] = None
         for question_id, question in visible.items():
@@ -199,6 +221,8 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
                                   "content_state": content_state, "href": href,
                                   "is_current": bool(thread and question_id == thread["current_question_id"]),
                                   "cross_root": question_id not in owned,
+                                  "source_root_title": (record["questions"][record["threads"][question["thread_id"]]["root_question_id"]]["title"]
+                                                        if question_id not in owned else None),
                                   "unresolved_confusions": question["unresolved_confusions"]}
         edges = [{"from_question_id": item["from_question_id"], "to_question_id": item["to_question_id"],
                   "kind": item["type"], "cross_root": item["type"] == "reference"}
@@ -218,7 +242,7 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
         destination = generations / generation_id
         if destination.exists():
             shutil.rmtree(temp)
-            if not _generation_valid(destination, module_id):
+            if _validated_manifest(destination, module_id) is None:
                 raise WorkspaceError("existing immutable view generation was modified or corrupted; preserving it for inspection")
         else:
             os.replace(temp, destination)
@@ -249,7 +273,7 @@ def status_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
     _, generations, current_root, status_root = _roots(config)
     snapshot = load_learning(config); pointer = current_root / f"{module_id}.json"
     served = read_json(pointer) if pointer.is_file() else None
-    generation_ok = bool(served and _generation_valid(generations / served["generation_id"], module_id))
+    generation_ok = bool(served and _validated_manifest(generations / served["generation_id"], module_id) is not None)
     sync = "current" if generation_ok and served["learning_commit_id"] == snapshot["commit_id"] else "unsynced"
     attempt = read_json(status_root / f"{module_id}.json") if (status_root / f"{module_id}.json").is_file() else None
     return response(status="completed", workspace=str(config.config_path), result={
