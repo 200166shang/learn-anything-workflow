@@ -22,7 +22,7 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 
 SCHEMA_ROOT = Path(__file__).resolve().parent.parent / "schemas"
 _SCHEMAS = {name: json.loads((SCHEMA_ROOT / name).read_text(encoding="utf-8")) for name in (
-    "learning-record-v2.schema.json", "learning-snapshot-v2.schema.json"
+    "learning-record-v2.schema.json", "learning-snapshot-v2.schema.json", "learning-candidate-v2.schema.json"
 )}
 _REGISTRY = Registry().with_resources((value["$id"], Resource.from_contents(value)) for value in _SCHEMAS.values())
 
@@ -150,6 +150,16 @@ def _deep_validate(value: dict[str, Any]) -> None:
             for question_id, section_ids in revision["section_map"].items():
                 if question_id not in questions or questions[question_id]["thread_id"] != root["thread_id"] or not section_ids:
                     raise WorkspaceError(f"explanation section map crosses thread ownership: {question_id}")
+            if "affected_question_ids" in revision and set(revision["affected_question_ids"]) != set(revision["section_map"]):
+                raise WorkspaceError(f"explanation affected questions do not match its section map: {explanation_id}/{revision_key}")
+        correction_ids: set[str] = set()
+        for correction in explanation.get("confirmed_corrections", []):
+            correction_id = correction["correction_id"]
+            introduced = explanation["revisions"].get(str(correction["introduced_revision"]))
+            if correction_id in correction_ids or introduced is None \
+                    or correction_id not in introduced.get("introduced_correction_ids", []):
+                raise WorkspaceError(f"confirmed correction history is invalid: {explanation_id}/{correction_id}")
+            correction_ids.add(correction_id)
     for question_id, question in questions.items():
         for ref in question["explanation_refs"]:
             explanation = explanations.get(ref["explanation_id"])
@@ -158,6 +168,30 @@ def _deep_validate(value: dict[str, Any]) -> None:
                     or ref["object_sha256"] != revision["object_sha256"] \
                     or ref["logical_path"] != revision["logical_path"]:
                 raise WorkspaceError(f"question explanation locator is invalid: {question_id}")
+
+
+def _validate_candidate_store(config: WorkspaceConfig) -> list[Path]:
+    candidates = _roots(config)[3]
+    if not candidates.exists():
+        return []
+    validated: list[Path] = []
+    for path in sorted(candidates.glob("candidate-*.json")):
+        if path.is_symlink():
+            raise WorkspaceError(f"learning candidate must not be a symbolic link: {path}")
+        candidate = read_json(path); _validate("learning-candidate-v2.schema.json", candidate)
+        if candidate.get("proposal_format") == "immutable-v1":
+            proposal_digest = hashlib.sha256(json.dumps(candidate["proposal"], ensure_ascii=False,
+                                                        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if candidate["proposal_sha256"] != proposal_digest:
+                raise WorkspaceError(f"learning candidate proposal is corrupt: {path}")
+            object_ref = candidate["proposal"]["draft_object"]
+            object_path = _object_path(config, object_ref["sha256"])
+            if (not object_path.is_file() or object_path.stat().st_size != object_ref["size"]
+                    or hashlib.sha256(object_path.read_bytes()).hexdigest() != object_ref["sha256"]
+                    or object_ref["logical_path"] != _logical_object_path(object_ref["sha256"])):
+                raise WorkspaceError(f"learning candidate draft object is missing or corrupt: {path}")
+        validated.append(path)
+    return validated
 
 
 def _load(config: WorkspaceConfig) -> dict[str, Any]:
@@ -175,6 +209,7 @@ def _load(config: WorkspaceConfig) -> dict[str, Any]:
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest or path.stat().st_size != item["size"]:
             raise WorkspaceError(f"learning snapshot object is missing or corrupt: {digest}")
     _deep_validate(value)
+    _validate_candidate_store(config)
     return value
 
 
@@ -227,9 +262,15 @@ def _revision_conflict(config: WorkspaceConfig, snapshot: dict[str, Any], expect
             raise OSError("injected candidate parent directory sync failure")
         _sync_directory(candidates.parent)
     path = candidates / f"candidate-{uuid.uuid4()}.json"
-    atomic_write_json(path, {"schema_version": 2, "operation": operation,
-                             "expected_revision": expected, "observed_revision": snapshot["revision"],
-                             "proposal": proposal})
+    candidate = {"schema_version": 2, "operation": operation,
+                 "expected_revision": expected, "observed_revision": snapshot["revision"],
+                 "proposal": proposal}
+    if operation == "explanation.commit" and "draft_object" in proposal:
+        candidate["proposal_format"] = "immutable-v1"
+        candidate["proposal_sha256"] = hashlib.sha256(json.dumps(
+            proposal, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    _validate("learning-candidate-v2.schema.json", candidate)
+    atomic_write_json(path, candidate)
     try:
         if os.environ.get("VIDEO_EXTRACT_LEARNING_TEST_FAULT") in {"candidate_sync", "candidate_cleanup_sync"}:
             raise OSError("injected candidate directory sync failure")
@@ -275,9 +316,16 @@ def reconcile(config: WorkspaceConfig, commit_id: str) -> dict[str, Any]:
 def backup_entries(config: WorkspaceConfig) -> dict[str, Any]:
     """Return the complete pinned learning generation for a future unified backup."""
     snapshot = _load(config); objects, commits, pointer, _ = _roots(config)
+    candidate_paths = _validate_candidate_store(config); candidate_objects: set[str] = set()
+    for path in candidate_paths:
+        candidate = read_json(path)
+        if candidate.get("proposal_format") == "immutable-v1":
+            candidate_objects.add(candidate["proposal"]["draft_object"]["sha256"])
+    object_digests = set(snapshot["objects"]) | candidate_objects
     return {"store": "learning-snapshot-v2", "commit_id": snapshot["commit_id"],
             "entries": [str(pointer), str(commits / f'{snapshot["commit_id"]}.json'),
-                        *[str(objects / digest[:2] / digest) for digest in sorted(snapshot["objects"])]]}
+                        *[str(objects / digest[:2] / digest) for digest in sorted(object_digests)],
+                        *map(str, candidate_paths)]}
 
 
 def _source_context(config: WorkspaceConfig, source_refs: list[dict[str, str]], *,
@@ -845,33 +893,149 @@ def _quality_errors(text: str, profile: str, review: dict[str, Any]) -> list[str
     return errors
 
 
+def _store_learning_object(config: WorkspaceConfig, body: bytes) -> tuple[str, Path]:
+    digest = hashlib.sha256(body).hexdigest(); path = _object_path(config, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        with path.open("xb") as stream:
+            stream.write(body); stream.flush(); os.fsync(stream.fileno())
+    _sync_directory(path.parent); _sync_directory(_roots(config)[0])
+    return digest, path
+
+
+_CORRECTION_BLOCK = re.compile(
+    r"<!-- correction-id: (correction-[0-9a-f-]{36}) -->\n(.*?)\n<!-- /correction-id: \1 -->",
+    re.DOTALL,
+)
+_ANY_CORRECTION_COMMENT = re.compile(r"<!--(?:(?!-->).)*correction-id(?:(?!-->).)*-->", re.DOTALL)
+_CANONICAL_CORRECTION_MARKER = re.compile(
+    r"<!-- (?P<closing>/?)correction-id: (?P<id>correction-[0-9a-f-]{36}) -->"
+)
+
+
+def _correction_block(correction: dict[str, Any]) -> str:
+    return (f"<!-- correction-id: {correction['correction_id']} -->\n"
+            f"纠正说法：{correction['corrected_claim']}\n"
+            f"适用边界：{correction['applicability']}\n"
+            f"<!-- /correction-id: {correction['correction_id']} -->")
+
+
+def _independent_claims(text: str) -> set[str]:
+    without_blocks = _CORRECTION_BLOCK.sub("", text)
+    explicit = re.findall(r"<!--\s*claim:\s*(.*?)\s*-->", without_blocks)
+    sentences = re.split(r"\n\s*\n|(?<=[。！？!?])\s*", without_blocks)
+    normalized = {re.sub(r"^(?:#+|[-*>])\s*", "", item.strip()).rstrip("。！？!?")
+                  for item in [*explicit, *sentences] if item.strip()}
+    return normalized
+
+
+def _replace_independent_claim(text: str, original: str, corrected: str) -> str:
+    paragraph = re.compile(rf"(?m)^(\s*){re.escape(original.rstrip('。！？!?'))}[。！？!?]?\s*$")
+    text = paragraph.sub(lambda match: f"{match.group(1)}{corrected}", text)
+    claim_marker = re.compile(rf"<!--\s*claim:\s*{re.escape(original)}\s*-->")
+    return claim_marker.sub(f"<!-- claim: {corrected} -->", text)
+
+
+def _confirmed_correction_errors(text: str, corrections: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    known = {correction["correction_id"]: correction for correction in corrections}
+    blocks: dict[str, list[str]] = {}
+    active: tuple[str, int] | None = None
+    for discovered in _ANY_CORRECTION_COMMENT.finditer(text):
+        marker = _CANONICAL_CORRECTION_MARKER.fullmatch(discovered.group())
+        at_column_zero = discovered.start() == 0 or text[discovered.start() - 1] == "\n"
+        ends_line = discovered.end() == len(text) or text[discovered.end()] == "\n"
+        if marker is None or not at_column_zero or not ends_line:
+            errors.append(f"noncanonical correction marker: {discovered.group()}")
+            continue
+        correction_id = marker.group("id"); closing = bool(marker.group("closing"))
+        if correction_id not in known:
+            errors.append(f"unknown correction marker: {correction_id}")
+        if not closing:
+            if active is not None:
+                errors.append(f"correction opening marker is nested or duplicated: {correction_id}")
+            else:
+                active = (correction_id, discovered.start())
+        elif active is None:
+            errors.append(f"orphan correction closing marker: {correction_id}")
+        elif active[0] != correction_id:
+            errors.append(f"mismatched correction closing marker: {active[0]} != {correction_id}")
+            active = None
+        else:
+            blocks.setdefault(correction_id, []).append(text[active[1]:discovered.end()])
+            active = None
+    if active is not None:
+        errors.append(f"unclosed correction opening marker: {active[0]}")
+    independent_claims = _independent_claims(text)
+    for correction in corrections:
+        correction_blocks = blocks.get(correction["correction_id"], [])
+        if len(correction_blocks) != 1:
+            errors.append(f"confirmed correction block must occur exactly once: {correction['correction_id']}")
+        elif correction_blocks[0] != _correction_block(correction):
+            errors.append(f"confirmed correction block is not canonical: {correction['correction_id']}")
+        if correction["original_claim"].rstrip("。！？!?") in independent_claims:
+            errors.append(f"confirmed correction would reintroduce original claim: {correction['correction_id']}")
+    return errors
+
+
 def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, evidence_path: Path,
                        review_path: Path, profile: str, preparation_id: str,
-                       expected_revision: int | None = None) -> dict[str, Any]:
-    text = draft.read_text(encoding="utf-8")
-    evidence = json.loads(evidence_path.read_text(encoding="utf-8")); review = json.loads(review_path.read_text(encoding="utf-8"))
+                       expected_revision: int | None = None, section_map_path: Path | None = None,
+                       revision_metadata_path: Path | None = None,
+                       corrections_path: Path | None = None,
+                       replay_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if replay_payload is None:
+        text = draft.read_bytes().decode("utf-8")
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8")); review = json.loads(review_path.read_text(encoding="utf-8"))
+        requested_section_map = json.loads(section_map_path.read_text(encoding="utf-8")) if section_map_path else None
+        metadata = json.loads(revision_metadata_path.read_text(encoding="utf-8")) if revision_metadata_path else None
+        requested_corrections = json.loads(corrections_path.read_text(encoding="utf-8")) if corrections_path else []
+    else:
+        text = replay_payload["text"]; evidence = replay_payload["evidence_refs"]
+        review = replay_payload["teaching_review"]; requested_section_map = replay_payload["section_map"]
+        metadata = {"summary": replay_payload["change_summary"],
+                    "affected_question_ids": replay_payload["affected_question_ids"]}
+        requested_corrections = replay_payload["corrections"]
     if profile not in PROFILES or not isinstance(evidence, list) or not evidence:
         return response(status="failed", workspace=str(config.config_path), diagnostics=["profile and at least one evidence reference are required"])
     markers = re.findall(r"<!--\s*section-id:\s*(section-[0-9a-f-]{36})\s*-->", text)
-    errors = [] if len(markers) == 1 else ["draft must contain exactly one stable section-id marker"]
+    errors = [] if markers and len(markers) == len(set(markers)) else ["draft must contain unique stable section-id markers"]
     errors.extend(_quality_errors(text, profile, review if isinstance(review, dict) else {}))
     if errors:
         return response(status="failed", workspace=str(config.config_path), validation={"teaching_quality": "failed"}, diagnostics=errors)
     body = text.encode(); digest = hashlib.sha256(body).hexdigest()
     with package_lock(_roots(config)[2].parent):
         snapshot = _load(config); record = snapshot["record"]; question = record["questions"].get(question_id)
-        if expected_revision is not None:
-            conflict = _revision_conflict(config, snapshot, expected_revision, "explanation.commit", {"question_id": question_id, "draft": str(draft)})
-            if conflict: return conflict
         if question is None:
             return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
         thread = record["threads"][question["thread_id"]]; module = record["modules"][thread["module_id"]]
+        root_id = thread["root_question_id"]
+        existing = next((item for item in record["explanations"].values() if item["root_question_id"] == root_id), None)
+        candidate_section_map = requested_section_map or {question_id: markers}
+        candidate_revision_kind = ("correction" if requested_corrections else "refactor"
+                                   if requested_section_map is not None else "initial" if not existing else "revision")
+        candidate_summary = (metadata or {}).get("summary", "Initial explanation" if not existing else "Revised explanation")
+        if expected_revision is not None and expected_revision != snapshot["revision"]:
+            object_digest, object_path = _store_learning_object(config, body)
+            proposal = {"question_id": question_id,
+                        "draft_object": {"sha256": object_digest,
+                                         "logical_path": _logical_object_path(object_digest), "size": len(body)},
+                        "evidence_refs": evidence, "teaching_review": review,
+                        "section_map": candidate_section_map,
+                        "revision_kind": candidate_revision_kind, "change_summary": candidate_summary,
+                        "affected_question_ids": sorted(candidate_section_map),
+                        "corrections": requested_corrections, "profile": profile,
+                        "preparation_id": preparation_id}
+            conflict = _revision_conflict(config, snapshot, expected_revision, "explanation.commit", proposal)
+            if conflict:
+                conflict["artifact_refs"] = [str(object_path)]
+                return conflict
         preparation = record["preparations"].get(preparation_id)
         scope_digest = hashlib.sha256(json.dumps(module["source_refs"], sort_keys=True).encode()).hexdigest()
         if preparation is None or preparation["question_id"] != question_id or preparation["profile"] != profile \
                 or preparation["consumed_at"] is not None or preparation["source_refs"] != module["source_refs"] \
                 or preparation["prepared_revision"] != snapshot["revision"] \
-                or preparation["source_scope_sha256"] != scope_digest or markers != [preparation["section_id"]]:
+                or preparation["source_scope_sha256"] != scope_digest or preparation["section_id"] not in markers:
             return response(status="failed", workspace=str(config.config_path),
                             validation={"preparation": "failed"},
                             diagnostics=["preparation token is missing, stale, consumed, cross-question, or marker-mismatched"])
@@ -910,27 +1074,102 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
         if evidence_errors:
             return response(status="failed", workspace=str(config.config_path),
                             validation={"source_scope": "failed"}, diagnostics=evidence_errors)
-        root_id = thread["root_question_id"]
-        existing = next((item for item in record["explanations"].values() if item["root_question_id"] == root_id), None)
         explanation_id = existing["explanation_id"] if existing else "explanation-" + str(uuid.uuid4())
         revision = existing["current_revision"] + 1 if existing else 1
-        object_root = _roots(config)[0]; object_path = _object_path(config, digest)
-        object_path.parent.mkdir(parents=True, exist_ok=True)
-        if not object_path.exists():
-            with object_path.open("xb") as stream:
-                stream.write(body); stream.flush(); os.fsync(stream.fileno())
-        _sync_directory(object_path.parent); _sync_directory(object_root)
+        section_map = requested_section_map or {question_id: markers}
+        if not isinstance(section_map, dict) or not section_map:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"same_root_scope": "failed"}, diagnostics=["section map must be a non-empty object"])
+        same_root_errors: list[str] = []
+        mapped_markers: set[str] = set()
+        for mapped_question_id, section_ids in section_map.items():
+            mapped_question = record["questions"].get(mapped_question_id)
+            if mapped_question is None or mapped_question["thread_id"] != question["thread_id"]:
+                same_root_errors.append(f"section map question is outside the selected root: {mapped_question_id}")
+            if not isinstance(section_ids, list) or not section_ids:
+                same_root_errors.append(f"section map needs at least one section for {mapped_question_id}")
+            else:
+                mapped_markers.update(section_ids)
+        previous_map = (existing or {}).get("revisions", {}).get(str((existing or {}).get("current_revision")), {}).get("section_map", {})
+        missing_history = set(previous_map) - set(section_map)
+        if missing_history:
+            same_root_errors.append("refactor would remove historical question locations: " + ", ".join(sorted(missing_history)))
+        if mapped_markers != set(markers) or preparation["section_id"] not in mapped_markers:
+            same_root_errors.append("section map must cover every draft marker including the prepared marker")
+        if same_root_errors:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"same_root_scope": "failed"}, diagnostics=same_root_errors)
+        if metadata is not None and (not isinstance(metadata, dict)
+                                     or not str(metadata.get("summary", "")).strip()
+                                     or set(metadata.get("affected_question_ids", [])) != set(section_map)):
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"revision_metadata": "failed"},
+                            diagnostics=["revision metadata must summarize the change and name exactly the affected questions"])
+        if not isinstance(requested_corrections, list):
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"corrections": "failed"}, diagnostics=["corrections must be a list"])
+        confirmed_corrections = list((existing or {}).get("confirmed_corrections", []))
+        correction_regressions = _confirmed_correction_errors(text, confirmed_corrections)
+        if correction_regressions:
+            return response(status="awaiting_user", workspace=str(config.config_path),
+                            validation={"confirmed_corrections": "conflict"},
+                            diagnostics=correction_regressions,
+                            next_action={"type": "user", "reason": "revise the candidate without undoing confirmed corrections"})
+        introduced_correction_ids: list[str] = []
+        for correction in requested_corrections:
+            if (not isinstance(correction, dict) or not str(correction.get("original_claim", "")).strip()
+                    or not str(correction.get("corrected_claim", "")).strip()
+                    or not str(correction.get("applicability", "")).strip()
+                    or not correction.get("evidence_refs") or not correction.get("affected_conclusions")):
+                return response(status="failed", workspace=str(config.config_path),
+                                validation={"corrections": "failed"},
+                                diagnostics=["each correction needs original/corrected claims, applicability, evidence, and affected conclusions"])
+            if any((item.get("source_id"), item.get("source_version")) not in allowed_refs
+                   for item in correction["evidence_refs"] if isinstance(item, dict)):
+                return response(status="failed", workspace=str(config.config_path),
+                                validation={"corrections": "failed"},
+                                diagnostics=["correction evidence is outside the selected root's confirmed source scope"])
+            correction_id = "correction-" + str(uuid.uuid4())
+            confirmed = {"correction_id": correction_id,
+                         "original_claim": correction["original_claim"],
+                         "corrected_claim": correction["corrected_claim"],
+                         "applicability": correction["applicability"],
+                         "evidence_refs": correction["evidence_refs"],
+                         "affected_conclusions": correction["affected_conclusions"],
+                         "confirmed_at": _now(), "introduced_revision": revision}
+            confirmed_corrections.append(confirmed)
+            introduced_correction_ids.append(correction_id)
+            text = text.rstrip() + "\n\n" + _correction_block(confirmed) + "\n"
+        correction_regressions = _confirmed_correction_errors(text, confirmed_corrections)
+        if correction_regressions:
+            return response(status="awaiting_user", workspace=str(config.config_path),
+                            validation={"confirmed_corrections": "conflict"},
+                            diagnostics=correction_regressions,
+                            next_action={"type": "user", "reason": "revise the candidate without undoing confirmed corrections"})
+        body = text.encode(); digest = hashlib.sha256(body).hexdigest()
+        digest, object_path = _store_learning_object(config, body)
         logical_path = _logical_object_path(digest)
+        revision_kind = (replay_payload["revision_kind"] if replay_payload is not None else
+                         "correction" if introduced_correction_ids else "refactor"
+                         if requested_section_map is not None else "initial" if not existing else "revision")
         revision_value = {"revision": revision, "object_sha256": digest, "logical_path": logical_path, "created_at": _now(),
                           "profile": profile, "evidence_refs": evidence, "teaching_review": review,
-                          "section_map": {question_id: markers}, "change_reason": "initial" if not existing else "revised"}
+                          "section_map": section_map, "change_reason": "initial" if not existing else "revised",
+                          "revision_kind": revision_kind,
+                          "change_summary": (metadata or {}).get("summary", "Initial explanation" if not existing else "Revised explanation"),
+                          "affected_question_ids": sorted(section_map),
+                          "introduced_correction_ids": introduced_correction_ids}
         explanation = {"explanation_id": explanation_id, "root_question_id": root_id,
                        "current_revision": revision,
-                       "revisions": {**(existing or {}).get("revisions", {}), str(revision): revision_value}}
-        ref = {"explanation_id": explanation_id, "explanation_revision": revision,
-               "section_id": markers[0], "object_sha256": digest, "logical_path": logical_path}
-        updated_question = {**question, "explanation_refs": [ref]}
-        updated = {**record, "questions": {**record["questions"], question_id: updated_question},
+                       "revisions": {**(existing or {}).get("revisions", {}), str(revision): revision_value},
+                       "confirmed_corrections": confirmed_corrections}
+        updated_questions = dict(record["questions"])
+        for mapped_question_id, section_ids in section_map.items():
+            updated_questions[mapped_question_id] = {**updated_questions[mapped_question_id], "explanation_refs": [
+                {"explanation_id": explanation_id, "explanation_revision": revision,
+                 "section_id": section_id, "object_sha256": digest, "logical_path": logical_path}
+                for section_id in section_ids]}
+        updated = {**record, "questions": updated_questions,
                    "preparations": {**record["preparations"], preparation_id: {**preparation, "consumed_at": _now()}},
                    "explanations": {**record["explanations"], explanation_id: explanation}}
         published = _publish(config, snapshot, updated, {digest: {"kind": "explanation_markdown", "size": len(body)}})
@@ -940,3 +1179,112 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
                     "commit_id": published["commit_id"], "revision": published["revision"]},
                     artifact_refs=[str(object_path)], validation={"learning_record": "passed",
                     "teaching_quality": "passed", "source_versions": "passed"})
+
+
+def replay_explanation_candidate(config: WorkspaceConfig, candidate_path: Path) -> dict[str, Any]:
+    candidate_root = _roots(config)[3].resolve(strict=False)
+    resolved = candidate_path.resolve(strict=True)
+    if resolved.parent != candidate_root or resolved.is_symlink():
+        return response(status="failed", workspace=str(config.config_path),
+                        validation={"candidate": "failed"}, diagnostics=["candidate is outside the workspace candidate store"])
+    candidate = read_json(resolved)
+    _validate("learning-candidate-v2.schema.json", candidate)
+    if candidate["operation"] != "explanation.commit" or candidate.get("proposal_format") != "immutable-v1":
+        return response(status="unsupported", workspace=str(config.config_path),
+                        validation={"candidate": "unsupported"},
+                        diagnostics=["only complete explanation.commit candidates can be replayed"])
+    snapshot = _load(config)
+    if snapshot["revision"] != candidate["observed_revision"]:
+        return response(status="awaiting_user", workspace=str(config.config_path),
+                        validation={"candidate_cas": "conflict"}, result={
+                            "candidate": str(resolved), "observed_revision": snapshot["revision"],
+                            "candidate_observed_revision": candidate["observed_revision"]},
+                        next_action={"type": "user", "reason": "review candidate against newer learning state"})
+    proposal = candidate["proposal"]; object_ref = proposal["draft_object"]
+    object_path = _object_path(config, object_ref["sha256"])
+    if (not object_path.is_file() or object_path.stat().st_size != object_ref["size"]
+            or hashlib.sha256(object_path.read_bytes()).hexdigest() != object_ref["sha256"]
+            or object_ref["logical_path"] != _logical_object_path(object_ref["sha256"])):
+        return response(status="failed", workspace=str(config.config_path),
+                        validation={"candidate": "failed", "draft_object": "failed"},
+                        diagnostics=["candidate draft object is missing, corrupt, or unreachable"])
+    payload = {**proposal, "text": object_path.read_bytes().decode("utf-8")}
+    result = commit_explanation(config, proposal["question_id"], object_path, object_path, object_path,
+                                proposal["profile"], proposal["preparation_id"],
+                                candidate["observed_revision"], replay_payload=payload)
+    if result.get("status") == "completed":
+        result["result"]["candidate_replayed"] = str(resolved)
+    return result
+
+
+def restore_explanation(config: WorkspaceConfig, question_id: str, source_revision: int,
+                        expected_revision: int | None = None) -> dict[str, Any]:
+    with package_lock(_roots(config)[2].parent):
+        snapshot = _load(config); record = snapshot["record"]; question = record["questions"].get(question_id)
+        if expected_revision is not None:
+            conflict = _revision_conflict(config, snapshot, expected_revision, "explanation.restore",
+                                          {"question_id": question_id, "source_revision": source_revision})
+            if conflict: return conflict
+        if question is None:
+            return response(status="missing_input", workspace=str(config.config_path),
+                            diagnostics=[f"unknown question_id: {question_id}"])
+        thread = record["threads"][question["thread_id"]]; root_id = thread["root_question_id"]
+        explanation = next((item for item in record["explanations"].values()
+                            if item["root_question_id"] == root_id), None)
+        source = explanation and explanation["revisions"].get(str(source_revision))
+        if source is None:
+            return response(status="missing_input", workspace=str(config.config_path),
+                            diagnostics=[f"unknown explanation revision for selected root: {source_revision}"])
+        current = explanation["revisions"][str(explanation["current_revision"])]
+        missing_current_questions = set(current["section_map"]) - set(source["section_map"])
+        if missing_current_questions:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"locations": "failed"}, diagnostics=[
+                                "restored expression predates current historical question locations: "
+                                + ", ".join(sorted(missing_current_questions))])
+        text = _object_path(config, source["object_sha256"]).read_bytes().decode("utf-8")
+        text = _CORRECTION_BLOCK.sub("", text).rstrip()
+        corrections = list(explanation.get("confirmed_corrections", []))
+        for correction in corrections:
+            text = _replace_independent_claim(text, correction["original_claim"], correction["corrected_claim"])
+            text += "\n\n" + _correction_block(correction)
+        correction_errors = _confirmed_correction_errors(text, corrections)
+        if correction_errors:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"corrections": "failed"}, diagnostics=correction_errors)
+        markers = set(re.findall(r"<!--\s*section-id:\s*(section-[0-9a-f-]{36})\s*-->", text))
+        required_markers = {section_id for values in source["section_map"].values() for section_id in values}
+        if markers != required_markers:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"locations": "failed"},
+                            diagnostics=["restored expression no longer contains its complete section map"])
+        body = text.encode(); digest = hashlib.sha256(body).hexdigest(); object_path = _object_path(config, digest)
+        object_path.parent.mkdir(parents=True, exist_ok=True)
+        if not object_path.exists():
+            with object_path.open("xb") as stream:
+                stream.write(body); stream.flush(); os.fsync(stream.fileno())
+        _sync_directory(object_path.parent); _sync_directory(_roots(config)[0])
+        revision = explanation["current_revision"] + 1; logical_path = _logical_object_path(digest)
+        revision_value = {**source, "revision": revision, "object_sha256": digest,
+                          "logical_path": logical_path, "created_at": _now(), "change_reason": "revised",
+                          "revision_kind": "restore", "change_summary": f"Restored expression from revision {source_revision}",
+                          "affected_question_ids": sorted(source["section_map"]),
+                          "introduced_correction_ids": [], "restored_from_revision": source_revision}
+        updated_explanation = {**explanation, "current_revision": revision,
+                               "revisions": {**explanation["revisions"], str(revision): revision_value},
+                               "confirmed_corrections": corrections}
+        updated_questions = dict(record["questions"])
+        for mapped_question_id, section_ids in source["section_map"].items():
+            updated_questions[mapped_question_id] = {**updated_questions[mapped_question_id], "explanation_refs": [
+                {"explanation_id": explanation["explanation_id"], "explanation_revision": revision,
+                 "section_id": section_id, "object_sha256": digest, "logical_path": logical_path}
+                for section_id in section_ids]}
+        updated = {**record, "questions": updated_questions,
+                   "explanations": {**record["explanations"], explanation["explanation_id"]: updated_explanation}}
+        published = _publish(config, snapshot, updated, {digest: {"kind": "explanation_markdown", "size": len(body)}})
+    public = {"explanation_id": explanation["explanation_id"], "root_question_id": root_id,
+              **revision_value, "confirmed_corrections": corrections, "document_path": str(object_path)}
+    return response(status="completed", workspace=str(config.config_path), result={"explanation": public,
+                    "commit_id": published["commit_id"], "revision": published["revision"]},
+                    artifact_refs=[str(object_path)], validation={"learning_record": "passed",
+                    "corrections": "passed", "locations": "passed"})
