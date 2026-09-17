@@ -107,7 +107,7 @@ def cmd_ensure(args: argparse.Namespace) -> int:
 def cmd_source(args: argparse.Namespace) -> int:
     from .command_response import exit_code, response
     from .source_import import import_source
-    from .source_registry import register, relocate, verify
+    from .source_registry import reconcile, register, relocate, verify
     from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceError
     workspace = discover_workspace(args.workspace)
     if args.source_action != "import" and workspace.schema_version != PORTABLE_SCHEMA_VERSION:
@@ -123,6 +123,8 @@ def cmd_source(args: argparse.Namespace) -> int:
             result = verify(workspace, args.source_id, args.source_version)
         elif args.source_action == "relocate":
             result = relocate(workspace, args.source_id, args.location, args.expected_revision)
+        elif args.source_action == "reconcile":
+            result = reconcile(workspace, args.source_id, args.source_version)
         elif args.source_action == "import" and workspace.schema_version == PORTABLE_SCHEMA_VERSION:
             result = register(workspace, args.input, args.title, getattr(args, "expected_revision", None))
         else:
@@ -483,6 +485,10 @@ def parser() -> argparse.ArgumentParser:
     source_relocate.add_argument("--expected-revision", type=int, required=True)
     source_relocate.add_argument("--workspace", type=Path); source_relocate.add_argument("--json", action="store_true")
     source_relocate.set_defaults(func=cmd_source)
+    source_reconcile = source_actions.add_parser("reconcile", help="complete durability checks after an uncertain publish")
+    source_reconcile.add_argument("source_id"); source_reconcile.add_argument("--source-version", required=True)
+    source_reconcile.add_argument("--workspace", type=Path); source_reconcile.add_argument("--json", action="store_true")
+    source_reconcile.set_defaults(func=cmd_source)
     notes = commands.add_parser("notes", help="prepare or finalize source-grounded notes")
     notes_actions = notes.add_subparsers(dest="notes_action", required=True)
     for action in ("prepare", "finalize"):

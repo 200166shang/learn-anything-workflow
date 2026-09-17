@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -233,7 +234,7 @@ def test_publish_fault_exposes_only_a_complete_snapshot(tmp_path: Path, fault: s
         assert failed["result"]["revision"] == first["result"]["revision"] + 1
         assert failed["result"]["commit_id"].startswith("commit-")
         assert first["result"]["source_id"] in failed["next_action"]["command"]
-        assert "source verify" in failed["next_action"]["command"]
+        assert "source reconcile" in failed["next_action"]["command"]
 
     _, observed = cli("source", "verify", first["result"]["source_id"],
                       "--workspace", config, "--json")
@@ -269,6 +270,28 @@ def test_doctor_and_verify_reject_nested_schema_corruption(tmp_path: Path) -> No
     assert "snapshot-v1.schema.json" in verified["diagnostics"][0]
 
 
+def test_doctor_rejects_version_object_missing_from_snapshot_objects(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = tmp_path / "fixture.txt"
+    source.write_text("one\n", encoding="utf-8")
+    _, first = cli("source", "register", source, "--workspace", config, "--json")
+    results = config.parent / "results"
+    pointer_path = results / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = results / "commits" / f'{pointer["commit_id"]}.json'
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["objects"][first["result"]["source_version"].removeprefix("source-version-")]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    code, checked = cli("workspace", "doctor", "--workspace", config, "--json")
+
+    assert code == 1
+    assert checked["status"] == "recoverable_failure"
+    assert "not reachable through snapshot.objects" in checked["diagnostics"][0]
+
+
 def test_publish_syncs_object_manifest_and_pointer_directories_in_order(tmp_path: Path) -> None:
     config_path = write_workspace(tmp_path / "workspace")
     source = tmp_path / "fixture.txt"
@@ -295,6 +318,45 @@ def test_directory_sync_failure_is_not_reported_as_success(tmp_path: Path) -> No
 
     assert result["status"] == "recoverable_failure"
     assert "sync failed" in result["diagnostics"][0]
+
+
+def test_pointer_directory_sync_failure_is_visibility_not_durability(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    workspace = WorkspaceConfig.load(config_path)
+    source = tmp_path / "fixture.txt"
+    source.write_text("one\n", encoding="utf-8")
+    first = register(workspace, source)
+    source.write_text("two\n", encoding="utf-8")
+    real_sync = __import__("video_extract.source_registry", fromlist=["_sync_directory"])._sync_directory
+    results_syncs = 0
+
+    def fail_after_pointer(path: Path) -> None:
+        nonlocal results_syncs
+        if Path(path) == workspace.results:
+            results_syncs += 1
+            if results_syncs == 2:
+                raise OSError("pointer directory sync failed")
+        real_sync(path)
+
+    with patch("video_extract.source_registry._sync_directory", side_effect=fail_after_pointer):
+        result = register(workspace, source, expected_revision=first["result"]["revision"])
+
+    assert result["status"] == "recoverable_failure"
+    assert result["result"]["logical_visibility"] == "current"
+    assert result["result"]["durability"] == "unknown"
+    assert result["validation"]["snapshot"] == "uncertain"
+    assert result["validation"]["durability"] == "unknown"
+    assert result["result"].get("published") is not True
+    command = result["next_action"]["command"]
+    assert "source reconcile" in command
+    assert first["result"]["source_id"] in command
+
+    completed = subprocess.run(shlex.split(command), cwd=Path(__file__).parents[1],
+                               capture_output=True, text=True)
+    reconciled = json.loads(completed.stdout)
+    assert completed.returncode == 0
+    assert reconciled["status"] == "completed"
+    assert reconciled["result"]["durability"] == "confirmed"
 
 
 def test_new_source_commands_reject_unconverted_workspace_v1(tmp_path: Path) -> None:

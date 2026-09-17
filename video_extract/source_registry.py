@@ -154,6 +154,8 @@ def _validate_source_packages(snapshot: dict[str, Any]) -> None:
         for version_id, version in package["versions"].items():
             if version["source_version"] != version_id or version["kind"] != package["kind"]:
                 raise WorkspaceError(f"source-package-v6.schema.json version identity/kind mismatch: {version_id}")
+            if version_id != "source-version-" + version["content_sha256"]:
+                raise WorkspaceError(f"source-package-v6.schema.json source version/content definition mismatch: {version_id}")
             if version["version_basis"]["content_sha256"] != version["content_sha256"]:
                 raise WorkspaceError(f"source-package-v6.schema.json version digest mismatch: {version_id}")
             if version["storage"] == "object" and "object_sha256" not in version:
@@ -231,6 +233,7 @@ def _publish(config: WorkspaceConfig, previous: dict[str, Any], sources: dict[st
     manifest["commit_id"] = commit_id
     _validate_schema("snapshot-v1.schema.json", manifest)
     _validate_source_packages(manifest)
+    _validate_snapshot_objects(config, manifest)
     manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n"
     manifest_digest, _ = _write_object(config, manifest_bytes)
     commits.mkdir(parents=True, exist_ok=True)
@@ -331,19 +334,21 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
             if package and package.get("current_version") == source_version:
                 observed = {"workspace_id": config.workspace_id, "source_id": source_id,
                             "source_version": source_version, "revision": current["revision"],
-                            "commit_id": current["commit_id"], "published": True}
+                            "commit_id": current["commit_id"],
+                            "logical_visibility": "current", "durability": "unknown"}
         except (OSError, ValueError, WorkspaceError):
             pass
-        verify_command = (f"video-extract source verify {shlex.quote(source_id)} "
-                          f"--source-version {shlex.quote(source_version)} "
-                          f"--workspace {shlex.quote(str(config.config_path))} --json")
+        reconcile_command = (f"video-extract source reconcile {shlex.quote(source_id)} "
+                             f"--source-version {shlex.quote(source_version)} "
+                             f"--workspace {shlex.quote(str(config.config_path))} --json")
         return response(status="recoverable_failure", workspace=str(config.config_path),
                         operation_id=_operation("source.register", config, source_id, source_version),
                         result=observed or {"workspace_id": config.workspace_id, "source_id": source_id,
-                                           "source_version": source_version, "published": False},
-                        validation={"snapshot": "published" if observed else "uncertain"},
+                                           "source_version": source_version,
+                                           "logical_visibility": "not_current", "durability": "unknown"},
+                        validation={"snapshot": "uncertain", "durability": "unknown"},
                         diagnostics=[str(exc)],
-                        next_action={"type": "reconcile", "command": verify_command,
+                        next_action={"type": "reconcile", "command": reconcile_command,
                                      "source_id": source_id, "source_version": source_version})
 
 
@@ -355,6 +360,54 @@ def _validate_snapshot_objects(config: WorkspaceConfig, snapshot: dict[str, Any]
             raise WorkspaceError(f"snapshot object is missing or corrupt: {digest}")
         if path.stat().st_size != record["size"]:
             raise WorkspaceError(f"snapshot object size record is inconsistent: {digest}")
+    for package in snapshot.get("sources", {}).values():
+        for version_id, version in package["versions"].items():
+            expected_version = "source-version-" + version["content_sha256"]
+            if version_id != expected_version or version["source_version"] != expected_version:
+                raise WorkspaceError(f"source version/content digest definition mismatch: {version_id}")
+            object_digest = version.get("object_sha256")
+            if object_digest and object_digest not in snapshot["objects"]:
+                raise WorkspaceError(
+                    f"source version object is not reachable through snapshot.objects: {version_id}"
+                )
+
+
+def reconcile(config: WorkspaceConfig, source_id: str, source_version: str) -> dict[str, Any]:
+    """Confirm the visible commit and complete its directory durability barriers."""
+    _require_v2(config)
+    snapshot = _load_snapshot(config)
+    package = snapshot["sources"].get(source_id)
+    operation_id = _operation("source.register", config, source_id, source_version)
+    if not package or source_version not in package.get("versions", {}):
+        return response(status="recoverable_failure", workspace=str(config.config_path),
+                        operation_id=operation_id,
+                        result={"source_id": source_id, "source_version": source_version,
+                                "logical_visibility": "not_current", "durability": "unknown"},
+                        validation={"snapshot": "passed", "durability": "not_applicable"},
+                        diagnostics=["the requested source version is not present in the current snapshot"],
+                        next_action={"type": "retry", "reason": "repeat source register with expected_revision"})
+    if package["current_version"] != source_version:
+        return response(status="recoverable_failure", workspace=str(config.config_path),
+                        operation_id=operation_id,
+                        result={"source_id": source_id, "source_version": source_version,
+                                "logical_visibility": "historical", "durability": "unknown"},
+                        validation={"snapshot": "passed", "durability": "not_applicable"},
+                        diagnostics=["the requested source version is not current; no durability claim was made"])
+    _validate_snapshot_objects(config, snapshot)
+    objects, commits, pointer, _ = _store_roots(config)
+    for digest in snapshot["objects"]:
+        _sync_directory(_safe_path(objects.parent, "objects", digest[:2]))
+    if snapshot["objects"]:
+        _sync_directory(objects)
+    _sync_directory(commits)
+    _sync_directory(pointer.parent)
+    return response(status="completed", workspace=str(config.config_path), operation_id=operation_id,
+                    result={"workspace_id": config.workspace_id, "source_id": source_id,
+                            "source_version": source_version, "revision": snapshot["revision"],
+                            "commit_id": snapshot["commit_id"], "logical_visibility": "current",
+                            "durability": "confirmed"},
+                    validation={"snapshot": "passed", "objects": "passed", "durability": "passed"},
+                    provenance={"commit_id": snapshot["commit_id"], "source_version": source_version})
 
 
 def audit(config: WorkspaceConfig) -> dict[str, Any]:
