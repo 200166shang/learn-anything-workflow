@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -10,6 +11,9 @@ from video_extract.learning import (commit_explanation, create_module, create_th
 from video_extract.review import backup_entries, prepare, record, show
 from video_extract.source_registry import register
 from video_extract.workspace import discover_workspace
+from video_extract.workspace import WorkspaceError
+
+import pytest
 
 
 def cli(*args: object) -> tuple[int, dict]:
@@ -61,6 +65,18 @@ def explained_question(tmp_path: Path):
                                    prepared["preparation_id"])
     assert committed["status"] == "completed"
     return config, rooted["thread"]["thread_id"], question_id
+
+
+def rewrite_review_snapshot(config, mutate) -> None:
+    pointer_path = config.results / "review/current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    snapshot_path = config.results / "review/commits" / f'{pointer["commit_id"]}.json'
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    mutate(snapshot)
+    body = json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n"
+    snapshot_path.write_bytes(body)
+    pointer["manifest_sha256"] = hashlib.sha256(body).hexdigest()
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
 
 
 def test_prepare_persists_recall_boundary_without_revealing_answer(tmp_path: Path) -> None:
@@ -136,9 +152,12 @@ def test_review_record_is_independent_idempotent_version_pinned_and_user_correct
     assert show(config, question_id)["result"]["events"] == [event]
     assert Path(first["result"]["reveal"]["document_path"]).is_file()
 
+    prepare(config, question_id, "review-preparation-second")
     backup = backup_entries(config)
-    assert backup["commit_id"] == first["result"]["review_commit_id"]
+    assert backup["commit_id"] == show(config)["result"]["commit_id"]
     assert all(Path(path).is_file() for path in backup["entries"])
+    object_entries = [path for path in backup["entries"] if "/learning/objects/" in path]
+    assert object_entries == [first["result"]["reveal"]["document_path"]]
     assert CAPABILITIES["learning.review"].input_type == "review-request-v1"
 
 
@@ -159,3 +178,54 @@ def test_skipped_review_is_not_scored_and_missing_explanation_creates_no_history
     skipped = record(config2, token, "skip-1", answer=None, answer_summary=None,
                      hints=[], model_evaluation="not_scored")
     assert skipped["result"]["event"]["effective_evaluation"] == "not_scored"
+
+
+def test_review_rejects_pointer_path_traversal(tmp_path: Path) -> None:
+    config, _, question_id = explained_question(tmp_path)
+    prepare(config, question_id)
+    pointer_path = config.results / "review/current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["commit_id"] = "../outside"
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match="pointer"):
+        show(config)
+
+
+def test_review_rejects_noncanonical_or_missing_pinned_object(tmp_path: Path) -> None:
+    config, _, question_id = explained_question(tmp_path)
+    preparation_id = prepare(config, question_id)["result"]["preparation_id"]
+    rewrite_review_snapshot(
+        config,
+        lambda snapshot: snapshot["record"]["preparations"][preparation_id]["pin"].update(
+            logical_path="learning/objects/../../outside"
+        ),
+    )
+
+    with pytest.raises(WorkspaceError, match="validation|pinned explanation path"):
+        show(config)
+
+    config2, _, question_id2 = explained_question(tmp_path / "missing")
+    prepare(config2, question_id2)
+    learning_pointer = json.loads((config2.results / "learning/current.json").read_text(encoding="utf-8"))
+    learning_snapshot = json.loads((config2.results / "learning/commits" /
+                                    f'{learning_pointer["commit_id"]}.json').read_text(encoding="utf-8"))
+    digest = next(iter(learning_snapshot["objects"]))
+    (config2.results / "learning/objects" / digest[:2] / digest).unlink()
+
+    with pytest.raises(WorkspaceError, match="missing or corrupt"):
+        show(config2)
+
+
+def test_review_rejects_orphaned_consumption_link(tmp_path: Path) -> None:
+    config, _, question_id = explained_question(tmp_path)
+    preparation_id = prepare(config, question_id)["result"]["preparation_id"]
+    rewrite_review_snapshot(
+        config,
+        lambda snapshot: snapshot["record"]["preparations"][preparation_id].update(
+            consumed_by="missing-event"
+        ),
+    )
+
+    with pytest.raises(WorkspaceError, match="consumption link"):
+        backup_entries(config)

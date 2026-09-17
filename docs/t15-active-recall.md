@@ -12,7 +12,7 @@ Review uses its own `review-snapshot-v1` authority pointer and immutable generat
 
 `event_id` is idempotent for an identical normalized fact and conflicts if reused for different content. A preparation cannot be scored twice. Skip and no-answer use `not_scored`. Each event retains both the model's suggestion and the user-corrected effective evaluation.
 
-`video_extract.review.backup_entries` first deep-validates the authority pointer, manifest digest, schemas, and preparation/event reachability, then returns the complete current Review generation. Paths inside records are results-root-relative so moving a workspace does not change identity.
+`video_extract.review.backup_entries` first deep-validates the authority pointer, manifest digest, schemas, preparation/event reachability, and pinned explanation objects, then returns the pointer, current Review manifest, and every unique pinned object needed to read that generation. Paths inside records are results-root-relative so moving a workspace does not change identity.
 
 ## Automated evidence
 

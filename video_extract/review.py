@@ -20,7 +20,8 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 
 SCHEMA_ROOT = Path(__file__).resolve().parent.parent / "schemas"
 _SCHEMAS = {name: json.loads((SCHEMA_ROOT / name).read_text(encoding="utf-8")) for name in
-            ("review-record-v1.schema.json", "review-snapshot-v1.schema.json")}
+            ("review-record-v1.schema.json", "review-snapshot-v1.schema.json",
+             "review-current-pointer-v1.schema.json")}
 _REGISTRY = Registry().with_resources((value["$id"], Resource.from_contents(value)) for value in _SCHEMAS.values())
 
 
@@ -57,17 +58,44 @@ def _load(config: WorkspaceConfig) -> dict[str, Any]:
     if not pointer.is_file():
         return _empty()
     selected = read_json(pointer)
+    _validate("review-current-pointer-v1.schema.json", selected)
     path = commits / f'{selected["commit_id"]}.json'
+    if path.resolve(strict=False) != commits.resolve(strict=False) / f'{selected["commit_id"]}.json':
+        raise WorkspaceError("review pointer resolves outside the commit store")
     if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != selected.get("manifest_sha256"):
         raise WorkspaceError("review snapshot manifest is missing or corrupt")
     snapshot = read_json(path)
     _validate("review-snapshot-v1.schema.json", snapshot)
-    for event_id, event in snapshot["record"]["events"].items():
-        preparation = snapshot["record"]["preparations"].get(event["preparation_id"])
+    preparations = snapshot["record"]["preparations"]
+    events = snapshot["record"]["events"]
+    for preparation_id, preparation in preparations.items():
+        if preparation["preparation_id"] != preparation_id:
+            raise WorkspaceError(f"review preparation identity mismatch: {preparation_id}")
+        consumed_by = preparation["consumed_by"]
+        if consumed_by is not None:
+            event = events.get(consumed_by)
+            if event is None or event["preparation_id"] != preparation_id:
+                raise WorkspaceError(f"review preparation has an invalid consumption link: {preparation_id}")
+        _validate_pin(config, preparation["pin"])
+    for event_id, event in events.items():
+        preparation = preparations.get(event["preparation_id"])
         if event["event_id"] != event_id or preparation is None or preparation["consumed_by"] != event_id \
                 or event["pin"] != preparation["pin"]:
             raise WorkspaceError(f"review event is not completely reachable: {event_id}")
     return snapshot
+
+
+def _validate_pin(config: WorkspaceConfig, pin: dict[str, Any]) -> None:
+    digest = pin["object_sha256"]
+    logical_path = f"learning/objects/{digest[:2]}/{digest}"
+    if pin["logical_path"] != logical_path:
+        raise WorkspaceError("review pinned explanation path is not canonical")
+    path = config.results / logical_path
+    expected = config.results.resolve(strict=False) / logical_path
+    if path.is_symlink() or path.resolve(strict=False) != expected:
+        raise WorkspaceError("review pinned explanation path resolves outside the results root")
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise WorkspaceError("review pinned explanation object is missing or corrupt")
 
 
 def _sync(path: Path) -> None:
@@ -241,8 +269,11 @@ def backup_entries(config: WorkspaceConfig) -> dict[str, Any]:
         return {"store": "review-snapshot-v1", "commit_id": None, "entries": []}
     commits, pointer = _roots(config)
     # _load has already checked the authority pointer, manifest digest, schema, and reachability.
+    pins = [item["pin"] for item in snapshot["record"]["preparations"].values()]
+    pinned_objects = sorted({str(config.results / pin["logical_path"]) for pin in pins})
     return {"store": "review-snapshot-v1", "commit_id": snapshot["commit_id"],
-            "entries": [str(pointer), str(commits / f'{snapshot["commit_id"]}.json')]}
+            "entries": [str(pointer), str(commits / f'{snapshot["commit_id"]}.json'),
+                        *pinned_objects]}
 
 
 def run_review(request: dict[str, Any]) -> dict[str, Any]:
