@@ -246,7 +246,7 @@ run_source_notes.__capability_contract__ = {
 
 def run_learning(request: dict[str, Any]) -> dict[str, Any]:
     from .learning import (LearningPublishError, commit_explanation, create_module, create_thread,
-                           locate, prepare_explanation, publish_failure_response, pursue,
+                           locate, prepare_explanation, publish_failure_response, pursue, restore_explanation,
                            recommend_roots, show_module, show_thread)
 
     workspace = discover_workspace(Path(request["workspace"]))
@@ -272,7 +272,13 @@ def run_learning(request: dict[str, Any]) -> dict[str, Any]:
             return commit_explanation(workspace, request["question_id"], Path(request["draft"]),
                                       Path(request["evidence"]), Path(request["teaching_review"]),
                                       request["profile"], request["preparation_id"],
-                                      request.get("expected_revision"))
+                                      request.get("expected_revision"),
+                                      Path(request["section_map"]) if request.get("section_map") else None,
+                                      Path(request["revision_metadata"]) if request.get("revision_metadata") else None,
+                                      Path(request["corrections"]) if request.get("corrections") else None)
+        if action == "explanation.restore":
+            return restore_explanation(workspace, request["question_id"], request["revision"],
+                                       request.get("expected_revision"))
         return {"status": "needs_input", "error": "unsupported learning action"}
     except LearningPublishError as exc:
         return publish_failure_response(workspace, exc)
