@@ -161,16 +161,30 @@ def test_record_keeps_hint_attempt_and_test_facts_without_executing_or_changing_
     assert not (config.parent / "results/learning/current.json").exists()
 
 
-def test_checkpoint_reports_continuously_changing_code_without_false_snapshot(tmp_path: Path) -> None:
+def test_checkpoint_reports_continuously_changing_code_without_false_snapshot(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from video_extract import practice
+    from video_extract.workspace import WorkspaceConfig
     config = write_workspace(tmp_path / "workspace")
     request = prepare_request(tmp_path / "practice.json")
     _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
     practice_id = prepared["result"]["practice"]["practice_id"]
+    original = practice._read_regular
+    reads = 0
 
-    code, result = cli("practice", "checkpoint", "--practice-id", practice_id,
-                       "--expected-revision", 1, "--workspace", config, "--json",
-                       env={"VIDEO_EXTRACT_PRACTICE_TEST_FAULT": "unstable_read"})
-    assert code != 0
+    def changing_read(task_fd: int, relative: str) -> bytes:
+        nonlocal reads
+        body = original(task_fd, relative)
+        reads += 1
+        if reads == 1:
+            task = Path(prepared["result"]["workspace"]) / "task" / relative
+            task.write_bytes(body + b"\n# concurrent edit")
+        return body
+
+    monkeypatch.setattr(practice, "_read_regular", changing_read)
+
+    result = practice.checkpoint(WorkspaceConfig.load(config), practice_id, 1)
+
     assert result["status"] == "recoverable_failure"
     assert result["validation"]["stable_code"] == "failed"
     assert result["result"]["revision"] == 1
@@ -216,17 +230,40 @@ def test_backup_entries_pin_checkpointed_code_and_exclude_editable_workspace(tmp
 
 
 @pytest.mark.parametrize("fault", ["late_file", "remove_file", "type_change", "symlink_swap", "late_after_second"])
-def test_checkpoint_rejects_file_set_and_type_races(tmp_path: Path, fault: str) -> None:
+def test_checkpoint_rejects_file_set_and_type_races(
+        tmp_path: Path, fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from video_extract import practice
+    from video_extract.workspace import WorkspaceConfig
     config = write_workspace(tmp_path / "workspace")
     request = prepare_request(tmp_path / "practice.json")
     _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
     pid = prepared["result"]["practice"]["practice_id"]
+    task = Path(prepared["result"]["workspace"]) / "task"
+    target = task / "solution.py"
+    original = practice._inventory
+    inventories = 0
 
-    code, result = cli("practice", "checkpoint", "--practice-id", pid,
-                       "--expected-revision", 1, "--workspace", config, "--json",
-                       env={"VIDEO_EXTRACT_PRACTICE_TEST_FAULT": fault})
+    def changing_inventory(task_fd: int) -> dict:
+        nonlocal inventories
+        inventories += 1
+        change_at = 3 if fault == "late_after_second" else 2
+        if inventories == change_at:
+            if fault in {"late_file", "late_after_second"}:
+                (task / "late.py").write_text("# late\n")
+            elif fault == "remove_file":
+                target.unlink()
+            elif fault == "type_change":
+                target.unlink()
+                target.mkdir()
+            elif fault == "symlink_swap":
+                target.unlink()
+                target.symlink_to(Path(prepared["result"]["workspace"]) / "reference/solution.py")
+        return original(task_fd)
 
-    assert code == 1
+    monkeypatch.setattr(practice, "_inventory", changing_inventory)
+
+    result = practice.checkpoint(WorkspaceConfig.load(config), pid, 1)
+
     assert result["status"] == "recoverable_failure"
     assert result["validation"]["stable_code"] == "failed"
     assert result["result"]["revision"] == 1
@@ -350,10 +387,13 @@ def test_latest_failure_for_current_checkpoint_overrides_earlier_pass(tmp_path: 
     _,checked=cli("practice","checkpoint","--practice-id",pid,"--expected-revision",1,"--workspace",config,"--json")
     revision=checked["result"]["revision"]; checkpoint=checked["result"]["checkpoint"]
     events=[{"event_id":"attempt-latest","kind":"attempt","summary":"implemented"}]
-    for name,state,exit_code in (("pass","passed",0),("fail","failed",1)):
+    for name,state,exit_code,observed_at in (
+        ("fail", "failed", 1, "2026-09-17T02:01:00+00:00"),
+        ("older-pass", "passed", 0, "2026-09-17T02:00:00+00:00"),
+    ):
         events.append({"event_id":f"test-{name}","kind":"test","command":["pytest"],
             "cases":{"normal":state,"expired":state,"boundary":state},"exit_code":exit_code,
-            "observed_at":"2026-09-17T02:00:00+00:00","verification":"tool_observed",
+            "observed_at":observed_at,"verification":"tool_observed",
             "checkpoint_id":checkpoint["checkpoint_id"],"code_object_sha256":checkpoint["object_sha256"]})
     for event in events:
         path=tmp_path/f'{event["event_id"]}.json';path.write_text(json.dumps(event))

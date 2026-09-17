@@ -221,7 +221,7 @@ def _derive_completion(practice:dict[str,Any])->str:
                     and item.get("checkpoint_id")==checkpoint["checkpoint_id"]
                     and item.get("code_object_sha256")==checkpoint["object_sha256"]]
     if not observed_tests:return "in_progress"
-    latest=observed_tests[-1]
+    latest=max(enumerate(observed_tests),key=lambda pair:(datetime.fromisoformat(pair[1]["observed_at"].replace("Z","+00:00")),pair[0]))[1]
     passed=latest["exit_code"]==0 and all(value=="passed" for value in latest["cases"].values())
     if not passed:return "in_progress"
     return "with_hint" if any(item["kind"]=="hint" for item in events) else "independent"
@@ -238,13 +238,6 @@ def checkpoint(config:WorkspaceConfig,pid:str,expected_revision:int)->dict[str,A
             if not before or any(item[0] not in {"file","dir"} for item in before.values()): raise WorkspaceError("editable paths must be regular files or directories")
             file_names=sorted(name for name,item in before.items() if item[0]=="file")
             if not file_names:raise WorkspaceError("editable task contains no regular files")
-            fault=os.environ.get("VIDEO_EXTRACT_PRACTICE_TEST_FAULT")
-            target=task/file_names[0]
-            if fault=="late_file":(task/"late.py").write_text("# late\n")
-            elif fault=="remove_file":target.unlink()
-            elif fault=="type_change":target.unlink();target.mkdir()
-            elif fault=="symlink_swap":target.unlink();target.symlink_to(workspace/"reference/solution.py")
-            elif fault=="unstable_read":target.write_bytes(target.read_bytes()+b"\n# concurrent edit")
             first=[(name,_read_regular(task_fd,name)) for name in file_names]
             fresh_fd=_open_task(root,pid)
             try:
@@ -255,7 +248,6 @@ def checkpoint(config:WorkspaceConfig,pid:str,expected_revision:int)->dict[str,A
             if before!=after: raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
             second=[(name,_read_regular(task_fd,name)) for name in file_names]
             if first!=second: raise WorkspaceError("editable file content changed during checkpoint")
-            if fault=="late_after_second":(task/"late.py").write_text("# late\n")
             final_fd=_open_task(root,pid)
             try:
                 final_root=os.fstat(final_fd)
