@@ -79,7 +79,7 @@ video-extract capability check source.notes --json
 video-extract capability run source.notes --request request.json --json
 ~~~
 
-`source.notes` 的请求使用 `contract_version: 1`，包含 `action`（`prepare` 或 `finalize`）、`workspace`、`package` 和可选的 `source_version`。能力声明同时记录 `implementation_version` 及 `command:ffmpeg`、`python:PIL` 依赖。响应采用 `api_version: 1`；`completed` 退出 0，可继续但未完成的状态退出 3，其余失败状态退出非零。实现移动时只修改 `video_extract.capabilities:CAPABILITIES`；兼容移动保持实现版本，行为改变时递增实现版本。入口、依赖或版本不匹配会返回确切维护位置，不会猜测替代工具。
+`source.notes` 的请求使用 `contract_version: 1`，包含 `action`（`prepare` 或 `finalize`）、`workspace`、`package` 和可选的 `source_version`。能力声明同时记录 `implementation_version` 及 `ffmpeg`、`ffprobe`、Pillow、faster-whisper 依赖。响应采用 `api_version: 1`；`completed` 退出 0，可继续但未完成的状态退出 3，其余失败状态退出非零。实现移动时只修改 `video_extract.capabilities:CAPABILITIES`；兼容移动不改变同一逻辑请求的 operation ID，行为版本只作为 provenance 和诊断事实。入口、I/O contract、依赖或版本不匹配会返回确切维护位置，不会猜测替代工具。
 
 `install apply` 在 Codex 安装根原子写入 `video-extract/install-receipt.json`，记录工程 revision、CLI/capability/schema/集成源码指纹和安装契约版本；收据提交失败会回滚本次新链接并恢复已备份手改。`install check` 将源码、revision、链接、依赖或收据漂移报告为 `recoverable_failure`。`install` 与 `workspace doctor` 都返回统一 command-response-v1 envelope；后者同时汇总能力和安装诊断，并可用 `--agents-root`、`--codex-root` 指向临时根完成隔离检查。
 

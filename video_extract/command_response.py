@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib
 
 
 API_VERSION = 1
@@ -25,7 +31,19 @@ def engineering_revision() -> str:
 
 
 def workspace_id(path: str | None) -> str:
-    raw = str(Path(path).expanduser().resolve()) if path else "unscoped"
+    if not path:
+        raw = "unscoped"
+    else:
+        config = Path(path).expanduser()
+        try:
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+            explicit = parsed.get("workspace_id")
+            if isinstance(explicit, str) and explicit.strip():
+                raw = "explicit:" + explicit.strip()
+            else:
+                raw = json.dumps(parsed, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            raw = "unresolved-workspace"
     return "workspace-" + hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import shutil
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -39,7 +41,7 @@ CAPABILITIES: dict[str, Capability] = {
         input_type="source-notes-request-v1",
         output_type="command-response-v1",
         side_effect="workspace_write",
-        dependencies=("command:ffmpeg", "python:PIL"),
+        dependencies=("command:ffmpeg", "command:ffprobe", "python:PIL", "python:faster_whisper"),
         authorization_category="local_workspace",
         recovery_query="capability run source.notes with the same request",
     ),
@@ -68,7 +70,6 @@ def _operation_id(entry: Capability, request: dict[str, Any]) -> str:
             except (OSError, json.JSONDecodeError):
                 pass
     stable = json.dumps({"capability": entry.id, "contract_version": entry.contract_version,
-                         "implementation_version": entry.implementation_version,
                          "request": logical_request}, sort_keys=True, ensure_ascii=False)
     return "operation-" + hashlib.sha256(stable.encode()).hexdigest()[:24]
 
@@ -82,6 +83,19 @@ def _dependency_available(dependency: str) -> bool:
     if kind == "python":
         return importlib.util.find_spec(name) is not None
     return False
+
+
+def _contract_compatible(entry: Capability, implementation: Callable[..., Any] | None) -> bool:
+    if entry.input_type != "source-notes-request-v1" or entry.output_type != "command-response-v1":
+        return False
+    if implementation is None:
+        return False
+    try:
+        signature = inspect.signature(implementation)
+        signature.bind({})
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def list_capabilities() -> dict[str, Any]:
@@ -104,9 +118,12 @@ def check_capabilities(capability_id: str | None = None) -> dict[str, Any]:
     diagnostics = []
     for entry in entries:
         available = _resolve(entry) is not None
+        implementation = _resolve(entry)
+        compatible = _contract_compatible(entry, implementation)
         dependencies = {dependency: _dependency_available(dependency) for dependency in entry.dependencies}
         results.append({**asdict(entry), "dependencies": list(entry.dependencies),
                         "implementation_state": "available" if available else "missing",
+                        "contract_state": "compatible" if compatible else "incompatible",
                         "dependency_state": dependencies})
         if not available:
             diagnostics.append(
@@ -115,12 +132,16 @@ def check_capabilities(capability_id: str | None = None) -> dict[str, Any]:
         for dependency, present in dependencies.items():
             if not present:
                 diagnostics.append(f"{entry.id} dependency is unavailable: {dependency}")
+        if available and not compatible:
+            diagnostics.append(f"{entry.id} input/output contract or callable signature is incompatible")
     dependencies_ok = all(all(item["dependency_state"].values()) for item in results)
     implementations_ok = all(item["implementation_state"] == "available" for item in results)
+    contracts_ok = all(item["contract_state"] == "compatible" for item in results)
     status = "completed" if not diagnostics else "missing_dependency"
     return response(status=status, result={"capabilities": results},
                      validation={"implementations": "passed" if implementations_ok else "failed",
-                                 "dependencies": "passed" if dependencies_ok else "failed"},
+                                 "dependencies": "passed" if dependencies_ok else "failed",
+                                 "contracts": "passed" if contracts_ok else "failed"},
                      diagnostics=diagnostics)
 
 
@@ -168,6 +189,11 @@ def run_capability(capability_id: str, request_path: Path) -> dict[str, Any]:
                          validation={"implementation": "failed"}, provenance=provenance,
                          diagnostics=[f"{entry.implementation} is unavailable"],
                          next_action={"type": "maintenance", "maintenance_path": str(Path(__file__).resolve())})
+    if not _contract_compatible(entry, implementation):
+        return response(status="unsupported", workspace=workspace, operation_id=operation_id,
+                        validation={"input_type": "failed", "output_type": "failed"}, provenance=provenance,
+                        diagnostics=[f"{capability_id} implementation does not satisfy its declared contract"],
+                        next_action={"type": "maintenance", "maintenance_path": str(Path(__file__).resolve())})
     try:
         raw = implementation(request)
     except (KeyError, TypeError, ValueError, FileNotFoundError, WorkspaceError) as exc:
@@ -175,6 +201,11 @@ def run_capability(capability_id: str, request_path: Path) -> dict[str, Any]:
                          validation={"request": "failed", "contract_version": "passed"},
                          provenance=provenance, diagnostics=[str(exc)],
                          next_action={"type": "user", "reason": "correct the request"})
+    if not isinstance(raw, Mapping):
+        return response(status="failed", workspace=workspace, operation_id=operation_id,
+                        validation={"contract_version": "passed", "output_type": "failed"},
+                        provenance=provenance, diagnostics=["capability implementation returned a non-mapping result"],
+                        next_action={"type": "maintenance", "maintenance_path": str(Path(__file__).resolve())})
     status_map = {"complete": "completed", "ready": "completed", "awaiting_ai": "awaiting_model",
                   "needs_input": "missing_input", "failed": "failed"}
     status = status_map.get(raw.get("status"), raw.get("status"))

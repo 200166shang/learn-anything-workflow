@@ -12,6 +12,7 @@ from video_extract.workspace import WorkspaceConfig
 
 
 def make_workspace(root: Path) -> WorkspaceConfig:
+    root.mkdir(parents=True, exist_ok=True)
     (root / "project").mkdir()
     (root / "media").mkdir()
     (root / "vault").mkdir()
@@ -79,9 +80,9 @@ def test_check_reports_declared_dependency_state() -> None:
 
     assert code == 3
     capability = result["result"]["capabilities"][0]
-    assert capability["dependency_state"] == {"command:ffmpeg": False, "python:PIL": False}
+    assert capability["dependency_state"] == {"command:ffmpeg": False, "command:ffprobe": False, "python:PIL": False, "python:faster_whisper": False}
     assert result["status"] == "missing_dependency"
-    assert result["validation"] == {"implementations": "passed", "dependencies": "failed"}
+    assert result["validation"] == {"implementations": "passed", "dependencies": "failed", "contracts": "passed"}
 
 
 def test_run_existing_capability_normalizes_model_pause_and_exit_code(tmp_path: Path) -> None:
@@ -156,9 +157,53 @@ def test_operation_identity_survives_relocation_and_tracks_contract_versions(tmp
     with patch.object(capability_module, "run_source_notes", return_value={"status": "awaiting_ai"}), \
             patch.dict(CAPABILITIES, {"source.notes": upgraded}, clear=True):
         _, changed = run_cli("capability", "run", "source.notes", "--request", str(request_two))
+    contract_request = tmp_path / "contract-two.json"
+    contract_request.write_text(json.dumps({**base, "contract_version": 2,
+                                             "workspace": "/new/workspace",
+                                             "package": str(second_package)}), encoding="utf-8")
+    contract_two = Capability(**{**CAPABILITIES["source.notes"].__dict__, "contract_version": 2})
+    with patch.object(capability_module, "run_source_notes", return_value={"status": "awaiting_ai"}), \
+            patch.dict(CAPABILITIES, {"source.notes": contract_two}, clear=True):
+        _, contract_changed = run_cli("capability", "run", "source.notes", "--request", str(contract_request))
 
     assert first["operation_id"] == relocated["operation_id"]
-    assert changed["operation_id"] != relocated["operation_id"]
+    assert changed["operation_id"] == relocated["operation_id"]
+    assert changed["provenance"]["implementation_version"] == 2
+    assert contract_changed["operation_id"] != relocated["operation_id"]
+
+
+def test_check_rejects_incompatible_contract_declaration_and_callable() -> None:
+    def incompatible() -> list[str]:
+        return []
+
+    bad = Capability(**{**CAPABILITIES["source.notes"].__dict__, "input_type": "unknown-v9",
+                        "implementation": "video_extract.capabilities:incompatible"})
+    with patch.object(capability_module, "incompatible", incompatible, create=True), \
+            patch.dict(CAPABILITIES, {"source.notes": bad}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 3
+    checked = result["result"]["capabilities"][0]
+    assert checked["contract_state"] == "incompatible"
+    assert result["validation"]["contracts"] == "failed"
+
+
+def test_run_incompatible_return_keeps_v1_envelope(tmp_path: Path) -> None:
+    def returns_list(_request: dict) -> list[str]:
+        return []
+
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"contract_version": 1}), encoding="utf-8")
+    replacement = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                                "implementation": "video_extract.capabilities:returns_list"})
+    with patch.object(capability_module, "returns_list", returns_list, create=True), \
+            patch.dict(CAPABILITIES, {"source.notes": replacement}, clear=True):
+        code, result = run_cli("capability", "run", "source.notes", "--request", str(request))
+
+    assert code == 1
+    assert result["api_version"] == 1
+    assert result["status"] == "failed"
+    assert result["validation"]["output_type"] == "failed"
 
 
 def test_run_rejects_contract_mismatch_without_guessing_an_adapter(tmp_path: Path) -> None:
@@ -214,6 +259,33 @@ def test_invalid_workspace_is_a_normalized_missing_input_response(tmp_path: Path
     assert result["api_version"] == 1
     assert result["status"] == "missing_input"
     assert result["validation"]["workspace"] == "failed"
+
+
+def test_workspace_identity_survives_workspace_relocation(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    workspace = make_workspace(first)
+    first_agents, first_codex = tmp_path / "agents-a", tmp_path / "codex-a"
+    _, before = run_cli("workspace", "doctor", "--workspace", str(workspace.config_path),
+                        "--agents-root", str(first_agents), "--codex-root", str(first_codex))
+    moved = tmp_path / "moved"
+    first.rename(moved)
+    _, after = run_cli("workspace", "doctor", "--workspace", str(moved / "workspace.toml"),
+                       "--agents-root", str(first_agents), "--codex-root", str(first_codex))
+
+    assert before["workspace_id"] == after["workspace_id"]
+
+
+def test_malformed_workspace_toml_is_normalized(tmp_path: Path) -> None:
+    malformed = tmp_path / "workspace.toml"
+    malformed.write_text("schema_version = [", encoding="utf-8")
+
+    code, result = run_cli("workspace", "doctor", "--workspace", str(malformed),
+                           "--agents-root", str(tmp_path / "agents"),
+                           "--codex-root", str(tmp_path / "codex"))
+
+    assert code == 3
+    assert result["api_version"] == 1
+    assert result["status"] == "missing_input"
 
 
 def test_capability_invalid_workspace_is_normalized(tmp_path: Path) -> None:

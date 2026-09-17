@@ -79,6 +79,12 @@ class InstallationContractTests(unittest.TestCase):
         self.assertTrue(all(item["state"] == "linked" for item in checked["result"]["entries"]))
         self.assertEqual(checked["result"]["tool"]["source"], str(source))
 
+    def test_apply_operation_identity_distinguishes_install_targets(self):
+        first = apply(self.root / "agents-one", self.root / "codex-one")
+        second = apply(self.root / "agents-two", self.root / "codex-two")
+
+        self.assertNotEqual(first["operation_id"], second["operation_id"])
+
     def test_check_reports_copy_drift_and_the_exact_maintenance_path(self):
         copied = self.agents_root / "skills/extract-media"
         copied.mkdir(parents=True)

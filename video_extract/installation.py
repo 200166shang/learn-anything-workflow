@@ -212,6 +212,13 @@ def _wrap(status: str, details: dict[str, Any], diagnostics: list[str], *, opera
                     artifact_refs=[details["backup"]] if details.get("backup") else [])
 
 
+def _install_operation_id(agents_root: Path, codex_root: Path) -> str:
+    payload = json.dumps({"agents_root": str(agents_root.expanduser().resolve()),
+                          "codex_root": str(codex_root.expanduser().resolve()),
+                          "contract_version": CONTRACT_VERSION}, sort_keys=True)
+    return "install-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
 def inspect(agents_root: Path, codex_root: Path) -> dict[str, Any]:
     status, details, diagnostics = _inspect_details(agents_root, codex_root)
     return _wrap(status, details, diagnostics,
@@ -267,10 +274,10 @@ def apply(agents_root: Path, codex_root: Path, backup_root: Path | None = None) 
         _, details, _ = _inspect_details(agents_root, codex_root)
         details.update({"ok": False, "backup": str(backup), "backed_up": backed_up})
         return _wrap("recoverable_failure", details, [str(exc), *rollback_errors],
-                     operation_id="install-" + source_info()["content_fingerprint"][:24],
+                     operation_id=_install_operation_id(agents_root, codex_root),
                      next_command="video-extract install plan --json")
     status, details, diagnostics = _inspect_details(agents_root, codex_root)
     details.update({"backup": str(backup), "backed_up": backed_up})
     return _wrap(status, details, diagnostics,
-                 operation_id="install-" + source_info()["content_fingerprint"][:24],
+                 operation_id=_install_operation_id(agents_root, codex_root),
                  next_command=None if status == "completed" else "video-extract install plan --json")

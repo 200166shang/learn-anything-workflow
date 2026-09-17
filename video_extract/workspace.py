@@ -59,7 +59,10 @@ class WorkspaceConfig:
         path = path.expanduser().resolve()
         if not path.is_file():
             raise WorkspaceError(f"workspace config not found: {path}; create it from workspace.example.toml")
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise WorkspaceError(f"invalid workspace config: {path}: {exc}") from exc
         if raw.get("schema_version") != SCHEMA_VERSION:
             raise WorkspaceError(f"unsupported workspace schema_version: {raw.get('schema_version')!r}")
         paths, obs = raw.get("paths", {}), raw.get("obsidian", {})
