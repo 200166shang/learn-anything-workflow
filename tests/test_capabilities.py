@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+from typing import TypedDict
 from unittest.mock import patch
 
 import video_extract.capabilities as capability_module
@@ -262,6 +263,63 @@ def test_metadata_cannot_hide_incompatible_return_annotation() -> None:
     assert result["result"]["capabilities"][0]["contract_state"] == "incompatible"
 
 
+def test_metadata_cannot_hide_incompatible_request_annotation() -> None:
+    def disguised(_request: list[str]) -> dict:
+        return {"status": "complete"}
+
+    disguised.__capability_contract__ = {"input_type": "source-notes-request-v1",
+                                         "output_type": "command-response-v1"}
+    bad = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                        "implementation": "video_extract.capabilities:disguised_input"})
+    with patch.object(capability_module, "disguised_input", disguised, create=True), \
+            patch.dict(CAPABILITIES, {"source.notes": bad}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 1
+    assert result["result"]["capabilities"][0]["contract_state"] == "incompatible"
+
+
+def test_typed_dict_output_annotation_is_compatible() -> None:
+    class AdapterResult(TypedDict):
+        status: str
+
+    def compatible(_request: dict) -> AdapterResult:
+        return {"status": "complete"}
+
+    compatible.__capability_contract__ = {"input_type": "source-notes-request-v1",
+                                          "output_type": "command-response-v1"}
+    replacement = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                                "implementation": "video_extract.capabilities:typed_dict_adapter"})
+    with patch.object(capability_module, "typed_dict_adapter", compatible, create=True), \
+            patch.dict(CAPABILITIES, {"source.notes": replacement}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 0
+    assert result["result"]["capabilities"][0]["contract_state"] == "compatible"
+
+
+def test_mapping_subclass_annotations_are_compatible() -> None:
+    class RequestMap(dict[str, object]):
+        pass
+
+    class ResultMap(dict[str, object]):
+        pass
+
+    def compatible(_request: RequestMap) -> ResultMap:
+        return ResultMap(status="complete")
+
+    compatible.__capability_contract__ = {"input_type": "source-notes-request-v1",
+                                          "output_type": "command-response-v1"}
+    replacement = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                                "implementation": "video_extract.capabilities:mapping_subclass_adapter"})
+    with patch.object(capability_module, "mapping_subclass_adapter", compatible, create=True), \
+            patch.dict(CAPABILITIES, {"source.notes": replacement}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 0
+    assert result["result"]["capabilities"][0]["contract_state"] == "compatible"
+
+
 def test_run_incompatible_return_keeps_v1_envelope(tmp_path: Path) -> None:
     # Unannotated adapters are allowed by the probe protocol, so runtime must still enforce Mapping.
     def returns_list(_request: dict):
@@ -382,6 +440,37 @@ def test_workspace_template_identity_is_rejected(tmp_path: Path) -> None:
     assert code == 3
     assert result["status"] == "missing_input"
     assert "placeholder" in result["diagnostics"][0]
+
+
+def test_legacy_legal_workspace_ids_remain_readable_for_show_and_source_import(tmp_path: Path) -> None:
+    for index, legal_id in enumerate(("fixture-course", "example-notes", "default-vault", "todoist-study")):
+        root = tmp_path / str(index)
+        workspace = make_workspace(root)
+        workspace.config_path.write_text(workspace.config_path.read_text(encoding="utf-8").replace(
+            'workspace_id = "11111111-1111-4111-8111-111111111111"',
+            f'workspace_id = "{legal_id}"'), encoding="utf-8")
+        show_code, shown = run_cli("workspace", "show", "--workspace", str(workspace.config_path))
+        source = root / "source.md"
+        source.write_text("# Source\n", encoding="utf-8")
+        import_code, imported = run_cli("source", "import", str(source),
+                                        "--workspace", str(workspace.config_path))
+
+        assert show_code == 0
+        assert shown["workspace_id"] == legal_id
+        assert import_code == 0
+        assert imported["status"] == "ready"
+
+
+def test_only_exact_workspace_template_sentinel_is_rejected(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    workspace.config_path.write_text(workspace.config_path.read_text(encoding="utf-8").replace(
+        'workspace_id = "11111111-1111-4111-8111-111111111111"',
+        'workspace_id = "replace-me-course"'), encoding="utf-8")
+
+    code, shown = run_cli("workspace", "show", "--workspace", str(workspace.config_path))
+
+    assert code == 0
+    assert shown["workspace_id"] == "replace-me-course"
 
 
 def test_malformed_workspace_toml_is_normalized(tmp_path: Path) -> None:

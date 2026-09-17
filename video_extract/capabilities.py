@@ -101,14 +101,27 @@ def _contract_compatible(entry: Capability, implementation: Callable[..., Any] |
     except (TypeError, ValueError):
         return False
     try:
-        return_annotation = typing.get_type_hints(implementation).get("return", signature.return_annotation)
+        annotations = typing.get_type_hints(implementation)
     except (NameError, TypeError):
-        return_annotation = signature.return_annotation
-    if return_annotation not in {inspect.Signature.empty, Any}:
-        origin = typing.get_origin(return_annotation) or return_annotation
-        if origin not in {dict, Mapping}:
-            return False
-    return True
+        annotations = {}
+    first_parameter = next(iter(signature.parameters.values()), None)
+    if first_parameter is None:
+        return False
+    input_annotation = annotations.get(first_parameter.name, first_parameter.annotation)
+    output_annotation = annotations.get("return", signature.return_annotation)
+    return _mapping_annotation_compatible(input_annotation) and _mapping_annotation_compatible(output_annotation)
+
+
+def _mapping_annotation_compatible(annotation: Any) -> bool:
+    if annotation in {inspect.Signature.empty, Any}:
+        return True
+    if typing.is_typeddict(annotation):
+        return True
+    origin = typing.get_origin(annotation) or annotation
+    try:
+        return isinstance(origin, type) and issubclass(origin, Mapping)
+    except TypeError:
+        return False
 
 
 def list_capabilities() -> dict[str, Any]:

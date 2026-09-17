@@ -33,10 +33,8 @@ class WorkspaceError(RuntimeError):
 def validate_workspace_id(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
-    normalized = value.strip().lower().replace("_", "-")
-    reserved = ("replace", "placeholder", "change-me", "changeme", "todo", "example", "your-",
-                "fixture", "sample", "default")
-    return None if any(marker in normalized for marker in reserved) else value.strip()
+    candidate = value.strip()
+    return None if candidate == "REPLACE_ME_WITH_UUID" else candidate
 
 
 def _contained(child: Path, parent: Path, label: str) -> Path:
