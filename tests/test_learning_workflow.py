@@ -322,3 +322,24 @@ def test_learning_store_rejects_a_symlink_escape_from_results(tmp_path: Path) ->
     assert rejected["status"] == "failed"
     assert "symbolic link" in rejected["diagnostics"][0]
     assert not any(outside.iterdir())
+
+
+def test_learning_capability_contract_checks_and_runs_the_same_public_workflow(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = register_source(tmp_path, config)
+    code, checked = cli("capability", "check", "learning.learn", "--json")
+    assert code == 0
+    assert checked["result"]["capabilities"][0]["contract_state"] == "compatible"
+    request = tmp_path / "learning-request.json"
+    request.write_text(json.dumps({
+        "contract_version": 1, "action": "module.create", "workspace": str(config),
+        "goal": "理解资料", "scope": "第一章", "source_id": source["source_id"],
+        "source_version": source["source_version"],
+    }), encoding="utf-8")
+
+    code, result = cli("capability", "run", "learning.learn", "--request", request, "--json")
+
+    assert code == 0
+    assert result["status"] == "completed"
+    assert result["provenance"]["capability_id"] == "learning.learn"
+    assert result["result"]["result"]["module"]["goal"] == "理解资料"

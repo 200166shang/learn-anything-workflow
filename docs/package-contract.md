@@ -4,6 +4,35 @@
 
 This document and the v4/v5 schemas are the authoritative deterministic package contract. `video_extract.validate` implements artifact-derived semantics. Schema 1–4 manifests remain readable; stored status labels are hints only.
 
+## Scoped media operations (request v1)
+
+`plan --request`, `ensure --request`, and `capability run media.acquire`
+accept `media-acquire-request-v1.schema.json`. The request pins a registered
+`source_id`/`source_version`, an explicit sorted set of inventory item IDs, and
+the requested media kinds, language, and quality. It never expands the scope or
+turns a missing language track into localization work.
+
+The stable operation key includes the logical workspace ID, source identity and
+version, explicit scope, effective parameters, and capability contract version.
+Operation state lives below the workspace's local role; artifacts live below
+the results role and are reusable only while their recorded size and SHA-256
+facts still match. `operation show` is read-only and `operation resume`
+rechecks those facts before filling only missing or invalid artifacts.
+
+Every media adapter implements acquisition plus reconciliation by stable
+idempotency token/query handle. Reconciliation reports `not_submitted`,
+`retry_safe`, `committed`, `available`, or `unsupported`; only the first two
+permit resubmission. `committed` remains uncertain until the existing result is
+queryable and locally verified. The operation store separately maintains a
+monotonic fencing counter and lease owner. Adapter results are accepted only
+while both still match the persisted lease, so an expired worker cannot publish
+over a newer attempt.
+
+A reconciliation transport failure is itself a persisted query attempt. It
+keeps the original idempotency token and query handle unchanged, remains
+`uncertain`, and offers only another `operation reconcile` command; it never
+falls through to acquisition resume.
+
 ## Current public workflows and retained validation goals
 
 - New acquisition uses `plan/ensure --media`; it never synthesizes a missing language track.

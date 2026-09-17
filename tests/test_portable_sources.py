@@ -42,6 +42,14 @@ def cli(*args: object, env: dict[str, str] | None = None) -> tuple[int, dict]:
     return completed.returncode, json.loads(completed.stdout)
 
 
+def run_recovery_command(command: str) -> subprocess.CompletedProcess[str]:
+    """Run generated argv through this test environment, never a globally installed CLI."""
+    argv = shlex.split(command)
+    assert argv.pop(0) == "video-extract"
+    return subprocess.run([sys.executable, "-m", "video_extract.cli", *argv],
+                          cwd=Path(__file__).parents[1], capture_output=True, text=True)
+
+
 def test_workspace_v2_show_uses_distinct_portable_roles(tmp_path: Path) -> None:
     config = write_workspace(tmp_path)
 
@@ -351,8 +359,7 @@ def test_pointer_directory_sync_failure_is_visibility_not_durability(tmp_path: P
     assert "source reconcile" in command
     assert first["result"]["source_id"] in command
 
-    completed = subprocess.run(shlex.split(command), cwd=Path(__file__).parents[1],
-                               capture_output=True, text=True)
+    completed = run_recovery_command(command)
     reconciled = json.loads(completed.stdout)
     assert completed.returncode == 0
     assert reconciled["status"] == "completed"
@@ -451,8 +458,7 @@ def test_pre_publish_retry_replays_source_id_title_and_operation_identity(tmp_pa
     command = failed["next_action"]["command"]
     assert "--source-id" in command
     assert "--title" in command
-    completed = subprocess.run(shlex.split(command), cwd=Path(__file__).parents[1],
-                               capture_output=True, text=True)
+    completed = run_recovery_command(command)
     retried = json.loads(completed.stdout)
 
     assert completed.returncode == 0
@@ -505,8 +511,7 @@ def test_committed_source_update_retry_accepts_matching_trusted_mapping(tmp_path
     with patch("video_extract.source_registry._sync_directory", side_effect=fail_first_hash_dir):
         failed = register(workspace, source, title="Stable title",
                           expected_revision=first["result"]["revision"])
-    completed = subprocess.run(shlex.split(failed["next_action"]["command"]),
-                               cwd=Path(__file__).parents[1], capture_output=True, text=True)
+    completed = run_recovery_command(failed["next_action"]["command"])
     retried = json.loads(completed.stdout)
 
     assert completed.returncode == 0

@@ -3,6 +3,15 @@ name: source-notes
 description: Write Chinese source-grounded notes from an already prepared VideoLearning package containing a document, transcript, audio, or video; do not download sources or maintain learning question graphs.
 ---
 
+For workspace-v2 registered text or transcripts, call `video-extract notes
+prepare SOURCE_ID --workspace WORKSPACE --json`. Continue the returned
+`awaiting_model` action by writing a `source-note-finalize-request-v1` JSON file,
+then call `video-extract notes finalize SOURCE_ID --request REQUEST --workspace
+WORKSPACE --json`. Preserve the exact `source_id` and `source_version`, use only
+the locator policy in the prepared input, and never invent timestamps or claim
+that an SRT is matched to video without a `source associate` record backed by
+structured, verifiable matching facts. Free-form claims remain unverified.
+
 # Source notes
 
 Work only from the managed package returned by `video-extract source import`, `video-extract ensure`, or an existing package. Use `video-extract notes prepare PACKAGE --workspace CONFIG --json` to discover the next action.

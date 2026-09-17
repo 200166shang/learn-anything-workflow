@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import SCHEMA_VERSION
+from .command_response import response
 from .manifest import atomic_write_json, fingerprint, read_json, relative_path, sanitize
 from .media_request import normalize_media_request
 from . import media_workflow
 from .orchestrator import existing_capabilities
 from .playlists import build_playback_views, build_xiaoe_playback_views, verify_playback
 from .validate import validate, validate_goals, validate_media_request
-from .workspace import discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
+from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceError, discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
 
 PROJECT = Path(__file__).resolve().parent.parent
 
@@ -93,15 +94,50 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
+    if args.request:
+        from .command_response import exit_code, response
+        from .media_operations import plan_request
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = plan_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json); return exit_code(result)
     result = media_workflow.plan(args.source, normalize_media_request(args.media, args.language, args.quality), args.output)
     emit(result, args.json); return 0 if not result.get("blockers") else 1
 
 
 def cmd_ensure(args: argparse.Namespace) -> int:
+    if args.request:
+        from .command_response import exit_code, response
+        from .media_operations import ensure_request
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = ensure_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json); return exit_code(result)
     workspace = discover_workspace(args.workspace)
     result = media_workflow.ensure(args.source, normalize_media_request(args.media, args.language, args.quality), args.output, workspace.media)
     emit(result, args.json)
     return 0 if result.get("status") == "complete" else 1
+
+
+def cmd_operation(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    from .media_operations import reconcile_operation, resume_operation, show_operation
+    workspace = discover_workspace(args.workspace)
+    if args.operation_action == "show":
+        result = show_operation(workspace, args.operation_id)
+    elif args.operation_action == "resume":
+        result = resume_operation(workspace, args.operation_id)
+    else:
+        result = reconcile_operation(workspace, args.operation_id)
+    emit(result, args.json); return exit_code(result)
 
 
 def cmd_source(args: argparse.Namespace) -> int:
@@ -117,7 +153,11 @@ def cmd_source(args: argparse.Namespace) -> int:
                           next_action={"command": "video-extract migration plan"})
         emit(result, args.json); return exit_code(result)
     try:
-        if args.source_action == "register":
+        if args.source_action == "associate":
+            from .authoritative_notes import associate_sources
+            evidence = read_json(args.evidence) if args.evidence else None
+            result = associate_sources(workspace, args.source_id, args.related_source_id, evidence)
+        elif args.source_action == "register":
             result = register(workspace, args.input, args.title, args.expected_revision, args.source_id)
         elif args.source_action == "verify":
             result = verify(workspace, args.source_id, args.source_version)
@@ -140,9 +180,32 @@ def cmd_source(args: argparse.Namespace) -> int:
 
 
 def cmd_notes(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    from .authoritative_notes import audit_notes, finalize_note, prepare_note, reconcile_notes
     from .notes_workflow import finalize, prepare
+    from .workspace import WorkspaceError
     workspace = discover_workspace(args.workspace)
-    result = prepare(args.package, workspace) if args.notes_action == "prepare" else finalize(args.package, workspace)
+    if workspace.schema_version == PORTABLE_SCHEMA_VERSION:
+        try:
+            if args.notes_action == "prepare":
+                result = prepare_note(workspace, args.target, args.source_version)
+            elif args.notes_action == "finalize":
+                if args.request is None:
+                    result = response(status="missing_input", workspace=str(workspace.config_path),
+                                      validation={"request": "failed"}, diagnostics=["--request is required"])
+                else:
+                    result = finalize_note(workspace, args.request)
+            elif args.notes_action == "audit":
+                result = audit_notes(workspace)
+            else:
+                result = reconcile_notes(workspace, args.commit_id)
+        except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+            result = response(status="missing_input", workspace=str(workspace.config_path),
+                              validation={"request": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json)
+        return exit_code(result)
+    package = Path(args.target)
+    result = prepare(package, workspace) if args.notes_action == "prepare" else finalize(package, workspace)
     emit(result, args.json)
     return 0 if result.get("status") in {"ready", "complete", "awaiting_ai"} else 1
 
@@ -519,8 +582,12 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--quality", choices=("standard", "balanced", "high"), default="high")
         p.add_argument("--workspace", type=Path)
         p.add_argument("--json", action="store_true")
-    planning = commands.add_parser("plan", help="read-only media extraction plan"); planning.add_argument("source"); planning.add_argument("--output", type=Path, help="existing package whose validated artifacts may be reused"); media_arguments(planning); planning.set_defaults(func=cmd_plan)
-    ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
+    planning = commands.add_parser("plan", help="read-only media extraction plan"); planning.add_argument("source", nargs="?"); planning.add_argument("--request", type=Path, help="versioned scoped media request JSON"); planning.add_argument("--output", type=Path, help="existing package whose validated artifacts may be reused"); media_arguments(planning); planning.set_defaults(func=cmd_plan)
+    ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source", nargs="?"); ensuring.add_argument("--request", type=Path, help="versioned scoped media request JSON"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
+    operation = commands.add_parser("operation", help="inspect or resume a persistent operation")
+    operation_actions = operation.add_subparsers(dest="operation_action", required=True)
+    for action in ("show", "resume", "reconcile"):
+        p = operation_actions.add_parser(action); p.add_argument("operation_id"); p.add_argument("--workspace", type=Path, required=True); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_operation)
     source = commands.add_parser("source", help="import local source material into a managed package")
     source_actions = source.add_subparsers(dest="source_action", required=True)
     source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--source-id"); source_import.add_argument("--expected-revision", type=int); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
@@ -541,10 +608,24 @@ def parser() -> argparse.ArgumentParser:
     source_reconcile.add_argument("source_id"); source_reconcile.add_argument("--source-version", required=True)
     source_reconcile.add_argument("--workspace", type=Path); source_reconcile.add_argument("--json", action="store_true")
     source_reconcile.set_defaults(func=cmd_source)
+    source_associate = source_actions.add_parser("associate", help="validate an explicit relationship between registered sources")
+    source_associate.add_argument("source_id"); source_associate.add_argument("related_source_id")
+    source_associate.add_argument("--evidence", type=Path, help="structured association evidence JSON")
+    source_associate.add_argument("--workspace", type=Path)
+    source_associate.add_argument("--json", action="store_true"); source_associate.set_defaults(func=cmd_source)
     notes = commands.add_parser("notes", help="prepare or finalize source-grounded notes")
     notes_actions = notes.add_subparsers(dest="notes_action", required=True)
     for action in ("prepare", "finalize"):
-        p = notes_actions.add_parser(action); p.add_argument("package", type=Path); p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
+        p = notes_actions.add_parser(action); p.add_argument("target")
+        p.add_argument("--source-version"); p.add_argument("--request", type=Path)
+        p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
+    notes_audit = notes_actions.add_parser("audit", help="enumerate and deeply validate authoritative notes")
+    notes_audit.add_argument("--workspace", type=Path); notes_audit.add_argument("--json", action="store_true")
+    notes_audit.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
+    notes_reconcile = notes_actions.add_parser("reconcile", help="deeply validate and repeat notes durability barriers")
+    notes_reconcile.add_argument("--commit-id")
+    notes_reconcile.add_argument("--workspace", type=Path); notes_reconcile.add_argument("--json", action="store_true")
+    notes_reconcile.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
     learning = commands.add_parser("learning", help="manage authoritative learning modules, threads, and questions")
     learning_entities = learning.add_subparsers(dest="learning_entity", required=True)
     module = learning_entities.add_parser("module"); module_actions = module.add_subparsers(dest="learning_action", required=True)
