@@ -53,6 +53,7 @@ include = [
 "schemas/source-package-v6.schema.json" = "schemas/source-package-v6.schema.json"
 "schemas/snapshot-v1.schema.json" = "schemas/snapshot-v1.schema.json"
 "schemas/current-pointer-v1.schema.json" = "schemas/current-pointer-v1.schema.json"
+"schemas/notes-snapshot-v1.schema.json" = "schemas/notes-snapshot-v1.schema.json"
 "integrations/skills" = "integrations/skills"
 ".codex/agents" = ".codex/agents"
 

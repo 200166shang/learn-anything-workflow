@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import SCHEMA_VERSION
+from .command_response import response
 from .manifest import atomic_write_json, fingerprint, read_json, relative_path, sanitize
 from .media_request import normalize_media_request
 from . import media_workflow
 from .orchestrator import existing_capabilities
 from .playlists import build_playback_views, build_xiaoe_playback_views, verify_playback
 from .validate import validate, validate_goals, validate_media_request
-from .workspace import discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
+from .workspace import PORTABLE_SCHEMA_VERSION, discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
 
 PROJECT = Path(__file__).resolve().parent.parent
 
@@ -117,7 +118,11 @@ def cmd_source(args: argparse.Namespace) -> int:
                           next_action={"command": "video-extract migration plan"})
         emit(result, args.json); return exit_code(result)
     try:
-        if args.source_action == "register":
+        if args.source_action == "associate":
+            from .authoritative_notes import associate_sources
+            evidence = read_json(args.evidence) if args.evidence else None
+            result = associate_sources(workspace, args.source_id, args.related_source_id, evidence)
+        elif args.source_action == "register":
             result = register(workspace, args.input, args.title, args.expected_revision, args.source_id)
         elif args.source_action == "verify":
             result = verify(workspace, args.source_id, args.source_version)
@@ -140,9 +145,32 @@ def cmd_source(args: argparse.Namespace) -> int:
 
 
 def cmd_notes(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    from .authoritative_notes import audit_notes, finalize_note, prepare_note, reconcile_notes
     from .notes_workflow import finalize, prepare
+    from .workspace import WorkspaceError
     workspace = discover_workspace(args.workspace)
-    result = prepare(args.package, workspace) if args.notes_action == "prepare" else finalize(args.package, workspace)
+    if workspace.schema_version == PORTABLE_SCHEMA_VERSION:
+        try:
+            if args.notes_action == "prepare":
+                result = prepare_note(workspace, args.target, args.source_version)
+            elif args.notes_action == "finalize":
+                if args.request is None:
+                    result = response(status="missing_input", workspace=str(workspace.config_path),
+                                      validation={"request": "failed"}, diagnostics=["--request is required"])
+                else:
+                    result = finalize_note(workspace, args.request)
+            elif args.notes_action == "audit":
+                result = audit_notes(workspace)
+            else:
+                result = reconcile_notes(workspace, args.commit_id)
+        except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+            result = response(status="missing_input", workspace=str(workspace.config_path),
+                              validation={"request": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json)
+        return exit_code(result)
+    package = Path(args.target)
+    result = prepare(package, workspace) if args.notes_action == "prepare" else finalize(package, workspace)
     emit(result, args.json)
     return 0 if result.get("status") in {"ready", "complete", "awaiting_ai"} else 1
 
@@ -490,10 +518,24 @@ def parser() -> argparse.ArgumentParser:
     source_reconcile.add_argument("source_id"); source_reconcile.add_argument("--source-version", required=True)
     source_reconcile.add_argument("--workspace", type=Path); source_reconcile.add_argument("--json", action="store_true")
     source_reconcile.set_defaults(func=cmd_source)
+    source_associate = source_actions.add_parser("associate", help="validate an explicit relationship between registered sources")
+    source_associate.add_argument("source_id"); source_associate.add_argument("related_source_id")
+    source_associate.add_argument("--evidence", type=Path, help="structured association evidence JSON")
+    source_associate.add_argument("--workspace", type=Path)
+    source_associate.add_argument("--json", action="store_true"); source_associate.set_defaults(func=cmd_source)
     notes = commands.add_parser("notes", help="prepare or finalize source-grounded notes")
     notes_actions = notes.add_subparsers(dest="notes_action", required=True)
     for action in ("prepare", "finalize"):
-        p = notes_actions.add_parser(action); p.add_argument("package", type=Path); p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
+        p = notes_actions.add_parser(action); p.add_argument("target")
+        p.add_argument("--source-version"); p.add_argument("--request", type=Path)
+        p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
+    notes_audit = notes_actions.add_parser("audit", help="enumerate and deeply validate authoritative notes")
+    notes_audit.add_argument("--workspace", type=Path); notes_audit.add_argument("--json", action="store_true")
+    notes_audit.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
+    notes_reconcile = notes_actions.add_parser("reconcile", help="deeply validate and repeat notes durability barriers")
+    notes_reconcile.add_argument("--commit-id")
+    notes_reconcile.add_argument("--workspace", type=Path); notes_reconcile.add_argument("--json", action="store_true")
+    notes_reconcile.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):
