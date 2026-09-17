@@ -723,8 +723,29 @@ def test_restore_old_expression_overlays_confirmed_correction_without_moving_pro
     rollback, rollback_evidence, rollback_review = _linear_inputs(
         tmp_path, source, rollback_prepare["result"]["required_marker"])
     prior_marker = correction_prepare["result"]["required_marker"]
-    rollback.write_text(corrected_text.replace(prior_marker, rollback_prepare["result"]["required_marker"])
-                        + "\n\n矩阵行是基向量的像。\n")
+    canonical_update = corrected_text.replace(prior_marker, rollback_prepare["result"]["required_marker"])
+    opening = f"<!-- correction-id: {correction_id} -->"
+    closing = f"<!-- /correction-id: {correction_id} -->"
+    unknown_id = "correction-22222222-2222-4222-8222-222222222222"
+    tampered_variants = {
+        "suffix": canonical_update.replace("适用边界：在线性映射采用列向量坐标约定时",
+                                             "适用边界：在线性映射采用列向量坐标约定时（篡改）"),
+        "duplicate_opening": canonical_update.replace(opening, opening + "\n" + opening),
+        "orphan_closing": canonical_update + f"\n{closing}\n",
+        "unknown_id": canonical_update + (f"\n<!-- correction-id: {unknown_id} -->\n未知\n"
+                                                   f"<!-- /correction-id: {unknown_id} -->\n"),
+    }
+    for label, tampered in tampered_variants.items():
+        rollback.write_text(tampered)
+        tampered_code, tampered_result = cli(
+            "explanation", "commit", "--question-id", root_id, "--draft", rollback,
+            "--evidence", rollback_evidence, "--teaching-review", rollback_review,
+            "--profile", "linear_transform", "--preparation-id", rollback_prepare["result"]["preparation_id"],
+            "--workspace", config, "--json")
+        assert tampered_code == 3, label
+        assert tampered_result["validation"]["confirmed_corrections"] == "conflict", label
+
+    rollback.write_text(canonical_update + "\n\n矩阵行是基向量的像。\n")
     code, rejected = cli("explanation", "commit", "--question-id", root_id, "--draft", rollback,
                          "--evidence", rollback_evidence, "--teaching-review", rollback_review,
                          "--profile", "linear_transform", "--preparation-id", rollback_prepare["result"]["preparation_id"],

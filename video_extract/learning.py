@@ -692,6 +692,9 @@ _CORRECTION_BLOCK = re.compile(
     r"<!-- correction-id: (correction-[0-9a-f-]{36}) -->\n(.*?)\n<!-- /correction-id: \1 -->",
     re.DOTALL,
 )
+_CORRECTION_MARKER = re.compile(
+    r"(?m)^<!--\s*(?P<closing>/?)correction-id:\s*(?P<id>[^\s>]+)\s*-->$"
+)
 
 
 def _correction_block(correction: dict[str, Any]) -> str:
@@ -719,17 +722,35 @@ def _replace_independent_claim(text: str, original: str, corrected: str) -> str:
 
 def _confirmed_correction_errors(text: str, corrections: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
+    known = {correction["correction_id"]: correction for correction in corrections}
     blocks: dict[str, list[str]] = {}
-    for correction_id, content in _CORRECTION_BLOCK.findall(text):
-        blocks.setdefault(correction_id, []).append(content)
+    active: tuple[str, int] | None = None
+    for marker in _CORRECTION_MARKER.finditer(text):
+        correction_id = marker.group("id"); closing = bool(marker.group("closing"))
+        if correction_id not in known:
+            errors.append(f"unknown correction marker: {correction_id}")
+        if not closing:
+            if active is not None:
+                errors.append(f"correction opening marker is nested or duplicated: {correction_id}")
+            else:
+                active = (correction_id, marker.start())
+        elif active is None:
+            errors.append(f"orphan correction closing marker: {correction_id}")
+        elif active[0] != correction_id:
+            errors.append(f"mismatched correction closing marker: {active[0]} != {correction_id}")
+            active = None
+        else:
+            blocks.setdefault(correction_id, []).append(text[active[1]:marker.end()])
+            active = None
+    if active is not None:
+        errors.append(f"unclosed correction opening marker: {active[0]}")
     independent_claims = _independent_claims(text)
     for correction in corrections:
         correction_blocks = blocks.get(correction["correction_id"], [])
         if len(correction_blocks) != 1:
             errors.append(f"confirmed correction block must occur exactly once: {correction['correction_id']}")
-        elif (f"纠正说法：{correction['corrected_claim']}" not in correction_blocks[0]
-              or f"适用边界：{correction.get('applicability', '')}" not in correction_blocks[0]):
-            errors.append(f"confirmed correction block content is incomplete: {correction['correction_id']}")
+        elif correction_blocks[0] != _correction_block(correction):
+            errors.append(f"confirmed correction block is not canonical: {correction['correction_id']}")
         if correction["original_claim"].rstrip("。！？!?") in independent_claims:
             errors.append(f"confirmed correction would reintroduce original claim: {correction['correction_id']}")
     return errors
@@ -742,7 +763,7 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
                        corrections_path: Path | None = None,
                        replay_payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if replay_payload is None:
-        text = draft.read_text(encoding="utf-8")
+        text = draft.read_bytes().decode("utf-8")
         evidence = json.loads(evidence_path.read_text(encoding="utf-8")); review = json.loads(review_path.read_text(encoding="utf-8"))
         requested_section_map = json.loads(section_map_path.read_text(encoding="utf-8")) if section_map_path else None
         metadata = json.loads(revision_metadata_path.read_text(encoding="utf-8")) if revision_metadata_path else None
@@ -965,7 +986,7 @@ def replay_explanation_candidate(config: WorkspaceConfig, candidate_path: Path) 
         return response(status="failed", workspace=str(config.config_path),
                         validation={"candidate": "failed", "draft_object": "failed"},
                         diagnostics=["candidate draft object is missing, corrupt, or unreachable"])
-    payload = {**proposal, "text": object_path.read_text(encoding="utf-8")}
+    payload = {**proposal, "text": object_path.read_bytes().decode("utf-8")}
     result = commit_explanation(config, proposal["question_id"], object_path, object_path, object_path,
                                 proposal["profile"], proposal["preparation_id"],
                                 candidate["observed_revision"], replay_payload=payload)
@@ -999,7 +1020,7 @@ def restore_explanation(config: WorkspaceConfig, question_id: str, source_revisi
                             validation={"locations": "failed"}, diagnostics=[
                                 "restored expression predates current historical question locations: "
                                 + ", ".join(sorted(missing_current_questions))])
-        text = _object_path(config, source["object_sha256"]).read_text(encoding="utf-8")
+        text = _object_path(config, source["object_sha256"]).read_bytes().decode("utf-8")
         text = _CORRECTION_BLOCK.sub("", text).rstrip()
         corrections = list(explanation.get("confirmed_corrections", []))
         for correction in corrections:
