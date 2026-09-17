@@ -41,6 +41,7 @@ ENTRIES = (
     InstallEntry("skill.extract-media", PROJECT / "integrations/skills/extract-media", ("skills", "extract-media"), "agents"),
     InstallEntry("skill.mandarin-audio", PROJECT / "integrations/skills/mandarin-audio", ("skills", "mandarin-audio"), "agents"),
     InstallEntry("skill.source-notes", PROJECT / "integrations/skills/source-notes", ("skills", "source-notes"), "agents"),
+    InstallEntry("skill.review", PROJECT / "integrations/skills/review", ("skills", "review"), "agents"),
 )
 
 

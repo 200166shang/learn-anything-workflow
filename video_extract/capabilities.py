@@ -70,6 +70,18 @@ CAPABILITIES: dict[str, Capability] = {
         authorization_category="local_workspace",
         recovery_query="capability run learning.learn with the same request",
     ),
+    "learning.review": Capability(
+        id="learning.review",
+        contract_version=1,
+        implementation_version=1,
+        implementation="video_extract.review:run_review",
+        input_type="review-request-v1",
+        output_type="command-response-v1",
+        side_effect="workspace_write",
+        dependencies=(),
+        authorization_category="local_workspace",
+        recovery_query="capability run learning.review with the same event_id",
+    ),
     "source.notes": Capability(
         id="source.notes",
         contract_version=1,
