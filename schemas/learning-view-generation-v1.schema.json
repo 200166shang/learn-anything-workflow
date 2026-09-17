@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/learning-view-generation-v1.schema.json",
+  "title": "Learning view generation v1",
+  "type": "object",
+  "required": ["schema_version", "generation_id", "module_id", "learning_commit_id", "root_digest", "view_sha256", "current_question_id", "nodes", "edges", "documents"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generation_id": {"type": "string", "pattern": "^view-generation-[0-9a-f]{64}$"},
+    "module_id": {"type": "string", "pattern": "^module-"},
+    "learning_commit_id": {"type": "string", "pattern": "^learning-commit-[0-9a-f]{64}$"},
+    "root_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "view_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "current_question_id": {"type": ["string", "null"]},
+    "nodes": {"type": "object"},
+    "edges": {"type": "array"},
+    "documents": {"type": "object"}
+  },
+  "additionalProperties": true
+}
