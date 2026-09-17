@@ -20,3 +20,19 @@ attachments and history through the existing authoritative notes commit.
 Stored note and frame objects remain readable if the original media later goes
 missing. Re-running preparation reuses valid transcripts and frames; deleting
 one frame regenerates only that frame.
+
+Visual preparation records are keyed by the registered source identity/version.
+Finalization must match the recorded approval, including review mode, candidate
+identities, image digests and the complete adopted set; removing both a Markdown
+image and its request attachment cannot bypass selection. To change that set,
+run preparation with an explicit new selection (an empty set requires a reason).
+Decisions remain recorded, and the final approval is stored in the note revision
+history. This adds optional `visual_review` to notes-v1 requests, notes and history;
+existing non-media note requests remain compatible.
+
+SRT locators normalize comma/dot milliseconds and horizontal spacing while
+preserving the original transcript bytes. ASR and frame cache receipts include
+the registered, versioned adapter ID; adapter authors must change that ID when
+changing implementation/version. Each successful frame is checkpointed before
+the next extraction. Untrusted adapter return details and exception strings are
+not published or persisted; failures report a fixed stage-specific retry message.

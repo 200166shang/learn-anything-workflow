@@ -19,6 +19,8 @@ from .command_response import response
 from .manifest import atomic_write_json, read_json
 from .source_registry import register
 from .workspace import WorkspaceConfig, WorkspaceError
+from .timed_cues import cue_ranges
+from .visual_approval import approval_record, record_preparation
 
 
 class TranscriptAdapter(Protocol):
@@ -101,9 +103,8 @@ def _artifact(config: WorkspaceConfig, operation: dict[str, Any], item_id: str,
 def _cue_timestamps(path: Path) -> list[int]:
     text = path.read_text(encoding="utf-8-sig")
     found = []
-    for hours, minutes, seconds, millis in re.findall(
-        r"(?m)^(\d\d):(\d\d):(\d\d)[,.](\d{3})\s+-->", text
-    ):
+    for cue in cue_ranges(text):
+        hours, minutes, seconds, millis = re.split(r"[:,]", cue.split(" --> ")[0])
         found.append((((int(hours) * 60 + int(minutes)) * 60 + int(seconds)) * 1000 + int(millis)))
     return found[:3]
 
@@ -132,7 +133,8 @@ def prepare_media_note(config: WorkspaceConfig, operation_id: str, item_id: str,
             atomic_write_json(transcript_receipt, {"origin": "formal_subtitles", "sha256": _sha256(transcript)})
     else:
         media = audio or video
-        adapter = TRANSCRIPT_ADAPTERS.get(transcript_adapter or "builtin.transcript-v1")
+        adapter_id = transcript_adapter or "builtin.transcript-v1"
+        adapter = TRANSCRIPT_ADAPTERS.get(adapter_id)
         if not media:
             return response(status="missing_input", workspace=str(config.config_path), operation_id=operation_id,
                             result={"available": []}, validation={"transcript": "missing"},
@@ -144,22 +146,23 @@ def prepare_media_note(config: WorkspaceConfig, operation_id: str, item_id: str,
         media_sha = _sha256(media)
         receipt = read_json(transcript_receipt) if transcript_receipt.is_file() else {}
         reusable = (transcript.is_file() and receipt.get("origin") == "asr"
+                    and receipt.get("adapter_id") == adapter_id
                     and receipt.get("input_sha256") == media_sha
                     and receipt.get("sha256") == _sha256(transcript) and bool(_cue_timestamps(transcript)))
         if not reusable:
-            token = hashlib.sha256(f"{operation_id}:{item_id}:transcript:{media_sha}".encode()).hexdigest()
+            token = hashlib.sha256(f"{operation_id}:{item_id}:transcript:{media_sha}:{adapter_id}".encode()).hexdigest()
             try:
-                details = adapter.transcribe(media, transcript, language=operation["request"]["language"],
+                adapter.transcribe(media, transcript, language=operation["request"]["language"],
                                              idempotency_token=token)
-            except Exception as exc:
+            except Exception:
                 return response(status="recoverable_failure", workspace=str(config.config_path),
                                 operation_id=operation_id, result={"available": [media.name]},
-                                validation={"transcript": "failed"}, diagnostics=[str(exc)],
+                                validation={"transcript": "failed"}, diagnostics=["transcript adapter failed; retry is available"],
                                 next_action={"type": "retry", "stage": "transcript"})
             if not transcript.is_file() or not _cue_timestamps(transcript):
                 raise WorkspaceError("transcript adapter did not produce a valid timed transcript")
-            atomic_write_json(transcript_receipt, {"origin": "asr", "input_sha256": media_sha,
-                                                    "sha256": _sha256(transcript), "details": details})
+            atomic_write_json(transcript_receipt, {"origin": "asr", "input_sha256": media_sha, "adapter_id": adapter_id,
+                                                    "sha256": _sha256(transcript)})
     if not _cue_timestamps(transcript):
         raise ValueError("prepared transcript has no complete timed cues")
     registered = register(config, transcript, title=f"{item_id} transcript")["result"]
@@ -171,7 +174,9 @@ def prepare_media_note(config: WorkspaceConfig, operation_id: str, item_id: str,
                         validation={"transcript": "passed", "visual_evidence": "missing"},
                         next_action={"type": "input", "missing": "video"})
     if video:
-        adapter = FRAME_ADAPTERS.get(frame_adapter or "builtin.frames-v1")
+        record_preparation(config, registered["source_id"], registered["source_version"], None)
+        adapter_id = frame_adapter or "builtin.frames-v1"
+        adapter = FRAME_ADAPTERS.get(adapter_id)
         if adapter is None:
             return response(status="missing_dependency", workspace=str(config.config_path), operation_id=operation_id,
                             result={"available": ["transcript", "video"], "source_id": registered["source_id"]},
@@ -186,28 +191,32 @@ def prepare_media_note(config: WorkspaceConfig, operation_id: str, item_id: str,
         for index, timestamp_ms in enumerate(_cue_timestamps(transcript), 1):
             candidate_id = f"frame-{index:03d}"
             image = root / "candidates" / f"frame-{index:03d}-{timestamp_ms}.png"
-            token = hashlib.sha256(f"{operation_id}:{item_id}:frame:{video_sha}:{timestamp_ms}".encode()).hexdigest()
+            token = hashlib.sha256(f"{operation_id}:{item_id}:frame:{video_sha}:{timestamp_ms}:{adapter_id}".encode()).hexdigest()
             previous = previous_candidates.get(candidate_id, {})
             reusable = (image.is_file() and previous.get("timestamp_ms") == timestamp_ms
+                        and previous.get("adapter_id") == adapter_id
                         and previous.get("source_video_sha256") == video_sha
                         and previous.get("image_sha256") == _sha256(image))
             if not reusable:
                 try:
-                    details = adapter.extract(video, image, timestamp_ms=timestamp_ms, idempotency_token=token)
-                except Exception as exc:
+                    adapter.extract(video, image, timestamp_ms=timestamp_ms, idempotency_token=token)
+                    details = {"result": "decoded_frame"}
+                except Exception:
                     return response(status="recoverable_failure", workspace=str(config.config_path),
                                     operation_id=operation_id,
                                     result={"available": ["transcript", "video"], "candidate_id": candidate_id},
                                     validation={"transcript": "passed", "visual_evidence": "failed"},
-                                    diagnostics=[str(exc)],
+                                    diagnostics=["frame adapter failed; retry is available"],
                                     next_action={"type": "retry", "stage": "frame", "candidate_id": candidate_id})
             else:
                 details = {"reuse": "verified_candidate"}
             if not image.is_file() or image.stat().st_size == 0:
                 raise WorkspaceError("frame adapter did not produce a non-empty image")
-            candidates.append({"candidate_id": candidate_id, "timestamp_ms": timestamp_ms,
+            candidates.append({"candidate_id": candidate_id, "timestamp_ms": timestamp_ms, "adapter_id": adapter_id,
                                "image": str(image), "image_sha256": _sha256(image),
                                "source_video_sha256": video_sha, "provenance": details})
+            atomic_write_json(candidate_index, {"kind": "video_frames", "review_mode": "unreviewed",
+                                                 "candidates": candidates})
         evidence = {"kind": "video_frames", "review_mode": "unreviewed", "candidates": candidates,
                     "candidate_index": str(candidate_index)}
         atomic_write_json(candidate_index, evidence)
@@ -236,6 +245,8 @@ def prepare_media_note(config: WorkspaceConfig, operation_id: str, item_id: str,
     else:
         next_action = note["next_action"]
     if evidence.get("approved") is not None:
+        visual_review = approval_record(evidence)
+        record_preparation(config, registered["source_id"], registered["source_version"], visual_review)
         request_path = root / "finalize-request.json"
         image_lines = "\n".join(
             f"![画面证据 {item['candidate_id']}]({Path(item['image']).name})" for item in evidence["approved"]
@@ -244,9 +255,9 @@ def prepare_media_note(config: WorkspaceConfig, operation_id: str, item_id: str,
                     "source_version": registered["source_version"], "expected_revision": 0,
                     "markdown": "# 来源笔记\n\n<!-- 模型应以转写证据完成正文，并保留所有采用画面 -->\n\n" + image_lines,
                     "citations": [{"claim": "待模型填写", "locator_type": "timestamp",
-                                   "locator": re.search(r"(?m)^\d\d:\d\d:\d\d,\d{3} --> \d\d:\d\d:\d\d,\d{3}$",
-                                                        transcript.read_text(encoding="utf-8-sig")).group(0)}],
+                                   "locator": cue_ranges(transcript.read_text(encoding="utf-8-sig"))[0]}],
                     "corrections": [], "attachments": [item["image"] for item in evidence["approved"]],
+                    "visual_review": visual_review,
                     "association": {"status": "unverified", "evidence": None}}
         atomic_write_json(request_path, template)
         result["finalize_request"] = str(request_path)

@@ -1,4 +1,5 @@
 import json
+import pytest
 from pathlib import Path
 
 from video_extract.media_note_operations import (
@@ -216,4 +217,123 @@ def test_public_capability_reports_asr_adapter_failure_without_claiming_completi
 
     assert result["status"] == "recoverable_failure"
     assert result["result"]["validation"]["transcript"] == "failed"
-    assert "fixture ASR unavailable" in result["result"]["diagnostics"][0]
+    assert result["result"]["diagnostics"] == ["transcript adapter failed; retry is available"]
+
+
+def test_dot_and_spaced_srt_cues_prepare_and_finalize_without_rewriting_source(tmp_path):
+    original = b"1\n00:00:01.000   -->   00:00:02.000\nClaim\n"
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video", "subtitles": original}))
+    register_frame_adapter("fixture.frames-v1", FrameFixture())
+    config, acquired = setup_operation(tmp_path, ["subtitles", "video"])
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps({"approved": ["frame-001"]}))
+    selected = prepare_media_note(config, acquired["operation_id"], "chapter-1",
+                                  frame_adapter="fixture.frames-v1", selection=selection)
+    assert finalize_note(config, Path(selected["result"]["finalize_request"]))["status"] == "completed"
+    assert any(Path(ref).read_bytes() == original for ref in acquired["artifact_refs"])
+
+
+def test_frame_retry_keeps_successful_first_frame(tmp_path):
+    class InterruptedFrames(FrameFixture):
+        failed = False
+
+        def extract(self, video, target, *, timestamp_ms, idempotency_token):
+            if timestamp_ms == 3000 and not self.failed:
+                self.failed = True
+                raise RuntimeError("interrupted")
+            return super().extract(video, target, timestamp_ms=timestamp_ms, idempotency_token=idempotency_token)
+
+    subtitles = b"1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond\n"
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video", "subtitles": subtitles}))
+    frames = InterruptedFrames()
+    register_frame_adapter("fixture.retry-v1", frames)
+    config, acquired = setup_operation(tmp_path, ["subtitles", "video"])
+    assert prepare_media_note(config, acquired["operation_id"], "chapter-1", frame_adapter="fixture.retry-v1")["status"] == "recoverable_failure"
+    assert prepare_media_note(config, acquired["operation_id"], "chapter-1", frame_adapter="fixture.retry-v1")["status"] == "awaiting_model"
+    assert [timestamp for _, timestamp in frames.calls] == [1000, 3000]
+
+
+def test_adapter_details_and_failure_messages_do_not_leak_secrets(tmp_path):
+    secret = "https://user:password@example.com?token=SECRET"
+
+    class SecretTranscript(TranscriptFixture):
+        def transcribe(self, *args, **kwargs):
+            super().transcribe(*args, **kwargs)
+            return {"engine": secret, "token": secret, "nested": {"secret": secret}}
+
+    class SecretFrame:
+        def extract(self, *args, **kwargs):
+            raise RuntimeError(secret)
+
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video"}))
+    register_transcript_adapter("fixture.secret-v1", SecretTranscript())
+    register_frame_adapter("fixture.secret-v1", SecretFrame())
+    config, acquired = setup_operation(tmp_path, ["video"])
+    result = prepare_media_note(config, acquired["operation_id"], "chapter-1",
+                                transcript_adapter="fixture.secret-v1", frame_adapter="fixture.secret-v1")
+    assert result["status"] == "recoverable_failure"
+    assert secret not in json.dumps(result)
+    assert all(secret not in path.read_text() for path in config.local.rglob("*.json"))
+
+
+def test_changing_adapter_identity_invalidates_transcript_and_frame_cache(tmp_path):
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video"}))
+    config, acquired = setup_operation(tmp_path, ["video"])
+    for version in ("v1", "v2"):
+        transcript, frames = TranscriptFixture(), FrameFixture()
+        register_transcript_adapter("fixture.cache-" + version, transcript)
+        register_frame_adapter("fixture.cache-" + version, frames)
+        result = prepare_media_note(config, acquired["operation_id"], "chapter-1",
+                                    transcript_adapter="fixture.cache-" + version,
+                                    frame_adapter="fixture.cache-" + version)
+        assert result["status"] == "awaiting_model"
+        assert transcript.calls == 1
+        assert len(frames.calls) == 1
+
+
+@pytest.mark.parametrize("tamper", ["omit", "replace", "review_mode", "remove_binding"])
+def test_finalize_rechecks_prepared_visual_approval(tmp_path, tamper):
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video", "subtitles":
+                          b"1\n00:00:01,000 --> 00:00:02,000\nClaim\n"}))
+    register_frame_adapter("fixture.frames-v1", FrameFixture())
+    config, acquired = setup_operation(tmp_path, ["subtitles", "video"])
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps({"approved": ["frame-001"]}))
+    selected = prepare_media_note(config, acquired["operation_id"], "chapter-1",
+                                  frame_adapter="fixture.frames-v1", selection=selection)
+    request_path = Path(selected["result"]["finalize_request"])
+    request = json.loads(request_path.read_text())
+    if tamper == "omit":
+        request["attachments"] = []
+        request["markdown"] = "# Notes without approved image"
+    elif tamper == "replace":
+        Path(request["attachments"][0]).write_bytes(b"different image")
+    elif tamper == "review_mode":
+        request.setdefault("visual_review", {})["review_mode"] = "human"
+    else:
+        request.pop("visual_review", None)
+    request_path.write_text(json.dumps(request))
+    with pytest.raises(ValueError, match="visual approval"):
+        finalize_note(config, request_path)
+
+
+def test_explicit_reselection_records_new_decision_and_publishes_review_provenance(tmp_path):
+    register_media_adapter("fixture.media-notes-v1", MediaFixture({"video": b"video", "subtitles":
+                          b"1\n00:00:01,000 --> 00:00:02,000\nClaim\n"}))
+    register_frame_adapter("fixture.frames-v1", FrameFixture())
+    config, acquired = setup_operation(tmp_path, ["subtitles", "video"])
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps({"approved": ["frame-001"]}))
+    first = prepare_media_note(config, acquired["operation_id"], "chapter-1",
+                               frame_adapter="fixture.frames-v1", selection=selection)
+    original = json.loads(Path(first["result"]["finalize_request"]).read_text())["visual_review"]
+    selection.write_text(json.dumps({"approved": [], "no_useful_visuals_reason": "frame is irrelevant to this claim"}))
+    selected = prepare_media_note(config, acquired["operation_id"], "chapter-1",
+                                  frame_adapter="fixture.frames-v1", selection=selection, human_reviewed=True)
+    result = finalize_note(config, Path(selected["result"]["finalize_request"]))
+    review = result["provenance"]["visual_review"]
+    assert review["review_mode"] == "human"
+    assert review["approval_id"] != original["approval_id"]
+    assert review["approved"] == []
+    assert review["no_useful_visuals_reason"] == "frame is irrelevant to this claim"
+    assert audit_notes(config)["status"] == "completed"
