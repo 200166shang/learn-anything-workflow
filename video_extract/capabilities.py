@@ -281,9 +281,9 @@ run_source_notes.__capability_contract__ = {
 
 
 def run_learning(request: dict[str, Any]) -> dict[str, Any]:
-    from .learning import (LearningPublishError, commit_explanation, create_module, create_thread,
+    from .learning import (LearningPublishError, back, commit_explanation, create_module, create_thread,
                            locate, prepare_explanation, publish_failure_response, pursue,
-                           recommend_roots, show_module, show_thread)
+                           recommend_roots, record_feedback, resume, show_module, show_thread)
 
     workspace = discover_workspace(Path(request["workspace"]))
     action = request.get("action")
@@ -299,8 +299,23 @@ def run_learning(request: dict[str, Any]) -> dict[str, Any]:
                                  request.get("expected_revision"))
         if action == "thread.show": return show_thread(workspace, request["thread_id"])
         if action == "pursue":
+            if request.get("existing_question_id") and not str(request.get("actual_question") or "").strip():
+                return response(status="missing_input", workspace=str(workspace.config_path),
+                                validation={"actual_question": "failed"},
+                                diagnostics=["actual_question is required with existing_question_id"])
             return pursue(workspace, request["thread_id"], request["from_question_id"], request["relation"],
-                          request["question"], request.get("expected_revision"))
+                          request.get("question"), request.get("expected_revision"),
+                          request.get("existing_question_id"), bool(request.get("independent", False)),
+                          request.get("actual_question"))
+        if action == "feedback":
+            return record_feedback(workspace, request["question_id"], request["state"], request["text"],
+                                   request.get("confusion"), request.get("expected_revision"))
+        if action == "resume":
+            return resume(workspace, request.get("thread_id"), request.get("question_id"),
+                          request.get("from_question_id"), request.get("expected_revision"),
+                          request.get("module_id"))
+        if action == "back":
+            return back(workspace, request["thread_id"], request.get("expected_revision"))
         if action == "locate": return locate(workspace, request["question_id"])
         if action == "explanation.prepare":
             return prepare_explanation(workspace, request["question_id"], request["profile"])

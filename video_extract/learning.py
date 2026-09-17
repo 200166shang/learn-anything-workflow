@@ -108,6 +108,16 @@ def _deep_validate(value: dict[str, Any]) -> None:
                            if question["thread_id"] == thread_id}
         if reachable != owned_questions:
             raise WorkspaceError(f"thread contains questions unreachable from its root: {thread_id}")
+        for frame in thread.get("return_route", []):
+            framed_thread = threads.get(frame["thread_id"])
+            framed_question = questions.get(frame["question_id"])
+            if framed_thread is None or framed_thread["module_id"] != frame["module_id"] \
+                    or framed_question is None or framed_question["thread_id"] != frame["thread_id"]:
+                raise WorkspaceError(f"thread return route is invalid: {thread_id}")
+        for entry in thread.get("entry_history", []):
+            if any(questions.get(question_id, {}).get("thread_id") != thread_id
+                   for question_id in (entry["from_question_id"], entry["to_question_id"])):
+                raise WorkspaceError(f"thread entry history is invalid: {thread_id}")
     for question_id, question in questions.items():
         if question["question_id"] != question_id or question["thread_id"] not in threads:
             raise WorkspaceError(f"question identity or thread reference is invalid: {question_id}")
@@ -387,6 +397,41 @@ def _question(question_id: str, thread_id: str, text: str) -> dict[str, Any]:
             "explanation_refs": []}
 
 
+def _thread_with_navigation(thread: dict[str, Any]) -> dict[str, Any]:
+    """Materialize optional T08 fields without rewriting a valid T07 snapshot."""
+    return {**thread, "return_route": list(thread.get("return_route", [])),
+            "entry_history": list(thread.get("entry_history", []))}
+
+
+def _question_state(record: dict[str, Any], question_id: str) -> dict[str, Any]:
+    history = sorted((item for item in record["feedbacks"].values()
+                      if item["question_id"] == question_id), key=lambda item: item["created_at"])
+    question = record["questions"][question_id]
+    return {"latest_feedback": history[-1] if history else None, "feedback_history": history,
+            "unresolved_confusions": list(question["unresolved_confusions"])}
+
+
+def _snapshot_at_revision(config: WorkspaceConfig, snapshot: dict[str, Any], revision: int) -> dict[str, Any] | None:
+    if revision < 0 or revision > snapshot["revision"]:
+        return None
+    current = snapshot
+    commits = _roots(config)[1]
+    while current["revision"] > revision and current.get("parent_commit_id"):
+        path = commits / f'{current["parent_commit_id"]}.json'
+        if not path.is_file():
+            return None
+        current = read_json(path)
+    return current if current["revision"] == revision else (_empty() if revision == 0 else None)
+
+
+def _feedback_unchanged_since(config: WorkspaceConfig, snapshot: dict[str, Any], expected: int,
+                              question_id: str) -> bool:
+    previous = _snapshot_at_revision(config, snapshot, expected)
+    if previous is None:
+        return False
+    return _question_state(previous["record"], question_id) == _question_state(snapshot["record"], question_id)
+
+
 def create_thread(config: WorkspaceConfig, module_id: str, root_text: str,
                   expected_revision: int | None = None) -> dict[str, Any]:
     if not root_text.strip():
@@ -404,7 +449,8 @@ def create_thread(config: WorkspaceConfig, module_id: str, root_text: str,
         thread_id = "thread-" + str(uuid.uuid4()); question_id = "question-" + str(uuid.uuid4())
         question = _question(question_id, thread_id, root_text)
         thread = {"thread_id": thread_id, "module_id": module_id, "root_question_id": question_id,
-                  "current_question_id": question_id, "revision": 1, "created_at": _now()}
+                  "current_question_id": question_id, "revision": 1, "created_at": _now(),
+                  "return_route": [], "entry_history": []}
         updated_module = {**module, "thread_ids": [*module["thread_ids"], thread_id],
                           "last_active_thread_id": thread_id}
         updated = {**record, "modules": {**record["modules"], module_id: updated_module},
@@ -417,8 +463,14 @@ def create_thread(config: WorkspaceConfig, module_id: str, root_text: str,
 
 
 def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relation: str,
-           text: str, expected_revision: int | None = None) -> dict[str, Any]:
-    if not text.strip():
+           text: str | None, expected_revision: int | None = None,
+           existing_question_id: str | None = None, independent: bool = False,
+           actual_question: str | None = None) -> dict[str, Any]:
+    if existing_question_id and not (actual_question or "").strip():
+        return response(status="missing_input", workspace=str(config.config_path),
+                        validation={"actual_question": "failed"},
+                        diagnostics=["existing question reentry requires the user's non-empty actual question"])
+    if not existing_question_id and not (text or "").strip():
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=["actual question must be non-empty"])
     if relation not in {"deepens", "applies", "related"}:
@@ -426,43 +478,206 @@ def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relat
                         diagnostics=["relation must be deepens, applies, or related"])
     with package_lock(_roots(config)[2].parent):
         snapshot = _load(config); record = snapshot["record"]
+        normalized_actual = (actual_question or text or "").strip()
+        target_effect = existing_question_id or "new_question"
+        intent = {"thread_id": thread_id, "from_question_id": from_question_id,
+                  "existing_question_id": existing_question_id, "question": text.strip() if text else None,
+                  "actual_question": normalized_actual, "relation": relation, "independent": bool(independent),
+                  "position_effect": {"set_current_question_id": target_effect,
+                                      "push_return_question_id": from_question_id}}
         if expected_revision is not None:
-            conflict = _revision_conflict(config, snapshot, expected_revision, "learning.pursue", {"thread_id": thread_id, "question": text})
+            conflict = _revision_conflict(config, snapshot, expected_revision, "learning.pursue", intent)
             if conflict: return conflict
         thread = record["threads"].get(thread_id); source = record["questions"].get(from_question_id)
         if thread is None or source is None or source["thread_id"] != thread_id:
             return response(status="missing_input", workspace=str(config.config_path),
                             diagnostics=["unknown thread/from-question relationship"])
-        question_id = "question-" + str(uuid.uuid4()); relationship_id = "relationship-" + str(uuid.uuid4())
-        question = _question(question_id, thread_id, text)
+        if not existing_question_id and not independent:
+            possible = [question_id for question_id, item in record["questions"].items()
+                        if item["thread_id"] == thread_id and item["original_question"] == (text or "").strip()]
+            if possible:
+                return response(status="awaiting_user", workspace=str(config.config_path), result={
+                    "possible_question_ids": possible, "submitted_question": (text or "").strip(),
+                    "persisted": False}, validation={"question_identity": "ambiguous"},
+                    next_action={"type": "user", "reason": "choose an existing question identity or confirm this is independent"})
+        if existing_question_id:
+            question = record["questions"].get(existing_question_id)
+            if question is None or question["thread_id"] != thread_id:
+                return response(status="missing_input", workspace=str(config.config_path),
+                                diagnostics=["existing question is unknown or belongs to another thread"])
+            question_id = existing_question_id
+        else:
+            question_id = "question-" + str(uuid.uuid4()); question = _question(question_id, thread_id, text or "")
+        relationship_id = "relationship-" + str(uuid.uuid4())
         relationship = {"relationship_id": relationship_id, "thread_id": thread_id,
                         "from_question_id": from_question_id, "to_question_id": question_id,
                         "type": relation, "created_at": _now()}
-        updated_thread = {**thread, "current_question_id": question_id, "revision": thread["revision"] + 1}
+        entry = {"entry_id": "entry-" + str(uuid.uuid4()), "from_question_id": from_question_id,
+                 "to_question_id": question_id, "original_text": normalized_actual,
+                 "relation": relation, "created_at": _now()}
+        navigable = _thread_with_navigation(thread)
+        updated_thread = {**navigable, "current_question_id": question_id, "revision": thread["revision"] + 1,
+                          "return_route": [*navigable["return_route"], {"module_id": thread["module_id"],
+                              "thread_id": thread_id, "question_id": from_question_id, "entered_at": _now()}],
+                          "entry_history": [*navigable["entry_history"], entry]}
         module_id = thread["module_id"]; module = record["modules"][module_id]
         updated = {**record,
                    "modules": {**record["modules"], module_id: {**module, "last_active_thread_id": thread_id}},
                    "threads": {**record["threads"], thread_id: updated_thread},
-                   "questions": {**record["questions"], question_id: question},
+                   "questions": ({**record["questions"]} if existing_question_id else
+                                 {**record["questions"], question_id: question}),
                    "relationships": {**record["relationships"], relationship_id: relationship}}
         published = _publish(config, snapshot, updated)
     return response(status="completed", workspace=str(config.config_path), result={"question": question,
-                    "relationship": relationship, "thread": updated_thread,
+                    "relationship": relationship, "entry": entry, "thread": updated_thread,
                     "revision": published["revision"], "commit_id": published["commit_id"]},
                     validation={"learning_record": "passed"})
+
+
+def replay_candidate(config: WorkspaceConfig, candidate: Path) -> dict[str, Any]:
+    candidates = _roots(config)[3].resolve(strict=False)
+    resolved = candidate.resolve(strict=True)
+    if resolved.parent != candidates or resolved.name.startswith("candidate-") is False:
+        return response(status="missing_input", workspace=str(config.config_path),
+                        diagnostics=["candidate must be a learning conflict candidate from this workspace"])
+    value = read_json(resolved)
+    if value.get("schema_version") != 2 or value.get("operation") != "learning.pursue" \
+            or not isinstance(value.get("proposal"), dict):
+        return response(status="missing_input", workspace=str(config.config_path),
+                        diagnostics=["candidate is not a replayable learning.pursue intent"])
+    proposal = value["proposal"]
+    required = {"thread_id", "from_question_id", "existing_question_id", "question",
+                "actual_question", "relation", "independent", "position_effect"}
+    if set(proposal) != required:
+        return response(status="missing_input", workspace=str(config.config_path),
+                        diagnostics=["candidate pursue intent is incomplete"])
+    return pursue(config, proposal["thread_id"], proposal["from_question_id"], proposal["relation"],
+                  proposal["question"], value.get("observed_revision"), proposal["existing_question_id"],
+                  proposal["independent"], proposal["actual_question"])
 
 
 def show_thread(config: WorkspaceConfig, thread_id: str) -> dict[str, Any]:
     snapshot = _load(config); record = snapshot["record"]; thread = record["threads"].get(thread_id)
     if thread is None:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown thread_id: {thread_id}"])
-    return response(status="completed", workspace=str(config.config_path), result={"thread": thread,
+    question_ids = [key for key, value in record["questions"].items() if value["thread_id"] == thread_id]
+    return response(status="completed", workspace=str(config.config_path), result={"thread": _thread_with_navigation(thread),
                     "questions": [value for value in record["questions"].values() if value["thread_id"] == thread_id],
                     "relationships": [value for value in record["relationships"].values() if value["thread_id"] == thread_id],
+                    "question_states": {key: _question_state(record, key) for key in question_ids},
                     "revision": snapshot["revision"], "commit_id": snapshot["commit_id"]},
                     validation={"learning_record": "passed"})
 
 
+def record_feedback(config: WorkspaceConfig, question_id: str, state: str, text: str,
+                    confusion: str | None = None, expected_revision: int | None = None) -> dict[str, Any]:
+    if state not in {"understood", "confused", "parked"} or not text.strip():
+        return response(status="missing_input", workspace=str(config.config_path),
+                        diagnostics=["feedback needs an explicit understood, confused, or parked state and original text"])
+    with package_lock(_roots(config)[2].parent):
+        snapshot = _load(config); record = snapshot["record"]; question = record["questions"].get(question_id)
+        if question is None:
+            return response(status="missing_input", workspace=str(config.config_path),
+                            diagnostics=[f"unknown question_id: {question_id}"])
+        if expected_revision is not None and expected_revision != snapshot["revision"] \
+                and not _feedback_unchanged_since(config, snapshot, expected_revision, question_id):
+            conflict = _revision_conflict(config, snapshot, expected_revision, "learning.feedback",
+                                          {"question_id": question_id, "state": state,
+                                           "original_text": text, "confusion": confusion})
+            if conflict: return conflict
+        feedback_id = "feedback-" + str(uuid.uuid4())
+        feedback = {"feedback_id": feedback_id, "question_id": question_id, "state": state,
+                    "original_text": text.strip(), "created_at": _now()}
+        confusions = list(question["unresolved_confusions"])
+        if confusion and confusion.strip() and confusion.strip() not in confusions:
+            confusions.append(confusion.strip())
+        updated_question = {**question, "unresolved_confusions": confusions}
+        updated = {**record, "questions": {**record["questions"], question_id: updated_question},
+                   "feedbacks": {**record["feedbacks"], feedback_id: feedback}}
+        published = _publish(config, snapshot, updated)
+    return response(status="completed", workspace=str(config.config_path), result={"feedback": feedback,
+                    "question_state": _question_state(updated, question_id), "revision": published["revision"],
+                    "commit_id": published["commit_id"]}, validation={"learning_record": "passed"})
+
+
+def resume(config: WorkspaceConfig, thread_id: str | None, question_id: str | None = None,
+           from_question_id: str | None = None, expected_revision: int | None = None,
+           module_id: str | None = None) -> dict[str, Any]:
+    snapshot = _load(config); record = snapshot["record"]
+    if module_id:
+        module = record["modules"].get(module_id)
+        if module is None:
+            return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown module_id: {module_id}"])
+        thread_id = module["last_active_thread_id"]
+        if thread_id is None:
+            return response(status="missing_input", workspace=str(config.config_path), diagnostics=["module has no learning thread to resume"])
+    thread = record["threads"].get(thread_id or "")
+    if thread is None:
+        return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown thread_id: {thread_id}"])
+    current_state = _question_state(record, thread["current_question_id"])
+    if question_id is None:
+        status = "awaiting_user" if current_state["latest_feedback"] and current_state["latest_feedback"]["state"] == "parked" else "completed"
+        return response(status=status, workspace=str(config.config_path), result={"thread": _thread_with_navigation(thread),
+                        "question": record["questions"][thread["current_question_id"]], "question_state": current_state,
+                        "choices": ([{"action": "continue", "question_id": thread["current_question_id"]},
+                                     {"action": "back"}] if status == "awaiting_user" else [])},
+                        next_action=({"type": "user", "reason": "choose whether to continue the parked question or return"}
+                                     if status == "awaiting_user" else None))
+    target = record["questions"].get(question_id)
+    if target is None or target["thread_id"] != thread_id:
+        return response(status="missing_input", workspace=str(config.config_path), diagnostics=["resume target must belong to thread"])
+    origin_id = from_question_id or thread["current_question_id"]
+    origin = record["questions"].get(origin_id)
+    if origin is None:
+        return response(status="missing_input", workspace=str(config.config_path), diagnostics=["resume origin is unknown"])
+    origin_thread = record["threads"][origin["thread_id"]]
+    with package_lock(_roots(config)[2].parent):
+        snapshot = _load(config); record = snapshot["record"]; thread = record["threads"][thread_id]
+        if expected_revision is not None:
+            conflict = _revision_conflict(config, snapshot, expected_revision, "learning.resume",
+                                          {"thread_id": thread_id, "question_id": question_id,
+                                           "from_question_id": origin_id})
+            if conflict: return conflict
+        navigable = _thread_with_navigation(thread)
+        updated_thread = {**navigable, "current_question_id": question_id, "revision": thread["revision"] + 1,
+                          "return_route": [*navigable["return_route"], {"module_id": origin_thread["module_id"],
+                              "thread_id": origin_thread["thread_id"], "question_id": origin_id, "entered_at": _now()}]}
+        module = record["modules"][thread["module_id"]]
+        updated = {**record, "threads": {**record["threads"], thread_id: updated_thread},
+                   "modules": {**record["modules"], module["module_id"]: {**module, "last_active_thread_id": thread_id}}}
+        published = _publish(config, snapshot, updated)
+    return response(status="completed", workspace=str(config.config_path), result={"thread": updated_thread,
+                    "question": target, "revision": published["revision"], "commit_id": published["commit_id"]})
+
+
+def back(config: WorkspaceConfig, thread_id: str, expected_revision: int | None = None) -> dict[str, Any]:
+    with package_lock(_roots(config)[2].parent):
+        snapshot = _load(config); record = snapshot["record"]; thread = record["threads"].get(thread_id)
+        if thread is None:
+            return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown thread_id: {thread_id}"])
+        if expected_revision is not None:
+            conflict = _revision_conflict(config, snapshot, expected_revision, "learning.back", {"thread_id": thread_id})
+            if conflict: return conflict
+        navigable = _thread_with_navigation(thread)
+        if not navigable["return_route"]:
+            return response(status="missing_input", workspace=str(config.config_path), diagnostics=["return route is empty"])
+        frame = navigable["return_route"][-1]; origin_thread = record["threads"][frame["thread_id"]]
+        popped_thread = {**navigable, "revision": thread["revision"] + 1,
+                         "return_route": navigable["return_route"][:-1]}
+        if origin_thread["thread_id"] == thread_id:
+            returned_thread = {**popped_thread, "current_question_id": frame["question_id"]}
+            threads = {**record["threads"], thread_id: returned_thread}
+        else:
+            returned_thread = {**_thread_with_navigation(origin_thread), "current_question_id": frame["question_id"],
+                               "revision": origin_thread["revision"] + 1}
+            threads = {**record["threads"], thread_id: popped_thread,
+                       origin_thread["thread_id"]: returned_thread}
+        origin_module = record["modules"][frame["module_id"]]
+        updated = {**record, "threads": threads, "modules": {**record["modules"],
+                   frame["module_id"]: {**origin_module, "last_active_thread_id": frame["thread_id"]}}}
+        published = _publish(config, snapshot, updated)
+    return response(status="completed", workspace=str(config.config_path), result={"thread": returned_thread,
+                    "returned_to": frame, "revision": published["revision"], "commit_id": published["commit_id"]})
 def _parse_code_locator(locator: dict[str, Any]) -> tuple[str, str, str]:
     value = str(locator.get("value", ""))
     kind = locator.get("kind")
