@@ -22,6 +22,8 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 
 SCHEMA_VERSION = 1
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/backup-manifest-v1.schema.json").read_text())
+DELIVERY_SCHEMA = json.loads((Path(__file__).resolve().parent.parent /
+                              "schemas/delivery-operation-v1.schema.json").read_text())
 MANIFEST = "backup-manifest.json"
 STORE_PREFIXES = {"sources": "", "notes": "source-notes", "learning": "learning",
                   "review": "review", "practice": "practices", "cards": "cards"}
@@ -126,7 +128,11 @@ def _receipt_files(results: Path) -> list[Path]:
             required = {"schema_version", "operation_id", "status", "authoritative_revision",
                         "authoritative_digest", "intent", "artifact_facts", "attempts",
                         "reconciliation", "receipt"}
-            if not isinstance(value, dict) or set(value) != required \
+            is_delivery = value.get("intent", {}).get("capability_id") == "delivery.lark"
+            delivery_errors = list(Draft202012Validator(DELIVERY_SCHEMA).iter_errors(value)) if is_delivery else []
+            if is_delivery and (delivery_errors or value.get("status") != "completed"):
+                raise WorkspaceError(f"invalid operation receipt: {path}")
+            if not is_delivery and (not isinstance(value, dict) or set(value) != required \
                     or value.get("schema_version") != 1 \
                     or not isinstance(value.get("operation_id"), str) \
                     or not isinstance(value.get("authoritative_revision"), int) \
@@ -139,7 +145,7 @@ def _receipt_files(results: Path) -> list[Path]:
                     or not isinstance(value.get("attempts"), list) \
                     or not isinstance(value.get("reconciliation"), list) \
                     or not isinstance(value.get("receipt"), dict) \
-                    or not isinstance(value["receipt"].get("state"), str):
+                    or not isinstance(value["receipt"].get("state"), str)):
                 raise WorkspaceError(f"invalid operation receipt: {path}")
             forbidden = {"token", "authorization", "cookie", "password", "secret", "credential"}
             def check(item: Any) -> None:
