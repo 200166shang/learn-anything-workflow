@@ -513,6 +513,138 @@ def test_candidate_sync_failure_does_not_claim_a_preserved_candidate(tmp_path: P
     assert not list(candidates.glob("candidate-*.json"))
 
 
+def test_reenter_existing_question_preserves_identity_and_records_actual_entry_route(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "相机标定如何工作？")
+    _, projected = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                       "--relation", "deepens", "--question", "投影是什么？", "--workspace", config, "--json")
+    projection_id = projected["result"]["question"]["question_id"]
+    _, branch = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                    "--relation", "applies", "--question", "基向量如何用？", "--workspace", config, "--json")
+    branch_id = branch["result"]["question"]["question_id"]
+
+    code, entered = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", branch_id,
+                        "--existing-question-id", projection_id, "--relation", "related",
+                        "--workspace", config, "--json")
+
+    assert code == 0
+    assert entered["result"]["question"]["question_id"] == projection_id
+    assert entered["result"]["entry"]["from_question_id"] == branch_id
+    _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert len([q for q in shown["result"]["questions"] if q["question_id"] == projection_id]) == 1
+    assert shown["result"]["thread"]["return_route"][-1]["question_id"] == branch_id
+
+
+def test_feedback_keeps_latest_history_and_confusions_without_inferring_silence(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, question_id = create_root(tmp_path, config, source, "线性变换是什么？")
+    _, before = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert before["result"]["question_states"][question_id]["latest_feedback"] is None
+    _, confused = cli("learning", "feedback", "--question-id", question_id, "--state", "confused",
+                      "--text", "仍不理解矩阵列为什么是基向量", "--confusion", "矩阵列与基向量的因果关系",
+                      "--workspace", config, "--json")
+    _, parked = cli("learning", "feedback", "--question-id", question_id, "--state", "parked",
+                    "--text", "先放一放", "--workspace", config, "--json")
+    assert confused["result"]["feedback"]["state"] == "confused"
+    assert parked["result"]["question_state"]["latest_feedback"]["state"] == "parked"
+    assert [x["state"] for x in parked["result"]["question_state"]["feedback_history"]] == ["confused", "parked"]
+    assert parked["result"]["question_state"]["unresolved_confusions"] == ["矩阵列与基向量的因果关系"]
+
+
+def test_locate_and_resume_preview_are_read_only_while_explicit_resume_and_back_are_atomic(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, child = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                   "--relation", "deepens", "--question", "子问题", "--workspace", config, "--json")
+    child_id = child["result"]["question"]["question_id"]
+    cli("learning", "feedback", "--question-id", child_id, "--state", "parked", "--text", "暂放",
+        "--workspace", config, "--json")
+    _, before = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    revision = before["result"]["revision"]
+    _, located = cli("learning", "locate", root_id, "--workspace", config, "--json")
+    code, preview = cli("learning", "resume", "--thread-id", thread_id, "--workspace", config, "--json")
+    assert code == 3 and preview["status"] == "awaiting_user"
+    assert {x["action"] for x in preview["result"]["choices"]} == {"continue", "back"}
+    _, unchanged = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert unchanged["result"]["revision"] == revision
+    code, module_preview = cli("learning", "resume", "--module-id", unchanged["result"]["thread"]["module_id"],
+                               "--workspace", config, "--json")
+    assert code == 3 and module_preview["result"]["question"]["question_id"] == child_id
+    assert located["result"]["question"]["question_id"] == root_id
+    _, resumed = cli("learning", "resume", "--thread-id", thread_id, "--question-id", root_id,
+                     "--from-question-id", child_id, "--expected-revision", revision,
+                     "--workspace", config, "--json")
+    assert resumed["result"]["thread"]["current_question_id"] == root_id
+    _, backed = cli("learning", "back", "--thread-id", thread_id, "--workspace", config, "--json")
+    assert backed["result"]["thread"]["current_question_id"] == child_id
+
+
+def test_feedback_stale_revision_preserves_candidate_but_different_question_can_revalidate(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, child = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                   "--relation", "deepens", "--question", "子", "--workspace", config, "--json")
+    base = child["result"]["revision"]; child_id = child["result"]["question"]["question_id"]
+    _, first = cli("learning", "feedback", "--question-id", root_id, "--state", "understood", "--text", "懂了",
+                   "--expected-revision", base, "--workspace", config, "--json")
+    code, merged = cli("learning", "feedback", "--question-id", child_id, "--state", "confused", "--text", "没懂",
+                       "--expected-revision", base, "--workspace", config, "--json")
+    assert code == 0 and merged["result"]["revision"] == first["result"]["revision"] + 1
+    code, conflict = cli("learning", "feedback", "--question-id", root_id, "--state", "parked", "--text", "暂停",
+                         "--expected-revision", base, "--workspace", config, "--json")
+    assert code == 3 and conflict["validation"]["expected_revision"] == "conflict"
+    assert Path(conflict["result"]["candidate"]).is_file()
+
+
+def test_explicit_cross_module_resume_returns_to_original_position(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    first_thread, first_question = create_root(tmp_path, config, source, "标定根")
+    _, first_child = cli("learning", "pursue", "--thread-id", first_thread, "--from-question-id", first_question,
+                         "--relation", "deepens", "--question", "标定当前位置", "--workspace", config, "--json")
+    origin = first_child["result"]["question"]["question_id"]
+    _, module = cli("learning", "module", "create", "--goal", "视觉控制", "--scope", "控制",
+                    "--source-id", source["source_id"], "--source-version", source["source_version"],
+                    "--workspace", config, "--json")
+    _, rooted = cli("learning", "thread", "create", "--module-id", module["result"]["module"]["module_id"],
+                    "--root-question", "视觉控制根", "--workspace", config, "--json")
+    target_thread = rooted["result"]["thread"]["thread_id"]; target = rooted["result"]["question"]["question_id"]
+
+    _, switched = cli("learning", "resume", "--thread-id", target_thread, "--question-id", target,
+                      "--from-question-id", origin, "--workspace", config, "--json")
+    assert switched["result"]["thread"]["return_route"][-1]["thread_id"] == first_thread
+    _, returned = cli("learning", "back", "--thread-id", target_thread, "--workspace", config, "--json")
+    assert returned["result"]["thread"]["thread_id"] == first_thread
+    assert returned["result"]["thread"]["current_question_id"] == origin
+
+
+def test_ambiguous_repeat_question_asks_for_identity_without_persisting(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, first = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                   "--relation", "deepens", "--question", "线性变换是什么？", "--workspace", config, "--json")
+    revision = first["result"]["revision"]
+    code, ambiguous = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                          "--relation", "related", "--question", "线性变换是什么？", "--workspace", config, "--json")
+    assert code == 3 and ambiguous["status"] == "awaiting_user"
+    assert ambiguous["result"]["possible_question_ids"] == [first["result"]["question"]["question_id"]]
+    _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert shown["result"]["revision"] == revision
+
+
+def test_t07_snapshot_without_navigation_fields_remains_readable(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, _ = create_root(tmp_path, config, source, "旧记录")
+    pointer_path = config.parent / "results/learning/current.json"; pointer = json.loads(pointer_path.read_text())
+    manifest_path = config.parent / "results/learning/commits" / f'{pointer["commit_id"]}.json'
+    manifest = json.loads(manifest_path.read_text())
+    for thread in manifest["record"]["threads"].values():
+        thread.pop("return_route", None); thread.pop("entry_history", None)
+    manifest_path.write_text(json.dumps(manifest)); pointer["manifest_sha256"] = __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer))
+    code, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert code == 0 and shown["result"]["thread"]["return_route"] == []
+
+
 def _linear_inputs(tmp_path: Path, source: dict, marker: str) -> tuple[Path, Path, Path]:
     draft = tmp_path / f"draft-{__import__('uuid').uuid4()}.md"
     draft.write_text(f"# 解释\n{marker}\n直觉和因果机制：基向量决定矩阵列。例子 (1,2) 变 (2,6)。条件边界：平移需要仿射或齐次坐标。\n")

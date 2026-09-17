@@ -212,9 +212,9 @@ def cmd_notes(args: argparse.Namespace) -> int:
 
 def cmd_learning(args: argparse.Namespace) -> int:
     from .command_response import exit_code, response
-    from .learning import (LearningPublishError, create_module, create_thread, locate,
+    from .learning import (LearningPublishError, back, create_module, create_thread, locate,
                            publish_failure_response, pursue, recommend_roots, reconcile,
-                           show_module, show_thread)
+                           record_feedback, resume, show_module, show_thread)
     from .workspace import WorkspaceError
     workspace = discover_workspace(args.workspace)
     try:
@@ -230,7 +230,16 @@ def cmd_learning(args: argparse.Namespace) -> int:
         elif args.learning_entity == "thread" and args.learning_action == "show":
             result = show_thread(workspace, args.thread_id)
         elif args.learning_entity == "pursue":
-            result = pursue(workspace, args.thread_id, args.from_question_id, args.relation, args.question, args.expected_revision)
+            result = pursue(workspace, args.thread_id, args.from_question_id, args.relation, args.question,
+                             args.expected_revision, args.existing_question_id, args.independent)
+        elif args.learning_entity == "feedback":
+            result = record_feedback(workspace, args.question_id, args.state, args.text,
+                                     args.confusion, args.expected_revision)
+        elif args.learning_entity == "resume":
+            result = resume(workspace, args.thread_id, args.question_id,
+                            args.from_question_id, args.expected_revision, args.module_id)
+        elif args.learning_entity == "back":
+            result = back(workspace, args.thread_id, args.expected_revision)
         elif args.learning_entity == "locate":
             result = locate(workspace, args.question_id)
         elif args.learning_entity == "reconcile":
@@ -637,7 +646,10 @@ def parser() -> argparse.ArgumentParser:
     thread = learning_entities.add_parser("thread"); thread_actions = thread.add_subparsers(dest="learning_action", required=True)
     thread_create = thread_actions.add_parser("create"); thread_create.add_argument("--module-id", required=True); thread_create.add_argument("--root-question", required=True); thread_create.add_argument("--expected-revision", type=int); thread_create.add_argument("--workspace", type=Path); thread_create.add_argument("--json", action="store_true"); thread_create.set_defaults(func=cmd_learning)
     thread_show = thread_actions.add_parser("show"); thread_show.add_argument("thread_id"); thread_show.add_argument("--workspace", type=Path); thread_show.add_argument("--json", action="store_true"); thread_show.set_defaults(func=cmd_learning)
-    pursue_parser = learning_entities.add_parser("pursue"); pursue_parser.add_argument("--thread-id", required=True); pursue_parser.add_argument("--from-question-id", required=True); pursue_parser.add_argument("--relation", required=True); pursue_parser.add_argument("--question", required=True); pursue_parser.add_argument("--expected-revision", type=int); pursue_parser.add_argument("--workspace", type=Path); pursue_parser.add_argument("--json", action="store_true"); pursue_parser.set_defaults(func=cmd_learning)
+    pursue_parser = learning_entities.add_parser("pursue"); pursue_parser.add_argument("--thread-id", required=True); pursue_parser.add_argument("--from-question-id", required=True); pursue_parser.add_argument("--relation", required=True); pursue_target = pursue_parser.add_mutually_exclusive_group(required=True); pursue_target.add_argument("--question"); pursue_target.add_argument("--existing-question-id"); pursue_parser.add_argument("--independent", action="store_true", help="after identity clarification, create a distinct question even when wording matches"); pursue_parser.add_argument("--expected-revision", type=int); pursue_parser.add_argument("--workspace", type=Path); pursue_parser.add_argument("--json", action="store_true"); pursue_parser.set_defaults(func=cmd_learning)
+    feedback_parser = learning_entities.add_parser("feedback"); feedback_parser.add_argument("--question-id", required=True); feedback_parser.add_argument("--state", choices=("understood", "confused", "parked"), required=True); feedback_parser.add_argument("--text", required=True); feedback_parser.add_argument("--confusion"); feedback_parser.add_argument("--expected-revision", type=int); feedback_parser.add_argument("--workspace", type=Path); feedback_parser.add_argument("--json", action="store_true"); feedback_parser.set_defaults(func=cmd_learning)
+    resume_parser = learning_entities.add_parser("resume"); resume_scope = resume_parser.add_mutually_exclusive_group(required=True); resume_scope.add_argument("--thread-id"); resume_scope.add_argument("--module-id"); resume_parser.add_argument("--question-id"); resume_parser.add_argument("--from-question-id"); resume_parser.add_argument("--expected-revision", type=int); resume_parser.add_argument("--workspace", type=Path); resume_parser.add_argument("--json", action="store_true"); resume_parser.set_defaults(func=cmd_learning)
+    back_parser = learning_entities.add_parser("back"); back_parser.add_argument("--thread-id", required=True); back_parser.add_argument("--expected-revision", type=int); back_parser.add_argument("--workspace", type=Path); back_parser.add_argument("--json", action="store_true"); back_parser.set_defaults(func=cmd_learning)
     locate_parser = learning_entities.add_parser("locate"); locate_parser.add_argument("question_id"); locate_parser.add_argument("--workspace", type=Path); locate_parser.add_argument("--json", action="store_true"); locate_parser.set_defaults(func=cmd_learning)
     reconcile_parser = learning_entities.add_parser("reconcile"); reconcile_parser.add_argument("--commit-id", required=True); reconcile_parser.add_argument("--workspace", type=Path); reconcile_parser.add_argument("--json", action="store_true"); reconcile_parser.set_defaults(func=cmd_learning)
     explanation = commands.add_parser("explanation", help="prepare and commit versioned teaching explanations")
