@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from video_extract.cli import main
+from video_extract.installation import apply
 
 
 class InstallationContractTests(unittest.TestCase):
@@ -80,7 +81,32 @@ class InstallationContractTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         item = next(entry for entry in result["entries"] if entry["id"] == "skill.extract-media")
         self.assertEqual(item["state"], "drifted")
+        self.assertEqual(result["status"], "installation_drift")
         self.assertEqual(item["maintenance_path"], str(Path(result["source"]["path"]) / "integrations/skills/extract-media"))
+
+    def test_apply_rolls_back_every_target_when_linking_is_interrupted(self):
+        first = self.codex_root / "agents/mandarin-netease-operator.toml"
+        first.parent.mkdir(parents=True)
+        first.write_text("manual agent\n", encoding="utf-8")
+        original = Path.symlink_to
+        calls = 0
+
+        def interrupted(path: Path, target: Path, target_is_directory: bool = False):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected link failure")
+            return original(path, target, target_is_directory=target_is_directory)
+
+        with patch.object(Path, "symlink_to", interrupted):
+            result = apply(self.agents_root, self.codex_root)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "recoverable_failure")
+        self.assertIn("injected link failure", result["diagnostics"][0])
+        self.assertFalse(first.is_symlink())
+        self.assertEqual(first.read_text(encoding="utf-8"), "manual agent\n")
+        self.assertFalse((self.codex_root / "agents/source-notes-operator.toml").exists())
 
 
 if __name__ == "__main__":

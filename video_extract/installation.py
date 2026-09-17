@@ -137,14 +137,26 @@ def inspect(agents_root: Path, codex_root: Path) -> dict[str, Any]:
         )
     dependencies = _dependencies()
     tool = _tool()
-    ok = all(item["state"] == "linked" for item in entries) and all(dependencies.values()) and tool["matches_source"]
+    entries_ok = all(item["state"] == "linked" for item in entries)
+    dependencies_ok = all(dependencies.values())
+    tool_ok = tool["matches_source"]
+    ok = entries_ok and dependencies_ok and tool_ok
+    status = "completed"
+    diagnostics = []
+    if not entries_ok or not tool_ok:
+        status = "installation_drift"
+        diagnostics.append("installed entries or the video-extract executable do not match the maintenance source")
+    elif not dependencies_ok:
+        status = "missing_dependency"
+        diagnostics.append("one or more required deterministic dependencies are unavailable")
     return {
         "ok": ok,
-        "status": "completed" if ok else "missing_dependency",
+        "status": status,
         "source": source_info(),
         "tool": tool,
         "dependencies": dependencies,
         "entries": entries,
+        "diagnostics": diagnostics,
     }
 
 
@@ -163,19 +175,45 @@ def apply(agents_root: Path, codex_root: Path, backup_root: Path | None = None) 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     backup = (backup_root or codex_root / "backups/video-extract-install") / stamp
     backed_up: list[dict[str, str]] = []
-    for entry in ENTRIES:
-        target = entry.target(agents_root, codex_root)
-        state = _entry_state(entry, target)
-        if state == "linked":
-            continue
-        if target.exists() or target.is_symlink():
-            relative = Path(entry.host) / Path(*entry.target_parts)
-            destination = backup / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(target, destination)
-            backed_up.append({"target": str(target), "backup": str(destination), "previous_state": state})
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.symlink_to(entry.source, target_is_directory=entry.source.is_dir())
+    changed: list[tuple[Path, Path | None]] = []
+    try:
+        for entry in ENTRIES:
+            if not entry.source.exists():
+                raise FileNotFoundError(f"maintenance source is missing: {entry.source}")
+            target = entry.target(agents_root, codex_root)
+            state = _entry_state(entry, target)
+            if state == "linked":
+                continue
+            destination = None
+            if target.exists() or target.is_symlink():
+                relative = Path(entry.host) / Path(*entry.target_parts)
+                destination = backup / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, destination)
+                backed_up.append({"target": str(target), "backup": str(destination), "previous_state": state})
+            changed.append((target, destination))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(entry.source, target_is_directory=entry.source.is_dir())
+    except Exception as exc:
+        rollback_errors = []
+        for target, destination in reversed(changed):
+            try:
+                if target.is_symlink():
+                    target.unlink()
+                if destination is not None and (destination.exists() or destination.is_symlink()):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(destination, target)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"rollback failed for {target}: {rollback_exc}")
+        result = inspect(agents_root, codex_root)
+        result.update({
+            "ok": False,
+            "status": "recoverable_failure",
+            "backup": str(backup),
+            "backed_up": backed_up,
+            "diagnostics": [str(exc), *rollback_errors],
+        })
+        return result
     result = inspect(agents_root, codex_root)
     result.update({"backup": str(backup), "backed_up": backed_up})
     return result

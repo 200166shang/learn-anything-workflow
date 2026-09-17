@@ -64,11 +64,11 @@ def main() -> int:
                 (output_dir / "production-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             elif language.casefold().replace("_", "-").split("-")[0] == "en":
                 python, cli = Path(str(tools.get("python", ""))), Path(str(tools.get("cli", "")))
-                if not python.is_file() or not cli.is_file(): raise RuntimeError("pyVideoTrans is not configured in workspace.toml")
+                if not python.is_file() or not cli.is_file(): raise RuntimeError("pyVideoTrans audio localization is not configured in workspace.toml")
                 run_manifest = output_dir / "manifest.json"
                 command = [str(python), str(cli), "--task", "podcast", "--resume", str(output_dir)] if run_manifest.is_file() else [str(python), str(cli), "--task", "podcast", "--name", str(source), "--output-dir", str(output_dir), "--podcast-profile", "alibaba-podcast-tts-throughput"]
                 completed = subprocess.run(command, text=True)
-                if completed.returncode: raise RuntimeError("pyVideoTrans podcast task failed; inspect its safe production report")
+                if completed.returncode: raise RuntimeError("pyVideoTrans audio localization failed; inspect its safe production report")
             else:
                 raise RuntimeError(f"unsupported source language for Mandarin synthesis: {language}")
             final = audio_info(output)
