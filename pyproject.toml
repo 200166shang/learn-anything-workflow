@@ -62,6 +62,7 @@ include = [
 "schemas/review-record-v1.schema.json" = "schemas/review-record-v1.schema.json"
 "schemas/review-snapshot-v1.schema.json" = "schemas/review-snapshot-v1.schema.json"
 "schemas/review-current-pointer-v1.schema.json" = "schemas/review-current-pointer-v1.schema.json"
+"schemas/card-record-v1.schema.json" = "schemas/card-record-v1.schema.json"
 "schemas/notes-snapshot-v1.schema.json" = "schemas/notes-snapshot-v1.schema.json"
 "schemas/media-acquire-request-v1.schema.json" = "schemas/media-acquire-request-v1.schema.json"
 "schemas/mandarin-audio-request-v1.schema.json" = "schemas/mandarin-audio-request-v1.schema.json"

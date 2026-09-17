@@ -15,7 +15,8 @@
       "properties": {
         "sources": {"$ref": "#/$defs/authority"}, "notes": {"$ref": "#/$defs/authority"},
         "learning": {"$ref": "#/$defs/authority"}, "operation_receipts": {"$ref": "#/$defs/authority"},
-        "review": {"$ref": "#/$defs/authority"}, "practice": {"$ref": "#/$defs/authority"}
+        "review": {"$ref": "#/$defs/authority"}, "practice": {"$ref": "#/$defs/authority"},
+        "cards": {"$ref": "#/$defs/authority"}
       }, "additionalProperties": false
     },
     "entries": {"type": "array", "items": {"$ref": "#/$defs/entry"}},

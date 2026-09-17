@@ -326,17 +326,46 @@ def cmd_review(args: argparse.Namespace) -> int:
     workspace = discover_workspace(args.workspace)
     try:
         if args.review_action == "prepare":
-            result = prepare(workspace, args.question_id, args.preparation_id)
+            result = prepare(workspace, args.question_id, args.preparation_id,
+                             card_version_id=args.card_version_id)
         elif args.review_action == "record":
             result = record(workspace, args.preparation_id, args.event_id, answer=args.answer,
                             answer_summary=args.answer_summary, hints=args.hint,
                             model_evaluation=args.model_evaluation, correction=args.correction,
-                            corrected_evaluation=args.corrected_evaluation)
+                            corrected_evaluation=args.corrected_evaluation,
+                            review_date=args.review_date)
         else:
             result = show(workspace, args.question_id)
     except PackageBusyError as exc:
         result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)],
                           next_action={"type": "retry", "reason": "another Review write is in progress"})
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_card(args: argparse.Namespace) -> int:
+    from .cards import propose, revise, schedule, select, show
+    from .command_response import exit_code, response
+    from .package_lock import PackageBusyError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.card_action == "propose":
+            result = propose(workspace, args.question_id, args.memory_target, args.conditions,
+                             args.prompt, args.answer, args.reason)
+        elif args.card_action == "select":
+            result = select(workspace, args.candidate, args.effective_date)
+        elif args.card_action == "revise":
+            result = revise(workspace, args.card_id, args.change_type, prompt=args.prompt,
+                            answer=args.answer, conditions=args.conditions,
+                            effective_date=args.effective_date)
+        elif args.card_action == "schedule":
+            result = schedule(workspace, card_id=args.card_id,
+                              card_version_id=args.card_version_id, on_date=args.on_date)
+        else:
+            result = show(workspace, args.card_id)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)])
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
         result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
     emit(result, args.json); return exit_code(result)
@@ -773,10 +802,20 @@ def parser() -> argparse.ArgumentParser:
     explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--preparation-id", required=True); explanation_commit.add_argument("--section-map", type=Path); explanation_commit.add_argument("--revision-metadata", type=Path); explanation_commit.add_argument("--corrections", type=Path); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
     explanation_restore = explanation_actions.add_parser("restore", help="restore an earlier expression while preserving confirmed corrections and learning state"); explanation_restore.add_argument("--question-id", required=True); explanation_restore.add_argument("--revision", type=int, required=True); explanation_restore.add_argument("--expected-revision", type=int); explanation_restore.add_argument("--workspace", type=Path); explanation_restore.add_argument("--json", action="store_true"); explanation_restore.set_defaults(func=cmd_explanation)
     explanation_replay = explanation_actions.add_parser("replay", help="replay a complete immutable explanation conflict candidate"); explanation_replay.add_argument("--candidate", type=Path, required=True); explanation_replay.add_argument("--workspace", type=Path); explanation_replay.add_argument("--json", action="store_true"); explanation_replay.set_defaults(func=cmd_explanation)
+    card = commands.add_parser("card", help="propose, select, revise, and schedule selected flash cards")
+    card_actions = card.add_subparsers(dest="card_action", required=True)
+    card_propose = card_actions.add_parser("propose")
+    for name in ("question-id", "memory-target", "conditions", "prompt", "answer", "reason"):
+        card_propose.add_argument(f"--{name}", required=True)
+    card_propose.add_argument("--workspace", type=Path); card_propose.add_argument("--json", action="store_true"); card_propose.set_defaults(func=cmd_card)
+    card_select = card_actions.add_parser("select"); card_select.add_argument("--candidate", type=Path, required=True); card_select.add_argument("--effective-date"); card_select.add_argument("--workspace", type=Path); card_select.add_argument("--json", action="store_true"); card_select.set_defaults(func=cmd_card)
+    card_revise = card_actions.add_parser("revise"); card_revise.add_argument("--card-id", required=True); card_revise.add_argument("--change-type", choices=("wording", "material"), required=True); card_revise.add_argument("--prompt"); card_revise.add_argument("--answer"); card_revise.add_argument("--conditions"); card_revise.add_argument("--effective-date", required=True); card_revise.add_argument("--workspace", type=Path); card_revise.add_argument("--json", action="store_true"); card_revise.set_defaults(func=cmd_card)
+    card_schedule = card_actions.add_parser("schedule"); card_identity = card_schedule.add_mutually_exclusive_group(required=True); card_identity.add_argument("--card-id"); card_identity.add_argument("--card-version-id"); card_schedule.add_argument("--on-date"); card_schedule.add_argument("--workspace", type=Path); card_schedule.add_argument("--json", action="store_true"); card_schedule.set_defaults(func=cmd_card)
+    card_show = card_actions.add_parser("show"); card_show.add_argument("--card-id"); card_show.add_argument("--workspace", type=Path); card_show.add_argument("--json", action="store_true"); card_show.set_defaults(func=cmd_card)
     review = commands.add_parser("review", help="prepare active recall before revealing and record independent Review facts")
     review_actions = review.add_subparsers(dest="review_action", required=True)
-    review_prepare = review_actions.add_parser("prepare"); review_prepare.add_argument("--question-id", required=True); review_prepare.add_argument("--preparation-id", help="stable retry identity beginning review-preparation-"); review_prepare.add_argument("--workspace", type=Path); review_prepare.add_argument("--json", action="store_true"); review_prepare.set_defaults(func=cmd_review)
-    review_record = review_actions.add_parser("record"); review_record.add_argument("--preparation-id", required=True); review_record.add_argument("--event-id", required=True); review_record.add_argument("--answer"); review_record.add_argument("--answer-summary"); review_record.add_argument("--hint", action="append", default=[]); review_record.add_argument("--model-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored"), required=True); review_record.add_argument("--correction"); review_record.add_argument("--corrected-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored")); review_record.add_argument("--workspace", type=Path); review_record.add_argument("--json", action="store_true"); review_record.set_defaults(func=cmd_review)
+    review_prepare = review_actions.add_parser("prepare"); review_target = review_prepare.add_mutually_exclusive_group(required=True); review_target.add_argument("--question-id"); review_target.add_argument("--card-version-id"); review_prepare.add_argument("--preparation-id", help="stable retry identity beginning review-preparation-"); review_prepare.add_argument("--workspace", type=Path); review_prepare.add_argument("--json", action="store_true"); review_prepare.set_defaults(func=cmd_review)
+    review_record = review_actions.add_parser("record"); review_record.add_argument("--preparation-id", required=True); review_record.add_argument("--event-id", required=True); review_record.add_argument("--answer"); review_record.add_argument("--answer-summary"); review_record.add_argument("--hint", action="append", default=[]); review_record.add_argument("--model-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored"), required=True); review_record.add_argument("--correction"); review_record.add_argument("--corrected-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored")); review_record.add_argument("--review-date", help="actual Asia/Shanghai review date (YYYY-MM-DD)"); review_record.add_argument("--workspace", type=Path); review_record.add_argument("--json", action="store_true"); review_record.set_defaults(func=cmd_review)
     review_show = review_actions.add_parser("show"); review_show.add_argument("--question-id"); review_show.add_argument("--workspace", type=Path); review_show.add_argument("--json", action="store_true"); review_show.set_defaults(func=cmd_review)
     practice = commands.add_parser("practice", help="prepare and record one isolated local mechanism practice")
     practice_actions = practice.add_subparsers(dest="practice_action", required=True)
