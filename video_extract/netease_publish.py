@@ -349,7 +349,7 @@ def resume_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, An
     return _public(config, record)
 
 
-def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
+def _reconcile_operation_unlocked(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
     path = _operation_path(config, operation_id)
     record = read_json(path)
     if record.get("status") == "completed" and record.get("commit"):
@@ -400,3 +400,22 @@ def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str,
     from .media_operations import _commit_authority
     _commit_authority(path, record)
     return _public(config, record)
+
+
+def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
+    """Serialize remote reconciliation with submission and re-read authority under that lock."""
+    from .media_operations import _lock
+    with _lock(config, operation_id) as acquired:
+        if not acquired:
+            path = _operation_path(config, operation_id)
+            if path.is_file():
+                record = read_json(path)
+                if record.get("status") == "completed":
+                    return _public(config, record, "verified_operation")
+            return response(status="busy", workspace=str(config.config_path), operation_id=operation_id,
+                            next_action={"type": "reconcile", "operation_id": operation_id})
+        # Never act on a record read before lock acquisition.
+        record = read_json(_operation_path(config, operation_id))
+        if record.get("status") == "completed" and _receipts_valid(record):
+            return _public(config, record, "verified_operation")
+        return _reconcile_operation_unlocked(config, operation_id)

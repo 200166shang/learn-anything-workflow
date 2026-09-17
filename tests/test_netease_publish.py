@@ -3,12 +3,15 @@ import hashlib
 import io
 import json
 import pytest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
 from video_extract.cli import main
 from video_extract.netease_adapter import NcmCliAdapter
 from video_extract.netease_publish import register_netease_adapter
+from video_extract.workspace import discover_workspace
 
 
 class FakeNetEase:
@@ -407,3 +410,43 @@ def test_tampered_authority_cannot_reproject_receipt(tmp_path):
     assert result["status"] == "uncertain"
     assert result["validation"]["authoritative_record"] == "failed"
     assert receipt_path.read_bytes() == before
+
+
+def test_concurrent_reconcile_cannot_overwrite_completed_winner(tmp_path):
+    workspace_path, package, _, request, base = fixture(tmp_path)
+    base["authorization_ref"] = "approval-33"
+    request.write_text(json.dumps(base))
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BarrierAdapter(FakeNetEase):
+        def reconcile(self, attempt):
+            self.calls.append(("reconcile", attempt["query_handle"]))
+            entered.set()
+            assert release.wait(5)
+            return {"state": "available", "query_handle": attempt["query_handle"],
+                    "remote_id": "remote-winner", "filename": "A_ reliable _ title_.mp3",
+                    "sha256": base["output_sha256"], "visible": True}
+
+    adapter = BarrierAdapter(pages=[{"items": []}], upload_result=RuntimeError("lost response"))
+    register_netease_adapter("fixture", adapter)
+    _, failed = invoke("capability", "run", "publish.netease", "--request", str(request))
+    config = discover_workspace(workspace_path)
+    from video_extract.netease_publish import reconcile_operation, show_operation
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winner = pool.submit(reconcile_operation, config, failed["operation_id"])
+        assert entered.wait(5)
+        concurrent = pool.submit(reconcile_operation, config, failed["operation_id"]).result(timeout=5)
+        release.set()
+        completed = winner.result(timeout=5)
+
+    final = show_operation(config, failed["operation_id"])
+    assert concurrent["status"] == "busy"
+    assert completed["status"] == final["status"] == "completed"
+    assert [call[0] for call in adapter.calls].count("reconcile") == 1
+    receipts = [json.loads((package / "publishing" / "netease" / "receipt.json").read_text()),
+                json.loads((workspace_path.parent / "results" / "operation-receipts" /
+                            f'{failed["operation_id"]}.json').read_text())]
+    assert receipts[0] == receipts[1]
+    assert receipts[0]["remote_id"] == "remote-winner"
