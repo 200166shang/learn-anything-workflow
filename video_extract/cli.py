@@ -385,6 +385,31 @@ def cmd_suggestions(args: argparse.Namespace) -> int:
     emit(result, args.json); return exit_code(result)
 
 
+def cmd_delivery(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .delivery import disable, enable, reconcile, status, tick
+    from .package_lock import PackageBusyError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.delivery_action == "enable":
+            result = enable(workspace, args.logical_target, args.adapter,
+                            args.authorization_ref, args.effective_from)
+        elif args.delivery_action == "disable":
+            result = disable(workspace, args.logical_target)
+        elif args.delivery_action == "tick":
+            result = tick(workspace, args.on_date)
+        elif args.delivery_action == "reconcile":
+            result = reconcile(workspace, args.operation_id)
+        else:
+            result = status(workspace, args.operation_id)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)],
+                          next_action={"type": "retry", "action": args.delivery_action})
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
 def cmd_practice(args: argparse.Namespace) -> int:
     from .command_response import exit_code, response
     from .package_lock import PackageBusyError
@@ -856,6 +881,17 @@ def parser() -> argparse.ArgumentParser:
     suggestions_today.add_argument("--prefer-card-version-id", action="append", default=[])
     suggestions_today.add_argument("--workspace", type=Path); suggestions_today.add_argument("--json", action="store_true")
     suggestions_today.set_defaults(func=cmd_suggestions)
+    delivery = commands.add_parser("delivery", help="deliver one-way daily suggestions with durable recovery")
+    delivery_actions = delivery.add_subparsers(dest="delivery_action", required=True)
+    delivery_enable = delivery_actions.add_parser("enable")
+    delivery_enable.add_argument("--logical-target", required=True); delivery_enable.add_argument("--adapter", default="lark-cli")
+    delivery_enable.add_argument("--authorization-ref", required=True); delivery_enable.add_argument("--effective-from", required=True)
+    delivery_disable = delivery_actions.add_parser("disable"); delivery_disable.add_argument("--logical-target", required=True)
+    delivery_tick = delivery_actions.add_parser("tick"); delivery_tick.add_argument("--on-date")
+    delivery_status = delivery_actions.add_parser("status"); delivery_status.add_argument("--operation-id")
+    delivery_reconcile = delivery_actions.add_parser("reconcile"); delivery_reconcile.add_argument("--operation-id", required=True)
+    for parser in (delivery_enable, delivery_disable, delivery_tick, delivery_status, delivery_reconcile):
+        parser.add_argument("--workspace", type=Path); parser.add_argument("--json", action="store_true"); parser.set_defaults(func=cmd_delivery)
     review = commands.add_parser("review", help="prepare active recall before revealing and record independent Review facts")
     review_actions = review.add_subparsers(dest="review_action", required=True)
     review_prepare = review_actions.add_parser("prepare"); review_target = review_prepare.add_mutually_exclusive_group(required=True); review_target.add_argument("--question-id"); review_target.add_argument("--card-version-id"); review_prepare.add_argument("--preparation-id", help="stable retry identity beginning review-preparation-"); review_prepare.add_argument("--workspace", type=Path); review_prepare.add_argument("--json", action="store_true"); review_prepare.set_defaults(func=cmd_review)
