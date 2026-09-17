@@ -17,7 +17,7 @@
         "learning": {"$ref": "#/$defs/authority"}, "operation_receipts": {"$ref": "#/$defs/authority"}
       }, "additionalProperties": false
     },
-    "entries": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/entry"}},
+    "entries": {"type": "array", "items": {"$ref": "#/$defs/entry"}},
     "exclusions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
   },
   "$defs": {

@@ -16,8 +16,15 @@ publishes the backup directory with one rename.  Verification checks its schema,
 commit identity, exact file set, every file digest, all authority root digests,
 store-specific deep invariants, and cross-store source-version references.
 
+An unused authority is explicitly represented by null commit/schema, revision
+zero, and the digest of an empty entry list. Notes-only, Learn-only, and empty
+workspaces can therefore be backed up without initializing unrelated domains.
+A missing pointer alongside stored commits, a non-file pointer, or a symbolic
+authority path is corruption, not an unused domain, and stops publication.
+
 Restore never overlays a results root.  It copies to an isolated sibling stage,
-re-validates all authority stores and receipts, writes a recovery state with
+re-validates the copied exact file set, digests, pinned generation and all
+authority stores and receipts against the initially verified manifest, writes a recovery state with
 delivery and external operations paused, and then publishes the results root
 with one rename.  Location-only sources are explicitly reported missing; notes,
 learning records, explanations, attachments, history, and receipts remain

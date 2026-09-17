@@ -8,7 +8,6 @@ import os
 import shutil
 import tempfile
 import uuid
-from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -67,19 +66,22 @@ def _validate_manifest(value: Any) -> None:
 
 def _pointer_generation(results: Path, store: str) -> tuple[dict[str, Any], list[Path]]:
     prefix = Path() if store == "sources" else Path("source-notes" if store == "notes" else "learning")
-    pointer = results / prefix / "current.json"
+    pointer = _safe(results, (prefix / "current.json").as_posix())
     if not pointer.is_file():
+        commits = _safe(results, (prefix / "commits").as_posix())
+        if pointer.exists() or (commits.exists() and (not commits.is_dir() or any(commits.iterdir()))):
+            raise WorkspaceError(f"{store} authority has stored commits but no valid current pointer")
         return {"store": store, "commit_id": None, "revision": 0, "schema_version": None}, []
     selected = read_json(pointer)
     commit_id = selected.get("commit_id")
-    manifest = results / prefix / "commits" / f"{commit_id}.json"
+    manifest = _safe(results, (prefix / "commits" / f"{commit_id}.json").as_posix())
     if not manifest.is_file() or _digest(manifest) != selected.get("manifest_sha256"):
         raise WorkspaceError(f"{store} current pointer is incomplete or corrupt")
     value = read_json(manifest)
     objects_root = results / prefix / "objects" if store != "sources" else results / "objects"
     objects = []
     for digest, facts in sorted(value.get("objects", {}).items()):
-        path = objects_root / digest[:2] / digest
+        path = _safe(results, (objects_root / digest[:2] / digest).relative_to(results).as_posix())
         if not path.is_file() or path.stat().st_size != facts.get("size") or _digest(path) != digest:
             raise WorkspaceError(f"{store} object is incomplete or corrupt: {digest}")
         objects.append(path)
@@ -164,6 +166,9 @@ def _deep_validate_payload(root: Path, manifest: dict[str, Any]) -> None:
     observed = {"sources": source, "notes": notes, "learning": learning}
     for name, value in observed.items():
         authority = expected[name]
+        generation, _ = _pointer_generation(payload, name)
+        if any(authority[key] != generation[key] for key in generation):
+            raise WorkspaceError(f"{name} authority metadata does not match its stored generation")
         if authority["commit_id"] != value.get("commit_id") or authority["revision"] != value.get("revision"):
             raise WorkspaceError(f"{name} authority does not match the pinned backup generation")
     # Foreign keys remain tied to the pinned source generation even when its external location is absent.
@@ -194,10 +199,9 @@ def create_backup(config: WorkspaceConfig, target: Path) -> dict[str, Any]:
         with package_lock(config.results):
             before = {name: _pointer_generation(config.results, name) for name in ("sources", "notes", "learning")}
             payload = stage / "payload"; entries: list[dict[str, Any]] = []
+            payload.mkdir()
             authorities: dict[str, Any] = {}
             for name, (authority, paths) in before.items():
-                if authority["commit_id"] is None:
-                    raise WorkspaceError(f"cannot create a complete backup without a published {name} generation")
                 store_entries = []
                 for source in paths:
                     relative = source.relative_to(config.results)
@@ -304,24 +308,28 @@ def restore_backup(root: Path, config: WorkspaceConfig) -> dict[str, Any]:
     stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.restore-", dir=target.parent))
     try:
         manifest = read_json(root / MANIFEST)
+        _validate_manifest(manifest)
+        if manifest["commit_id"] != checked["result"]["commit_id"]:
+            raise WorkspaceError("backup generation changed after verification")
+        payload = stage / "payload"
+        payload.mkdir()
         for item in manifest["entries"]:
             source = _safe(root, item["path"])
-            relative = Path(item["path"]).relative_to("payload")
-            destination = _safe(stage, relative.as_posix())
+            destination = _safe(stage, item["path"])
             destination.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(source, destination)
-        atomic_write_json(stage / "recovery-state.json", {"schema_version": 1,
+        atomic_write_json(stage / MANIFEST, manifest)
+        copied = verify_backup(stage)
+        if copied["status"] != "completed":
+            raise WorkspaceError("copied backup failed verification: " + "; ".join(copied["diagnostics"]))
+        atomic_write_json(payload / "recovery-state.json", {"schema_version": 1,
             "backup_commit_id": manifest["commit_id"], "restored_at": _now(),
             "delivery": "paused", "external_operations": "paused", "unique_host_verified": False})
-        # Validate the exact authoritative files before making the new results root visible.
-        synthetic = replace(config, results=stage)
-        from .source_registry import _load_snapshot, _validate_snapshot_objects
-        from .authoritative_notes import _load_current
-        from .learning import _load
-        source = _load_snapshot(synthetic); _validate_snapshot_objects(synthetic, source)
-        _load_current(synthetic); _load(synthetic); _receipt_files(stage)
+        source_authority = manifest["authorities"]["sources"]
+        source = (read_json(payload / "commits" / f"{source_authority['commit_id']}.json")
+                  if source_authority["commit_id"] else {"sources": {}})
         if os.environ.get("VIDEO_EXTRACT_BACKUP_TEST_FAULT") == "restore_before_publish":
             raise OSError("injected restore interruption before publish")
-        os.replace(stage, target)
+        os.replace(payload, target)
         descriptor = os.open(target.parent, os.O_RDONLY)
         try: os.fsync(descriptor)
         finally: os.close(descriptor)

@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,31 @@ from video_extract.backup import create_backup, restore_backup, verify_backup
 from video_extract.learning import create_module, create_thread
 from video_extract.source_registry import register, verify
 from video_extract.workspace import WorkspaceConfig
+from video_extract.cli import main
+
+
+def test_restore_cli_rejects_receipt_changed_during_copy(tmp_path: Path, monkeypatch, capsys) -> None:
+    config, _, _ = populated(tmp_path)
+    backup = tmp_path / "backup"
+    assert create_backup(config, backup)["status"] == "completed"
+    target = workspace(tmp_path / "restored")
+    copyfile = shutil.copyfile
+
+    def concurrent_copy(source, destination, *args, **kwargs):
+        if Path(source).name == "operation-example.json":
+            receipt = json.loads(Path(source).read_text())
+            receipt["receipt"]["state"] = "changed_after_verification"
+            Path(source).write_text(json.dumps(receipt))
+        return copyfile(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copyfile", concurrent_copy)
+    monkeypatch.setattr(sys, "argv", ["video-extract", "backup", "restore", str(backup),
+                                     "--workspace", str(target.config_path), "--json"])
+    code = main()
+    result = json.loads(capsys.readouterr().out)
+    assert code != 0
+    assert result["status"] == "recoverable_failure"
+    assert not target.results.exists()
 
 
 def workspace(root: Path, *, results: str = "results") -> WorkspaceConfig:
@@ -27,7 +53,7 @@ local = "local"
     return WorkspaceConfig.load(config)
 
 
-def populated(tmp_path: Path) -> tuple[WorkspaceConfig, dict, dict]:
+def populated(tmp_path: Path, *, include_learning: bool = True) -> tuple[WorkspaceConfig, dict, dict]:
     config = workspace(tmp_path / "source-workspace")
     source_path = tmp_path / "lesson.md"
     source_path.write_text("# Mechanism\n\nInput becomes output.\n", encoding="utf-8")
@@ -44,9 +70,11 @@ def populated(tmp_path: Path) -> tuple[WorkspaceConfig, dict, dict]:
         "association": {"status": "not_applicable", "evidence": None},
     }), encoding="utf-8")
     finalize_note(config, request)
-    module = create_module(config, "Understand mechanism", "one lesson",
-                           source["source_id"], source["source_version"])["result"]["module"]
-    thread = create_thread(config, module["module_id"], "How does it work?")["result"]
+    thread = {}
+    if include_learning:
+        module = create_module(config, "Understand mechanism", "one lesson",
+                               source["source_id"], source["source_version"])["result"]["module"]
+        thread = create_thread(config, module["module_id"], "How does it work?")["result"]
     receipt = config.results / "operation-receipts" / "operation-example.json"
     receipt.parent.mkdir(parents=True)
     receipt.write_text(json.dumps({"schema_version": 1, "operation_id": "operation-example",
@@ -55,6 +83,52 @@ def populated(tmp_path: Path) -> tuple[WorkspaceConfig, dict, dict]:
         "reconciliation": [], "receipt": {"state": "verified"}}),
                        encoding="utf-8")
     return config, source, thread
+
+
+@pytest.mark.parametrize("notes", [True, False])
+def test_backup_cli_preserves_uninitialized_domains(tmp_path: Path, monkeypatch, capsys, notes: bool) -> None:
+    config = populated(tmp_path, include_learning=False)[0] if notes else workspace(tmp_path / "empty")
+    backup = tmp_path / "backup"
+    target = workspace(tmp_path / "restored")
+    for action, selected in (("create", config), ("verify", None), ("restore", target)):
+        argv = ["video-extract", "backup", action, str(backup), "--json"]
+        if selected:
+            argv += ["--workspace", str(selected.config_path)]
+        monkeypatch.setattr(sys, "argv", argv)
+        code = main()
+        result = json.loads(capsys.readouterr().out)
+        assert code == 0, result
+    manifest = json.loads((backup / "backup-manifest.json").read_text())
+    empty = manifest["authorities"]["learning"]
+    assert empty["commit_id"] is None and empty["revision"] == 0 and empty["schema_version"] is None
+    assert not (target.results / "learning/current.json").exists()
+    if notes:
+        assert (target.results / "source-notes/current.json").is_file()
+    else:
+        assert manifest["entries"] == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "directory", "corrupt", "symlink"])
+def test_backup_cli_rejects_damaged_published_authority(tmp_path: Path, monkeypatch, capsys, damage: str) -> None:
+    config, _, _ = populated(tmp_path)
+    pointer = config.results / "learning/current.json"
+    original = pointer.read_bytes()
+    pointer.unlink()
+    if damage == "directory":
+        pointer.mkdir()
+    elif damage == "corrupt":
+        pointer.write_text("{}")
+    elif damage == "symlink":
+        outside = tmp_path / "outside-pointer.json"
+        outside.write_bytes(original)
+        pointer.symlink_to(outside)
+    backup = tmp_path / "backup"
+    monkeypatch.setattr(sys, "argv", ["video-extract", "backup", "create", str(backup),
+                                     "--workspace", str(config.config_path), "--json"])
+    code = main()
+    result = json.loads(capsys.readouterr().out)
+    assert code != 0, result
+    assert not backup.exists()
 
 
 def test_create_pins_and_deeply_verifies_complete_results_generation(tmp_path: Path) -> None:
@@ -170,10 +244,10 @@ def test_result_only_restore_marks_an_absent_referenced_source_without_losing_le
     module = create_module(config, "Understand code", "main.py", source["source_id"],
                            source["source_version"])["result"]["module"]
     create_thread(config, module["module_id"], "Why is this output produced?")
-    # A complete notes generation is required, but it may validly be empty for a code source.
-    from video_extract.authoritative_notes import _load_current, _publish
-    _publish(config, _load_current(config), {}, {})
-    backup = tmp_path / "backup"; create_backup(config, backup)
+    backup = tmp_path / "backup"
+    completed = subprocess.run([sys.executable, "-m", "video_extract.cli", "backup", "create", str(backup),
+                               "--workspace", str(config.config_path), "--json"], capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout
     target = workspace(tmp_path / "restored", results="restored-results")
     source_tree.rename(tmp_path / "code-source-away")
 

@@ -105,6 +105,11 @@ file.  Current manifests contain their complete formal version history; every
 object reachable from those manifests and every sanitized result-side operation
 receipt is included.
 
+Uninitialized source/notes/learning authorities are recorded explicitly as null
+commit/schema, revision zero and an empty root digest. They do not require a
+synthetic publication; an entirely empty workspace has zero entries. Missing or
+invalid pointers beside existing commits are rejected instead of treated as empty.
+
 The backup is intentionally result-only.  Source media and referenced source
 trees, local operation state, leases and locks, candidates/drafts, derived
 indexes and views, temporary files, installation state, and credentials are not
@@ -115,8 +120,10 @@ never substituted with a different version.
 `backup verify` rejects missing, extra, symbolic, digest-mismatched, or
 association-broken payloads. `backup restore` accepts an explicit workspace-v2
 configuration whose results root does not yet exist, validates in a sibling
-staging directory, and atomically publishes the complete results root.  It does
-not merge with or overwrite an existing target.  Restore writes only a recovery
+staging directory, and atomically publishes the complete results root. The copied
+exact file set and every digest are checked against the original pinned backup
+manifest before publication, including operation receipts. Restore does not
+merge with or overwrite an existing target. Restore writes only a recovery
 state which pauses delivery and external operations until the user verifies a
 unique host; rebuildable indexes and views remain the responsibility of their
 registered capabilities.
