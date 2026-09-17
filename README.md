@@ -45,17 +45,18 @@ finalize 验证笔记、导出到配置的资料库并更新索引。视频笔�
 
 这是自然节奏听觉版，不是同步配音。pyVideoTrans 的私有恢复资料由其自身管理。
 
-## 状态、验证与兼容
+## 状态、验证与迁移
 
-Media package 是事实来源；资料库导出、SQLite 索引和播放视图是可重建派生物。现有 schema 1–5 package 继续由 status、verify 和 validator 读取，不进行批量自动迁移。
+Media package 是事实来源；资料库导出、SQLite 索引和播放视图是可重建派生物。正常运行只读取当前 schema。schema 1–4 package 和旧学习线程仅由显式、分批的迁移转换器读取；旧副本在切换后保持只读并退出发现。
 
 ~~~text
 video-extract status PACKAGE --json
-video-extract verify PACKAGE --goal notes_zh --json
+video-extract verify PACKAGE --json
 video-extract library status --json
+video-extract migration plan --batch NAME --legacy-package PACKAGE --legacy-thread THREAD --workspace WORKSPACE --json
 ~~~
 
-旧的 goal-driven planner 保留为内部兼容实现，不再是 plan/ensure 的公开入口。低层 transcribe、prepare-evidence、scan、acquire 和平台命令继续服务已有工具与维护任务；新 agent 使用上面的正式入口。
+旧 goal 名称、旧脚本命令和旧 Skill 别名不再是正常运行入口。转换器和回退副本只用于显式迁移与恢复；删除旧副本仍需单独确认。
 
 ## 安装
 
@@ -64,12 +65,12 @@ brew install uv ffmpeg
 uv sync
 uv run playwright install chromium
 uv tool install --force --editable /path/to/video-extract-core
-video-extract install plan --json
-video-extract install apply --json
-video-extract install check --json
+video-extract install plan --obsidian-plugins-root /path/to/Vault/.obsidian/plugins --json
+video-extract install apply --obsidian-plugins-root /path/to/Vault/.obsidian/plugins --json
+video-extract install check --obsidian-plugins-root /path/to/Vault/.obsidian/plugins --json
 ~~~
 
-`integrations/skills/`、`.codex/agents/` 和 Python 工具都只在本工程维护。`install apply` 在链接宿主入口前备份已有副本；`install check` 报告源码修订、内容指纹、依赖、安装漂移和确切维护位置。不要直接修改链接目标之外的安装副本。
+`integrations/skills/`、`.codex/agents/`、Obsidian 插件和 Python 工具都只在本工程维护。`install apply` 在链接宿主入口前备份已有副本，并把已知旧 Skill 移到宿主发现目录外的时间戳备份；不会删除它们。`install check` 报告源码修订、内容指纹、依赖、安装漂移、旧入口复现和确切维护位置。
 
 稳定能力入口由工程内唯一映射维护，调用方只保存能力 ID 和公开契约版本：
 

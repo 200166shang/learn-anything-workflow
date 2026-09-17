@@ -1,8 +1,8 @@
 # ADR 0002: Goal-driven public workflow
 
-**Status:** Accepted
+**Status:** Superseded by the learning-system contract and T25 cutover (2026-09-17)
 
-2026-09-17 transition note: the deterministic planning lessons remain useful, but the clauses exposing only two public goals and keeping schema 1–3 in normal runtime are pending replacement by the approved learning-system contract. T01 preserves existing behavior and data while establishing reproducible installation; it does not delete old data or revive the superseded coupled entry points in ADR 0003/0004.
+The deterministic planning lessons remain historical context. The clauses exposing two public goals and keeping old schemas in normal runtime were replaced by specification #12 and T25: retained data moves through the explicit batch converter, while current Skills and runtime use only the new contracts.
 
 ## Decision
 

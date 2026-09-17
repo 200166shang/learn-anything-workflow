@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
-import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
 from .contracts import SCHEMA_VERSION
 from .command_response import response
-from .manifest import atomic_write_json, fingerprint, read_json, relative_path, sanitize
+from .manifest import read_json, sanitize
 from .media_request import normalize_media_request
 from . import media_workflow
 from .orchestrator import existing_capabilities
@@ -29,18 +28,6 @@ def emit(value: Any, as_json: bool) -> None:
     elif isinstance(value, dict):
         for key, item in value.items(): print(f"{key}: {item}")
     else: print(value)
-
-
-def run_legacy(script: str, arguments: list[str], as_json: bool = False) -> int:
-    script_path = PROJECT / script
-    if script_path.exists():
-        command = [sys.executable, str(script_path), *arguments]
-    else:
-        command = [sys.executable, "-m", script.removesuffix(".py"), *arguments]
-    completed = subprocess.run(command, capture_output=as_json, text=as_json)
-    if as_json:
-        emit({"ok": completed.returncode == 0, "adapter": script.removesuffix(".py"), "result": (completed.stdout or "").strip(), "error": (completed.stderr or "").strip() or None}, True)
-    return completed.returncode
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -62,17 +49,42 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     manifest = read_json(args.path / "manifest.json") if (args.path / "manifest.json").exists() else {}
+    if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
+        from .command_response import exit_code
+        result = response(status="unsupported", validation={"legacy_package": "rejected"},
+                          diagnostics=["legacy package schemas are available only to the isolated migration converter"],
+                          next_action={"command": "video-extract migration plan"})
+        emit(result, args.json); return exit_code(result)
     if manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "media":
         result = validate_media_request(args.path); emit(result, args.json); return 0 if result["ok"] else 1
-    if getattr(args, "goal", None):
-        result = validate_goals(args.path, args.goal); emit(result, args.json); return 0 if result["ok"] else 1
     result = validate(args.path, args.catalog).to_dict(); emit(result, args.json); return 0 if not result["missing"] and not result["invalid"] else 1
+
+
+_DISCOVERY_EXCLUDED_ROOTS = {
+    "backup", "backups", "legacy", "legacy-read-only", "migration-batches",
+    "migration-preserved", "migration-quarantine", "quarantine", "read-only-legacy",
+}
+
+
+def _excluded_discovery_root(name: str) -> bool:
+    normalized = name.casefold().replace("_", "-")
+    return (
+        normalized in _DISCOVERY_EXCLUDED_ROOTS
+        or normalized.startswith(("backup-", "legacy-", "read-only-legacy-"))
+        or normalized.endswith(("-backup", "-backups"))
+    )
 
 
 def _discover(root: Path) -> list[dict[str, Any]]:
     found = []
-    for path in root.expanduser().resolve().rglob("manifest.json"):
-        found.append(validate(path.parent).to_dict())
+    resolved = root.expanduser().resolve()
+    for directory, names, files in os.walk(resolved):
+        names[:] = [name for name in names if not _excluded_discovery_root(name)]
+        if "manifest.json" in files:
+            manifest = read_json(Path(directory) / "manifest.json")
+            if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
+                continue
+            found.append(validate(Path(directory)).to_dict())
     return found
 
 
@@ -80,6 +92,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     path = args.path.expanduser().resolve()
     if (path / "manifest.json").exists() or any((path / name).exists() for name in ("collection.json", "course_catalog.json", "catalog.json")):
         manifest = read_json(path / "manifest.json") if (path / "manifest.json").exists() else {}
+        if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
+            from .command_response import exit_code
+            result = response(status="unsupported", validation={"legacy_package": "rejected"},
+                              diagnostics=["legacy package schemas are excluded from normal runtime discovery and reads"],
+                              next_action={"command": "video-extract migration plan"})
+            emit(result, args.json); return exit_code(result)
         goals = manifest.get("request", {}).get("goals")
         result: Any = validate_media_request(path) if manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "media" else {
             "package": str(path), "requested_goals": goals,
@@ -469,12 +487,14 @@ def cmd_install(args: argparse.Namespace) -> int:
     from .installation import apply, inspect, plan
     agents_root = args.agents_root.expanduser().resolve()
     codex_root = args.codex_root.expanduser().resolve()
+    obsidian_plugins_root = (args.obsidian_plugins_root.expanduser().resolve()
+                             if args.obsidian_plugins_root else None)
     if args.install_action == "plan":
-        result = plan(agents_root, codex_root)
+        result = plan(agents_root, codex_root, obsidian_plugins_root)
     elif args.install_action == "apply":
-        result = apply(agents_root, codex_root, args.backup_root)
+        result = apply(agents_root, codex_root, args.backup_root, obsidian_plugins_root)
     else:
-        result = inspect(agents_root, codex_root)
+        result = inspect(agents_root, codex_root, obsidian_plugins_root)
     emit(result, args.json)
     return exit_code(result)
 
@@ -491,48 +511,26 @@ def cmd_capability(args: argparse.Namespace) -> int:
     return exit_code(result)
 
 
-def cmd_scan(args: argparse.Namespace) -> int:
-    if args.platform == "xiaoe":
-        forwarded = [args.source, "--output", str(args.output)]
-        if args.visible: forwarded.append("--visible")
-        if args.wait_seconds is not None: forwarded += ["--wait-seconds", str(args.wait_seconds)]
-        return run_legacy("scan_course.py", forwarded, args.json)
-    completed = subprocess.run([sys.executable, "-m", "yt_dlp", "--flat-playlist", "--dump-single-json", args.source], capture_output=True, text=True)
-    if completed.returncode:
-        emit({"ok": False, "error": completed.stderr.strip()}, args.json); return completed.returncode
-    raw = json.loads(completed.stdout); entries = raw.get("entries") or [raw]
-    items = [{"index": i, "id": entry.get("id") or entry.get("url"), "title": entry.get("title") or "untitled", "url": entry.get("webpage_url") or entry.get("url"), "availability": entry.get("availability", "unknown")} for i, entry in enumerate(entries, 1)]
-    catalog = {"schema_version": SCHEMA_VERSION, "platform": args.platform, "identity": raw.get("id") or args.source, "source_url": args.source, "title": raw.get("title"), "total": len(items), "items": items}
-    atomic_write_json(args.output.expanduser().resolve(), catalog)
-    checked = validate(args.output).to_dict(); ok = not checked["invalid"] and not checked["missing"]
-    emit({"ok": ok, "catalog": str(args.output), "validation": checked}, args.json); return 0 if ok else 1
+_RETIRED_COMMAND_REPLACEMENTS = {
+    "migrate-legacy": "video-extract migration plan",
+    "scan": "video-extract plan",
+    "acquire": "video-extract ensure",
+    "transcribe": "video-extract notes prepare",
+    "prepare-evidence": "video-extract notes prepare",
+}
 
 
-def cmd_acquire(args: argparse.Namespace) -> int:
-    if args.platform == "youtube":
-        forwarded = [args.source, "--media", args.media, "--output-dir", str(args.output)]
-        if args.quality: forwarded += ["--max-height", str(args.quality)]
-        return run_legacy("download_youtube.py", forwarded, args.json)
-    if args.platform == "bilibili":
-        if not args.urls_file:
-            emit({"ok": False, "error": "Bilibili acquire requires --urls-file"}, args.json); return 2
-        forwarded = [str(args.urls_file), "--output-dir", str(args.output)]
-        if args.quality: forwarded += ["--quality", str(args.quality)]
-        if args.workers: forwarded += ["--workers", str(args.workers)]
-        if args.headless: forwarded.append("--headless")
-        return run_legacy("prefetch_bilibili.py", forwarded, args.json)
-    from convert_voice_to_article import capture_media, download_video
-    started = time.monotonic(); output = args.output.expanduser().resolve(); source_dir = output / "source"; source_dir.mkdir(parents=True, exist_ok=True)
-    captured = capture_media(args.source, args.session_dir, args.wait_seconds or 30, args.headless, getattr(args, "cdp_url", None))
-    if not captured:
-        emit({"ok": False, "error": "No authorized media request was captured; retry visibly after login and playback."}, args.json); return 1
-    downloaded = download_video(captured[0], source_dir); canonical = source_dir / "source.mp4"
-    if downloaded != canonical: downloaded.replace(canonical)
-    identity = fingerprint([canonical], {"source": args.source})
-    atomic_write_json(source_dir / "metadata.json", {"platform": "xiaoe", "identity": identity, "source_url": args.source, "title": captured[0].title})
-    atomic_write_json(output / "manifest.json", {"schema_version": SCHEMA_VERSION, "platform": "xiaoe", "identity": identity, "title": captured[0].title, "artifacts": {"video": "source/source.mp4", "metadata": "source/metadata.json"}, "stages": {"media_ready": {"duration_ms": round((time.monotonic()-started)*1000), "input_fingerprint": identity, "parameters": {}, "cache_hit": False, "result": "passed"}}})
-    checked = validate(output); ok = "media_ready" in checked.passed
-    emit({"ok": ok, "package": str(output), "validation": checked.to_dict()}, args.json); return 0 if ok else 1
+def cmd_retired(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    replacement = _RETIRED_COMMAND_REPLACEMENTS[args.command]
+    result = response(
+        status="unsupported",
+        validation={"retired_public_command": "failed"},
+        next_action={"command": replacement},
+        diagnostics=[f"video-extract {args.command} is retired and cannot execute legacy scripts"],
+    )
+    emit(result, args.json)
+    return exit_code(result)
 
 
 def cmd_xiaoe(args: argparse.Namespace) -> int:
@@ -547,60 +545,6 @@ def cmd_xiaoe(args: argparse.Namespace) -> int:
         result = status(config, args.course_url)
     emit(result, args.json)
     return 0 if result.get("ok") else 1
-
-
-def cmd_transcribe(args: argparse.Namespace) -> int:
-    if args.catalog:
-        forwarded = ["--catalog", str(args.catalog), "--output-dir", str(args.output)]
-        for key in ("section", "model", "language", "task"):
-            value = getattr(args, key, None)
-            if value: forwarded += [f"--{key}", str(value)]
-        if args.limit: forwarded += ["--limit", str(args.limit)]
-        if args.workers: forwarded += ["--workers", str(args.workers)]
-        if args.visible: forwarded.append("--visible")
-        return run_legacy("batch_process.py", forwarded, args.json)
-    forwarded = ["--video", str(args.video), "--output-dir", str(args.output), "--model", args.model, "--language", args.language, "--task", args.task]
-    return run_legacy("convert_voice_to_article.py", forwarded, args.json)
-
-
-def cmd_prepare(args: argparse.Namespace) -> int:
-    output = args.output.expanduser().resolve(); video = args.video.expanduser().resolve()
-    transcript = (args.transcript or video.with_name("transcript.srt")).expanduser().resolve()
-    params = {"interval": args.interval, "scene_threshold": args.scene_threshold, "max_candidates": args.max_candidates, "ocr": not args.no_ocr,
-              "review": str(args.review_json.resolve()) if args.review_json else None}
-    inputs = [video, transcript] + ([args.review_json.expanduser().resolve()] if args.review_json else [])
-    stage_fingerprint = fingerprint(inputs, params)
-    manifest_path = output / "manifest.json"
-    if manifest_path.exists():
-        old = read_json(manifest_path); prior = old.get("stages", {}).get("candidates_ready", {})
-        current = validate(output)
-        required_gate = "evidence_selected" if args.review_json else "candidates_ready"
-        if prior.get("input_fingerprint") == stage_fingerprint and required_gate in current.passed:
-            emit({"ok": True, "cache_hit": True, "package": str(output), "validation": current.to_dict()}, args.json); return 0
-    started = time.monotonic()
-    forwarded = [str(video), "--transcript", str(transcript), "--output-dir", str(output), "--interval", str(args.interval), "--scene-threshold", str(args.scene_threshold), "--max-candidates", str(args.max_candidates)]
-    if args.review_json: forwarded += ["--review-json", str(args.review_json)]
-    if args.no_ocr: forwarded.append("--no-ocr")
-    code = run_legacy("prepare_learning_package.py", forwarded, False)
-    if code: return code
-    output.mkdir(parents=True, exist_ok=True)
-    metadata = output / "source" / "metadata.json"
-    source_video = output / "source" / "source.mp4"
-    source_srt = output / "source" / "transcript.srt"
-    (output / "source").mkdir(exist_ok=True)
-    if video.resolve() != source_video.resolve() and not source_video.exists(): shutil.copy2(video, source_video)
-    if transcript.resolve() != source_srt.resolve() and not source_srt.exists(): shutil.copy2(transcript, source_srt)
-    if not metadata.exists(): atomic_write_json(metadata, {"platform": "local", "identity": fingerprint([source_video]), "source": video.name})
-    existing = read_json(manifest_path) if manifest_path.exists() else {}
-    existing.update({"schema_version": SCHEMA_VERSION, "platform": existing.get("platform", "local"), "identity": existing.get("identity", fingerprint([source_video])), "title": existing.get("title", video.stem),
-                     "artifacts": {**existing.get("artifacts", {}), "video": "source/source.mp4", "metadata": "source/metadata.json", "transcript_srt": "source/transcript.srt", "candidate_json": "review/keyframes.json", "contact_sheet": "frames/contact_sheet.jpg", "approved_json": "review/approved_keyframes.json", "notes_input": "notes/notes_input.md", "notes": "notes/notes.md"}})
-    atomic_write_json(manifest_path, existing)
-    checked = validate(output)
-    if "candidates_ready" not in checked.passed:
-        emit({"ok": False, "validation": checked.to_dict()}, args.json); return 1
-    existing = read_json(manifest_path); existing.setdefault("stages", {})["candidates_ready"] = {"duration_ms": round((time.monotonic()-started)*1000), "input_fingerprint": stage_fingerprint, "parameters": params, "cache_hit": False, "result": "passed"}; existing["verified_gate"] = checked.observed_gate
-    atomic_write_json(manifest_path, existing)
-    emit({"ok": True, "cache_hit": False, "package": str(output), "validation": checked.to_dict()}, args.json); return 0
 
 
 def cmd_playlist(args: argparse.Namespace) -> int:
@@ -621,21 +565,6 @@ def cmd_playlist(args: argparse.Namespace) -> int:
     result = build_xiaoe_playback_views(args.catalog, args.source_root, args.library_root, args.output_root, args.section)
     emit(result, args.json)
     return 0 if result["ok"] else 1
-
-
-def cmd_migrate_legacy(args: argparse.Namespace) -> int:
-    from .migration import build_plan, consolidate_plans, execute_plan, write_plan
-    if args.mode == "plan":
-        if args.source_root is None: raise ValueError("plan mode requires --source-root")
-        result = build_plan(args.source_root, args.library_root, root_media_only=args.root_media_only)
-        write_plan(args.report, result)
-    elif args.mode == "consolidate":
-        result = consolidate_plans([read_json(path) for path in args.input_report])
-        write_plan(args.report, result)
-    else:
-        result = execute_plan(read_json(args.report), args.journal)
-    emit(result, args.json)
-    return 0 if result.get("ok", False) else 1
 
 
 def cmd_export_obsidian(args: argparse.Namespace) -> int:
@@ -736,6 +665,9 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="video-extract", description="Stable deterministic interface for authorized video-learning packages")
     commands = root.add_subparsers(dest="command", required=True)
+    def hide(parser: argparse.ArgumentParser) -> None:
+        command = parser.prog.rsplit(" ", 1)[-1]
+        commands._choices_actions[:] = [action for action in commands._choices_actions if action.dest != command]
     workspace = commands.add_parser("workspace", help="inspect and rebuild a portable workspace")
     workspace_actions = workspace.add_subparsers(dest="workspace_action", required=True)
     for action in ("show", "doctor"):
@@ -763,7 +695,7 @@ def parser() -> argparse.ArgumentParser:
     migrate.add_argument("--mode", choices=("plan", "move", "consolidate"), required=True); migrate.add_argument("--report", type=Path, required=True)
     migrate.add_argument("--input-report", type=Path, action="append", default=[])
     migrate.add_argument("--root-media-only", action="store_true")
-    migrate.add_argument("--journal", type=Path, required=True); migrate.add_argument("--json", action="store_true"); migrate.set_defaults(func=cmd_migrate_legacy)
+    migrate.add_argument("--journal", type=Path, required=True); migrate.add_argument("--json", action="store_true"); migrate.set_defaults(func=cmd_retired); hide(migrate)
     export = commands.add_parser("export-obsidian", help="export verified reading notes into Obsidian")
     export.add_argument("package", nargs="?", type=Path); export.add_argument("--all-verified", action="store_true")
     export.add_argument("--library-root", type=Path); export.add_argument("--root", type=Path); export.add_argument("--workspace", type=Path)
@@ -778,7 +710,6 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--json", action="store_true"); search.set_defaults(func=cmd_library)
     for name, func in (("verify", cmd_verify), ("status", cmd_status)):
         p = commands.add_parser(name, help=f"{name} package state from actual artifacts"); p.add_argument("path", type=Path); p.add_argument("--catalog", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=func)
-        if name == "verify": p.add_argument("--goal", action="append", choices=("podcast_zh", "notes_zh"))
     def media_arguments(p: argparse.ArgumentParser) -> None:
         p.add_argument("--media", choices=("video", "audio", "subtitles", "all"), default="all")
         p.add_argument("--language", default="original")
@@ -925,6 +856,7 @@ def parser() -> argparse.ArgumentParser:
         p = install_actions.add_parser(action)
         p.add_argument("--agents-root", type=Path, default=Path.home() / ".agents")
         p.add_argument("--codex-root", type=Path, default=Path.home() / ".codex")
+        p.add_argument("--obsidian-plugins-root", type=Path)
         if action == "apply": p.add_argument("--backup-root", type=Path)
         p.add_argument("--json", action="store_true")
         p.set_defaults(func=cmd_install)
@@ -937,8 +869,8 @@ def parser() -> argparse.ArgumentParser:
     capability_run = capability_actions.add_parser("run", help="run a capability from a versioned JSON request")
     capability_run.add_argument("capability_id"); capability_run.add_argument("--request", type=Path, required=True)
     capability_run.add_argument("--json", action="store_true"); capability_run.set_defaults(func=cmd_capability)
-    scan = commands.add_parser("scan", help="scan a homogeneous collection inventory"); scan.add_argument("source"); scan.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); scan.add_argument("--output", type=Path, required=True); scan.add_argument("--visible", action="store_true"); scan.add_argument("--wait-seconds", type=int); scan.add_argument("--json", action="store_true"); scan.set_defaults(func=cmd_scan)
-    acquire = commands.add_parser("acquire", help="acquire authorized media for one platform scope"); acquire.add_argument("source", nargs="?", default=""); acquire.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); acquire.add_argument("--urls-file", type=Path); acquire.add_argument("--output", type=Path, required=True); acquire.add_argument("--media", choices=("video", "audio", "both"), default="video"); acquire.add_argument("--quality", type=int); acquire.add_argument("--workers", type=int); acquire.add_argument("--session-dir", type=Path, default=Path("work/browser_session")); acquire.add_argument("--wait-seconds", type=int); acquire.add_argument("--headless", action="store_true"); acquire.add_argument("--cdp-url", help="连接已打开的 Chrome CDP 地址"); acquire.add_argument("--json", action="store_true"); acquire.set_defaults(func=cmd_acquire)
+    scan = commands.add_parser("scan"); scan.add_argument("source"); scan.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); scan.add_argument("--output", type=Path, required=True); scan.add_argument("--visible", action="store_true"); scan.add_argument("--wait-seconds", type=int); scan.add_argument("--json", action="store_true"); scan.set_defaults(func=cmd_retired); hide(scan)
+    acquire = commands.add_parser("acquire"); acquire.add_argument("source", nargs="?", default=""); acquire.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); acquire.add_argument("--urls-file", type=Path); acquire.add_argument("--output", type=Path, required=True); acquire.add_argument("--media", choices=("video", "audio", "both"), default="video"); acquire.add_argument("--quality", type=int); acquire.add_argument("--workers", type=int); acquire.add_argument("--session-dir", type=Path, default=Path("work/browser_session")); acquire.add_argument("--wait-seconds", type=int); acquire.add_argument("--headless", action="store_true"); acquire.add_argument("--cdp-url", help="连接已打开的 Chrome CDP 地址"); acquire.add_argument("--json", action="store_true"); acquire.set_defaults(func=cmd_retired); hide(acquire)
     xiaoe = commands.add_parser("xiaoe", help="persistent, resumable Xiaoe course downloads")
     xiaoe_actions = xiaoe.add_subparsers(dest="xiaoe_action", required=True)
     xiaoe_login = xiaoe_actions.add_parser("login", help="authorize the persistent Xiaoe download profile once")
@@ -947,8 +879,9 @@ def parser() -> argparse.ArgumentParser:
     xiaoe_download.add_argument("course_url"); xiaoe_download.add_argument("--chapters", required=True, help="comma-separated numbers or ranges, e.g. 17,18,19 or 17-19"); xiaoe_download.add_argument("--wait-seconds", type=int, default=12); xiaoe_download.add_argument("--visible", action="store_true"); xiaoe_download.add_argument("--workspace", type=Path); xiaoe_download.add_argument("--json", action="store_true"); xiaoe_download.set_defaults(func=cmd_xiaoe)
     xiaoe_status = xiaoe_actions.add_parser("status", help="show resumable Xiaoe download status")
     xiaoe_status.add_argument("course_url"); xiaoe_status.add_argument("--workspace", type=Path); xiaoe_status.add_argument("--json", action="store_true"); xiaoe_status.set_defaults(func=cmd_xiaoe)
-    transcribe = commands.add_parser("transcribe", help="reuse formal subtitles or transcribe media"); transcribe.add_argument("--video", type=Path); transcribe.add_argument("--catalog", type=Path); transcribe.add_argument("--output", type=Path, required=True); transcribe.add_argument("--section"); transcribe.add_argument("--limit", type=int); transcribe.add_argument("--workers", type=int); transcribe.add_argument("--model", default="small"); transcribe.add_argument("--language", default="zh"); transcribe.add_argument("--task", choices=("transcribe", "translate"), default="transcribe"); transcribe.add_argument("--visible", action="store_true"); transcribe.add_argument("--json", action="store_true"); transcribe.set_defaults(func=cmd_transcribe)
-    prep = commands.add_parser("prepare-evidence", help="prepare reusable low-resolution evidence candidates"); prep.add_argument("--video", type=Path, required=True); prep.add_argument("--transcript", type=Path); prep.add_argument("--output", type=Path, required=True); prep.add_argument("--review-json", type=Path); prep.add_argument("--interval", type=float, default=15); prep.add_argument("--scene-threshold", type=float, default=.30); prep.add_argument("--max-candidates", type=int, default=40); prep.add_argument("--no-ocr", action="store_true"); prep.add_argument("--json", action="store_true"); prep.set_defaults(func=cmd_prepare)
+    transcribe = commands.add_parser("transcribe"); transcribe.add_argument("--video", type=Path); transcribe.add_argument("--catalog", type=Path); transcribe.add_argument("--output", type=Path, required=True); transcribe.add_argument("--section"); transcribe.add_argument("--limit", type=int); transcribe.add_argument("--workers", type=int); transcribe.add_argument("--model", default="small"); transcribe.add_argument("--language", default="zh"); transcribe.add_argument("--task", choices=("transcribe", "translate"), default="transcribe"); transcribe.add_argument("--visible", action="store_true"); transcribe.add_argument("--json", action="store_true"); transcribe.set_defaults(func=cmd_retired); hide(transcribe)
+    prep = commands.add_parser("prepare-evidence"); prep.add_argument("--video", type=Path, required=True); prep.add_argument("--transcript", type=Path); prep.add_argument("--output", type=Path, required=True); prep.add_argument("--review-json", type=Path); prep.add_argument("--interval", type=float, default=15); prep.add_argument("--scene-threshold", type=float, default=.30); prep.add_argument("--max-candidates", type=int, default=40); prep.add_argument("--no-ocr", action="store_true"); prep.add_argument("--json", action="store_true"); prep.set_defaults(func=cmd_retired); hide(prep)
+    commands.metavar = "{" + ",".join(action.dest for action in commands._choices_actions) + "}"
     return root
 
 
