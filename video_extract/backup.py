@@ -24,7 +24,7 @@ SCHEMA_VERSION = 1
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/backup-manifest-v1.schema.json").read_text())
 MANIFEST = "backup-manifest.json"
 STORE_PREFIXES = {"sources": "", "notes": "source-notes", "learning": "learning",
-                  "review": "review", "practice": "practices"}
+                  "review": "review", "practice": "practices", "cards": "cards"}
 
 
 def _now() -> str:
@@ -94,10 +94,12 @@ def _pointer_generation(results: Path, store: str) -> tuple[dict[str, Any], list
 
 def _generation(config: WorkspaceConfig, store: str) -> tuple[dict[str, Any], list[Path]]:
     authority, paths = _pointer_generation(config.results, store)
-    if store in {"review", "practice"}:
+    if store in {"review", "practice", "cards"}:
         from .review import backup_entries as review_entries
         from .practice import backup_entries as practice_entries
-        exported = (review_entries if store == "review" else practice_entries)(config)
+        from .cards import backup_entries as card_entries
+        exported = {"review": review_entries, "practice": practice_entries,
+                    "cards": card_entries}[store](config)
         if exported["commit_id"] != authority["commit_id"]:
             raise WorkspaceError(f"{store} generation changed while enumerating backup entries")
         paths = [_safe(config.results, Path(raw).relative_to(config.results).as_posix())
@@ -184,7 +186,8 @@ def _deep_validate_payload(root: Path, manifest: dict[str, Any]) -> None:
     observed = {"sources": source, "notes": notes, "learning": learning}
     from .review import _load as load_review
     from .practice import _load as load_practice
-    for name, loader in (("review", load_review), ("practice", load_practice)):
+    from .cards import _load as load_cards
+    for name, loader in (("review", load_review), ("practice", load_practice), ("cards", load_cards)):
         snapshot = loader(config)
         if name in expected:
             observed[name] = snapshot
@@ -215,6 +218,11 @@ def _deep_validate_payload(root: Path, manifest: dict[str, Any]) -> None:
         if any((ref["source_id"], ref["source_version"]) not in versions
                for ref in preparation["pin"]["source_refs"]):
             raise WorkspaceError("review pin has a broken source-version association")
+    for card in observed.get("cards", {}).get("record", {}).get("cards", {}).values():
+        for version in card["versions"].values():
+            if any((ref["source_id"], ref["source_version"]) not in versions
+                   for ref in version["explanation_pin"]["source_refs"]):
+                raise WorkspaceError("card version has a broken source-version association")
     _receipt_files(payload)
 
 

@@ -144,8 +144,25 @@ def _learning_pin(config: WorkspaceConfig, question_id: str) -> tuple[dict[str, 
             "learning_commit_id": snapshot["commit_id"], "learning_revision": snapshot["revision"]}, question
 
 
-def prepare(config: WorkspaceConfig, question_id: str, preparation_id: str | None = None) -> dict[str, Any]:
-    pin, question = _learning_pin(config, question_id)
+def prepare(config: WorkspaceConfig, question_id: str | None, preparation_id: str | None = None,
+            *, card_version_id: str | None = None) -> dict[str, Any]:
+    if card_version_id:
+        from .cards import get_version
+        card, version = get_version(config, card_version_id)
+        current_pin, _ = _learning_pin(config, version["explanation_pin"]["question_id"])
+        if current_pin is None or current_pin["object_sha256"] != version["explanation_pin"]["object_sha256"]:
+            return response(status="awaiting_user", workspace=str(config.config_path),
+                            validation={"card_answer": "stale"},
+                            diagnostics=["the bound explanation changed; revise or confirm the card before scoring"],
+                            next_action={"type": "user", "reason": "review the card answer and conditions"})
+        pin = {**version["explanation_pin"], "card_id": card["card_id"],
+               "card_version_id": card_version_id}
+        question_id = pin["question_id"]
+        question = {"question_id": question_id, "original_question": version["prompt"]}
+    elif question_id:
+        pin, question = _learning_pin(config, question_id)
+    else:
+        pin, question = None, None
     if pin is None:
         return response(status="missing_input", workspace=str(config.config_path), result=question,
                         validation={"persisted_explanation": "failed"},
@@ -158,7 +175,8 @@ def prepare(config: WorkspaceConfig, question_id: str, preparation_id: str | Non
                             diagnostics=["preparation_id must start with review-preparation-"])
         existing = snapshot["record"]["preparations"].get(preparation_id)
         if existing is not None:
-            if existing["pin"]["question_id"] != question_id:
+            if existing["pin"]["question_id"] != question_id \
+                    or existing["pin"].get("card_version_id") != card_version_id:
                 return response(status="awaiting_user", workspace=str(config.config_path),
                                 validation={"preparation_id": "conflict"},
                                 diagnostics=["preparation_id already identifies another question"])
@@ -189,7 +207,8 @@ def prepare(config: WorkspaceConfig, question_id: str, preparation_id: str | Non
 
 def record(config: WorkspaceConfig, preparation_id: str, event_id: str, *, answer: str | None,
            answer_summary: str | None, hints: list[str], model_evaluation: str,
-           correction: str | None = None, corrected_evaluation: str | None = None) -> dict[str, Any]:
+           correction: str | None = None, corrected_evaluation: str | None = None,
+           review_date: str | None = None) -> dict[str, Any]:
     allowed = {"recalled", "prompted", "not_recalled", "not_scored"}
     if model_evaluation not in allowed or corrected_evaluation not in allowed | {None}:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=["invalid review evaluation"])
@@ -199,13 +218,16 @@ def record(config: WorkspaceConfig, preparation_id: str, event_id: str, *, answe
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=["skipped or unanswered review must be not_scored"])
     if bool(correction) != bool(corrected_evaluation):
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=["a correction requires both text and corrected evaluation"])
+    if review_date is not None:
+        from datetime import date
+        date.fromisoformat(review_date)
     normalized = {"preparation_id": preparation_id, "event_id": event_id,
                   "answer": answer.strip() if answer else None,
                   "answer_summary": answer_summary.strip() if answer_summary else None,
                   "hints": [item.strip() for item in hints if item.strip()],
                   "model_evaluation": model_evaluation,
                   "correction": correction.strip() if correction else None,
-                  "corrected_evaluation": corrected_evaluation}
+                  "corrected_evaluation": corrected_evaluation, "review_date": review_date}
     request_sha256 = hashlib.sha256(json.dumps(normalized, ensure_ascii=False,
                                                sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with package_lock(_roots(config)[1].parent):
@@ -216,12 +238,21 @@ def record(config: WorkspaceConfig, preparation_id: str, event_id: str, *, answe
                 return response(status="awaiting_user", workspace=str(config.config_path),
                                 validation={"event_id": "conflict"},
                                 diagnostics=["event_id already identifies a different immutable Review fact"])
-            return response(status="completed", workspace=str(config.config_path), result={
-                "event": existing, "replayed": True, "reveal": _reveal(config, existing["pin"])},
+            replay_result = {"event": existing, "replayed": True, "reveal": _reveal(config, existing["pin"])}
+            if existing["pin"].get("card_version_id"):
+                from .cards import schedule
+                replay_result["next_schedule"] = schedule(
+                    config, card_version_id=existing["pin"]["card_version_id"],
+                    on_date=existing.get("review_date"))["result"]
+            return response(status="completed", workspace=str(config.config_path), result=replay_result,
                 validation={"review_record": "passed", "idempotency": "reused"})
         preparation = record_value["preparations"].get(preparation_id)
         if preparation is None:
             return response(status="missing_input", workspace=str(config.config_path), diagnostics=["unknown review preparation"])
+        if preparation["pin"].get("card_version_id") and review_date is None:
+            return response(status="missing_input", workspace=str(config.config_path),
+                            validation={"review_date": "failed"},
+                            diagnostics=["card review requires the actual Asia/Shanghai review date"])
         if preparation["consumed_by"] is not None:
             return response(status="awaiting_user", workspace=str(config.config_path),
                             validation={"preparation": "consumed"}, diagnostics=["review preparation was already consumed"])
@@ -234,22 +265,34 @@ def record(config: WorkspaceConfig, preparation_id: str, event_id: str, *, answe
                  "model_evaluation": model_evaluation,
                  "effective_evaluation": corrected_evaluation or model_evaluation,
                  "corrections": corrections, "pin": preparation["pin"],
-                 "engine_version": engineering_revision(), "schema_version": 1}
+                 "engine_version": engineering_revision(), "schema_version": 1,
+                 "review_date": review_date}
         consumed = {**preparation, "consumed_by": event_id}
         updated = {**record_value,
                    "preparations": {**record_value["preparations"], preparation_id: consumed},
                    "events": {**record_value["events"], event_id: event}}
         published = _publish(config, snapshot, updated)
-    return response(status="completed", workspace=str(config.config_path), result={
+    result = {
         "event": event, "replayed": False, "reveal": _reveal(config, event["pin"]),
-        "review_revision": published["revision"], "review_commit_id": published["commit_id"]},
+        "review_revision": published["revision"], "review_commit_id": published["commit_id"]}
+    if event["pin"].get("card_version_id"):
+        from .cards import schedule
+        result["next_schedule"] = schedule(config, card_version_id=event["pin"]["card_version_id"],
+                                           on_date=review_date)["result"]
+    return response(status="completed", workspace=str(config.config_path), result=result,
         validation={"review_record": "passed", "learning_record": "unchanged"})
 
 
 def _reveal(config: WorkspaceConfig, pin: dict[str, Any]) -> dict[str, Any]:
-    return {"explanation_id": pin["explanation_id"], "explanation_revision": pin["explanation_revision"],
+    value = {"explanation_id": pin["explanation_id"], "explanation_revision": pin["explanation_revision"],
             "object_sha256": pin["object_sha256"], "document_path": str(config.results / pin["logical_path"]),
             "source_refs": pin["source_refs"]}
+    if pin.get("card_version_id"):
+        from .cards import get_version
+        _, version = get_version(config, pin["card_version_id"])
+        value.update(card_id=pin["card_id"], card_version_id=pin["card_version_id"],
+                     expected_answer=version["answer"], conditions=version["conditions"])
+    return value
 
 
 def show(config: WorkspaceConfig, question_id: str | None = None) -> dict[str, Any]:
@@ -281,12 +324,14 @@ def run_review(request: dict[str, Any]) -> dict[str, Any]:
     from .workspace import discover_workspace
     config = discover_workspace(Path(request["workspace"])); action = request.get("action")
     try:
-        if action == "prepare": return prepare(config, request["question_id"], request.get("preparation_id"))
+        if action == "prepare": return prepare(config, request.get("question_id"), request.get("preparation_id"),
+                                                card_version_id=request.get("card_version_id"))
         if action == "record":
             return record(config, request["preparation_id"], request["event_id"], answer=request.get("answer"),
                           answer_summary=request.get("answer_summary"), hints=list(request.get("hints") or []),
                           model_evaluation=request["model_evaluation"], correction=request.get("correction"),
-                          corrected_evaluation=request.get("corrected_evaluation"))
+                          corrected_evaluation=request.get("corrected_evaluation"),
+                          review_date=request.get("review_date"))
         if action == "show": return show(config, request.get("question_id"))
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=["unsupported review action"])
     except PackageBusyError as exc:
