@@ -203,6 +203,8 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
                                                  snapshot["commit_id"])
             except WorkspaceError:
                 projected[filename] = None
+        root_titles = {thread_id: record["questions"][value["root_question_id"]]["title"]
+                       for thread_id, value in record["threads"].items()}
         for question_id, question in visible.items():
             refs = question["explanation_refs"]
             content_state, href = "pending", None
@@ -221,7 +223,7 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
                                   "content_state": content_state, "href": href,
                                   "is_current": bool(thread and question_id == thread["current_question_id"]),
                                   "cross_root": question_id not in owned,
-                                  "source_root_title": (record["questions"][record["threads"][question["thread_id"]]["root_question_id"]]["title"]
+                                  "source_root_title": (root_titles[question["thread_id"]]
                                                         if question_id not in owned else None),
                                   "unresolved_confusions": question["unresolved_confusions"]}
         edges = [{"from_question_id": item["from_question_id"], "to_question_id": item["to_question_id"],
