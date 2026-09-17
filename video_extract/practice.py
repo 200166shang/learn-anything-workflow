@@ -1,7 +1,7 @@
 """Independent local-practice facts and stable user-code checkpoints."""
 from __future__ import annotations
 
-import hashlib, json, os, re, shutil, uuid
+import hashlib, json, os, re, shutil, stat, uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -13,6 +13,7 @@ from .package_lock import package_lock
 from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError, discover_workspace
 
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/practice-snapshot-v1.schema.json").read_text())
+EVENT_SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/practice-event-v1.schema.json").read_text())
 ID_RE = re.compile(r"^practice-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 ROLES = ("example", "task", "tests", "reference")
 
@@ -41,6 +42,14 @@ def _validate(value: dict[str, Any]) -> None:
     if errors: raise WorkspaceError(f"practice-snapshot-v1 validation failed: {errors[0].message}")
     for key, practice in value["practices"].items():
         if practice.get("practice_id") != key: raise WorkspaceError(f"practice identity mismatch: {key}")
+        for event in practice.get("events",[]):
+            recorded_at=event.get("recorded_at")
+            if not isinstance(recorded_at,str):raise WorkspaceError("practice event recorded_at is required")
+            candidate={name:item for name,item in event.items() if name not in {"recorded_at"}}
+            if event.get("kind")!="test":
+                if candidate.pop("verification",None)!="reported_not_executed":raise WorkspaceError("non-test practice event verification is invalid")
+            event_errors=list(Draft202012Validator(EVENT_SCHEMA,format_checker=FormatChecker()).iter_errors(candidate))
+            if event_errors:raise WorkspaceError(f"stored practice event is invalid: {event_errors[0].message}")
         reachable = [practice["preparation_sha256"], *[x["object_sha256"] for x in practice["checkpoints"]]]
         if any(digest not in value["objects"] for digest in reachable): raise WorkspaceError("practice object is unreachable")
 
@@ -152,39 +161,121 @@ def _conflict(config:WorkspaceConfig,snapshot:dict[str,Any],expected:int,operati
     atomic_write_json(path,{"schema_version":1,"operation":operation,"expected_revision":expected,"observed_revision":snapshot["revision"],"proposal":proposal}); _sync(directory)
     return response(status="awaiting_user",workspace=str(config.config_path),result={"candidate":str(path),"observed_revision":snapshot["revision"]},validation={"expected_revision":"conflict"},next_action={"type":"user","reason":"resolve practice revision conflict"})
 
+def _open_task(root:Path,pid:str)->int:
+    descriptor=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        for part in ("workspaces",pid,"task"):
+            child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=descriptor)
+            os.close(descriptor); descriptor=child
+        return descriptor
+    except Exception:
+        os.close(descriptor); raise
+
+def _inventory(task_fd:int)->dict[str,tuple[str,int,int,int,int]]:
+    result:dict[str,tuple[str,int,int,int,int]]={}
+    def walk(fd:int,prefix:PurePosixPath)->None:
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                relative=(prefix/entry.name).as_posix(); metadata=entry.stat(follow_symlinks=False); mode=metadata.st_mode
+                kind="file" if stat.S_ISREG(mode) else "dir" if stat.S_ISDIR(mode) else "symlink" if stat.S_ISLNK(mode) else "other"
+                result[relative]=(kind,metadata.st_dev,metadata.st_ino,metadata.st_size,metadata.st_mtime_ns)
+                if kind=="dir":
+                    child=os.open(entry.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+                    try: walk(child,prefix/entry.name)
+                    finally: os.close(child)
+    walk(task_fd,PurePosixPath())
+    return result
+
+def _read_regular(task_fd:int,relative:str)->bytes:
+    parts=PurePosixPath(relative).parts; descriptor=os.dup(task_fd)
+    try:
+        for part in parts[:-1]:
+            child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=descriptor)
+            os.close(descriptor); descriptor=child
+        file_descriptor=os.open(parts[-1],os.O_RDONLY|os.O_NOFOLLOW,dir_fd=descriptor)
+        try:
+            before=os.fstat(file_descriptor)
+            if not stat.S_ISREG(before.st_mode): raise WorkspaceError(f"editable path changed type: {relative}")
+            chunks=[]
+            while True:
+                chunk=os.read(file_descriptor,1024*1024)
+                if not chunk: break
+                chunks.append(chunk)
+            after=os.fstat(file_descriptor)
+            signature=lambda value:(value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+            if signature(before)!=signature(after): raise WorkspaceError(f"editable file changed while reading: {relative}")
+            return b"".join(chunks)
+        finally: os.close(file_descriptor)
+    finally: os.close(descriptor)
+
+def _unstable(config:WorkspaceConfig,snapshot:dict[str,Any],pid:str,diagnostic:str)->dict[str,Any]:
+    return response(status="recoverable_failure",workspace=str(config.config_path),result={"practice_id":pid,"revision":snapshot["revision"]},validation={"stable_code":"failed"},diagnostics=[diagnostic],next_action={"type":"retry","reason":"save or pause edits, then checkpoint again"})
+
+def _derive_completion(practice:dict[str,Any])->str:
+    events=practice["events"]
+    attempts=any(item["kind"]=="attempt" for item in events)
+    observed_tests=[item for item in events if item["kind"]=="test" and item.get("verification")=="tool_observed"]
+    passed=any(item["exit_code"]==0 and all(value=="passed" for value in item["cases"].values()) for item in observed_tests)
+    if not practice["checkpoints"] or not attempts or not passed:return "in_progress"
+    return "with_hint" if any(item["kind"]=="hint" for item in events) else "independent"
+
 def checkpoint(config:WorkspaceConfig,pid:str,expected_revision:int)->dict[str,Any]:
     root=_root(config)
     with package_lock(root):
         snapshot=_load(config); practice=_get(snapshot,pid); conflict=_conflict(config,snapshot,expected_revision,"checkpoint",{"practice_id":pid})
         if conflict:return conflict
-        workspace=root/"workspaces"/pid; task=workspace/"task"
-        if workspace.is_symlink() or task.is_symlink() or task.resolve(strict=False)!=workspace.resolve(strict=False)/"task":
-            raise WorkspaceError("refusing symbolic link in editable practice workspace")
-        all_paths=sorted(task.rglob("*"))
-        if any(path.is_symlink() for path in all_paths): raise WorkspaceError("refusing symbolic link in task files")
-        paths=[path for path in all_paths if path.is_file()]
-        first=[(path.relative_to(task).as_posix(),path.read_bytes()) for path in paths]
-        if os.environ.get("VIDEO_EXTRACT_PRACTICE_TEST_FAULT")=="unstable_read" and paths: paths[0].write_bytes(paths[0].read_bytes()+b"\n# concurrent edit")
-        second=[(path.relative_to(task).as_posix(),path.read_bytes()) for path in paths]
-        if first!=second:return response(status="recoverable_failure",workspace=str(config.config_path),result={"practice_id":pid,"revision":snapshot["revision"]},validation={"stable_code":"failed"},diagnostics=["task code changed during checkpoint"],next_action={"type":"retry"})
-        payload=json.dumps({name:body.decode("utf-8") for name,body in first},ensure_ascii=False,sort_keys=True,separators=(",",":")).encode(); digest,size=_put(root,payload)
+        workspace=root/"workspaces"/pid; task=workspace/"task"; task_fd=None
+        try:
+            task_fd=_open_task(root,pid); initial_root=os.fstat(task_fd)
+            before=_inventory(task_fd)
+            if not before or any(item[0] not in {"file","dir"} for item in before.values()): raise WorkspaceError("editable paths must be regular files or directories")
+            file_names=sorted(name for name,item in before.items() if item[0]=="file")
+            if not file_names:raise WorkspaceError("editable task contains no regular files")
+            fault=os.environ.get("VIDEO_EXTRACT_PRACTICE_TEST_FAULT")
+            target=task/file_names[0]
+            if fault=="late_file":(task/"late.py").write_text("# late\n")
+            elif fault=="remove_file":target.unlink()
+            elif fault=="type_change":target.unlink();target.mkdir()
+            elif fault=="symlink_swap":target.unlink();target.symlink_to(workspace/"reference/solution.py")
+            elif fault=="unstable_read":target.write_bytes(target.read_bytes()+b"\n# concurrent edit")
+            first=[(name,_read_regular(task_fd,name)) for name in file_names]
+            fresh_fd=_open_task(root,pid)
+            try:
+                fresh_root=os.fstat(fresh_fd)
+                if (initial_root.st_dev,initial_root.st_ino)!=(fresh_root.st_dev,fresh_root.st_ino):raise WorkspaceError("editable task root changed during checkpoint")
+                after=_inventory(fresh_fd)
+            finally:os.close(fresh_fd)
+            if before!=after: raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
+            second=[(name,_read_regular(task_fd,name)) for name in file_names]
+            if first!=second: raise WorkspaceError("editable file content changed during checkpoint")
+            payload=json.dumps({name:body.decode("utf-8") for name,body in first},ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
+        except (OSError,WorkspaceError) as exc:
+            return _unstable(config,snapshot,pid,str(exc))
+        except UnicodeError as exc:
+            return _unstable(config,snapshot,pid,f"editable task is not UTF-8 text: {exc}")
+        finally:
+            if task_fd is not None:os.close(task_fd)
+        digest,size=_put(root,payload)
         item={"checkpoint_id":"checkpoint-"+str(uuid.uuid4()),"created_at":_now(),"object_sha256":digest,"files":[{"path":name,"sha256":hashlib.sha256(body).hexdigest(),"size":len(body)} for name,body in first]}
         updated={**practice,"checkpoints":[*practice["checkpoints"],item],"next_step":"run isolated tests"}
+        updated["completion"]=_derive_completion(updated)
         published=_publish(config,snapshot,{**snapshot["practices"],pid:updated},{digest:{"kind":"code_checkpoint","size":size}})
         return _result(config,published,updated,checkpoint=item)
 
 def record(config:WorkspaceConfig,pid:str,request_path:Path,expected_revision:int)->dict[str,Any]:
     event=read_json(request_path)
-    if event.get("kind") not in {"hint","attempt","test","outcome"} or not isinstance(event.get("event_id"),str): raise ValueError("event_id and valid kind required")
-    if event["kind"]=="hint" and event.get("level") not in {1,2,3}: raise ValueError("hint level must be 1..3")
-    if event["kind"]=="outcome" and event.get("completion") not in {"independent","with_hint","example_only","incomplete"}: raise ValueError("invalid completion")
+    errors=list(Draft202012Validator(EVENT_SCHEMA,format_checker=FormatChecker()).iter_errors(event))
+    if errors:raise ValueError(f"practice-event-v1 validation failed: {errors[0].message}")
     root=_root(config)
     with package_lock(root):
         snapshot=_load(config); practice=_get(snapshot,pid); conflict=_conflict(config,snapshot,expected_revision,"record",{"practice_id":pid,"event":event})
         if conflict:return conflict
         if any(x["event_id"]==event["event_id"] for x in practice["events"]):return _result(config,snapshot,practice,reused=True)
-        saved={**event,"recorded_at":_now(),"verification":"reported_not_executed"}; updated={**practice,"events":[*practice["events"],saved]}
-        if event["kind"]=="outcome":updated.update({"completion":event["completion"],"next_step":event.get("next_step")})
+        saved={**event,"recorded_at":_now()}
+        if event["kind"]!="test":saved["verification"]="reported_not_executed"
+        updated={**practice,"events":[*practice["events"],saved]}
+        if event["kind"]=="outcome":updated.update({"reported_outcome":event["completion"],"next_step":event["next_step"]})
+        updated["completion"]=_derive_completion(updated)
         published=_publish(config,snapshot,{**snapshot["practices"],pid:updated},{})
         return _result(config,published,updated,event=saved)
 

@@ -3,7 +3,10 @@ import os
 import subprocess
 import sys
 import importlib.util
+import shutil
 from pathlib import Path
+
+import pytest
 
 
 def write_workspace(root: Path) -> Path:
@@ -134,7 +137,8 @@ def test_record_keeps_hint_attempt_and_test_facts_without_executing_or_changing_
         {"event_id": "attempt-1", "kind": "attempt", "summary": "修正边界条件"},
         {"event_id": "test-1", "kind": "test", "command": ["touch", str(marker)],
          "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
-         "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00"},
+         "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00",
+         "verification": "tool_observed"},
         {"event_id": "outcome-1", "kind": "outcome", "completion": "with_hint",
          "next_step": "尝试改变过期阈值"},
     ]
@@ -147,7 +151,8 @@ def test_record_keeps_hint_attempt_and_test_facts_without_executing_or_changing_
         assert code == 0
         revision = recorded["result"]["revision"]
     assert not marker.exists()
-    assert recorded["result"]["practice"]["completion"] == "with_hint"
+    assert recorded["result"]["practice"]["completion"] == "in_progress"
+    assert recorded["result"]["practice"]["reported_outcome"] == "with_hint"
     assert len(recorded["result"]["practice"]["events"]) == 4
     assert not (config.parent / "results/learning/current.json").exists()
 
@@ -191,3 +196,117 @@ def test_backup_entries_pin_checkpointed_code_and_exclude_editable_workspace(tmp
     assert any("/objects/" in item for item in entries)
     assert all("/workspaces/" not in item for item in entries)
     assert checked["result"]["checkpoint"]["object_sha256"] in " ".join(entries)
+
+    restored = tmp_path / "restored"
+    restored_config = write_workspace(restored)
+    source_root = config_path.parent / "results"
+    target_root = restored / "results"
+    for entry in entries:
+        source = Path(entry)
+        relative = source.relative_to(source_root)
+        destination = target_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    restored_entries = backup_entries(WorkspaceConfig.load(restored_config))
+    assert restored_entries["commit_id"] == checked["result"]["commit_id"]
+
+
+@pytest.mark.parametrize("fault", ["late_file", "remove_file", "type_change", "symlink_swap"])
+def test_checkpoint_rejects_file_set_and_type_races(tmp_path: Path, fault: str) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+
+    code, result = cli("practice", "checkpoint", "--practice-id", pid,
+                       "--expected-revision", 1, "--workspace", config, "--json",
+                       env={"VIDEO_EXTRACT_PRACTICE_TEST_FAULT": fault})
+
+    assert code == 1
+    assert result["status"] == "recoverable_failure"
+    assert result["validation"]["stable_code"] == "failed"
+    assert result["result"]["revision"] == 1
+
+
+def test_outcome_without_checkpoint_attempt_and_observed_tests_is_not_authoritative(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+    outcome = tmp_path / "outcome.json"
+    outcome.write_text(json.dumps({"event_id": "outcome-zero", "kind": "outcome",
+                                   "completion": "independent", "next_step": "done"}))
+
+    code, result = cli("practice", "record", "--practice-id", pid, "--request", outcome,
+                       "--expected-revision", 1, "--workspace", config, "--json")
+
+    assert code == 0
+    assert result["result"]["practice"]["completion"] == "in_progress"
+    assert result["result"]["practice"]["reported_outcome"] == "independent"
+
+
+def test_hint_prevents_independent_completion_even_when_outcome_claims_it(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+    _, checked = cli("practice", "checkpoint", "--practice-id", pid, "--expected-revision", 1,
+                     "--workspace", config, "--json")
+    revision = checked["result"]["revision"]
+    events = [
+        {"event_id": "hint-derived", "kind": "hint", "level": 1, "summary": "compare age"},
+        {"event_id": "attempt-derived", "kind": "attempt", "summary": "fixed boundary"},
+        {"event_id": "test-derived", "kind": "test", "command": ["pytest"],
+         "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
+         "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00", "verification": "tool_observed"},
+        {"event_id": "outcome-derived", "kind": "outcome", "completion": "independent", "next_step": "vary threshold"},
+    ]
+    for event in events:
+        path = tmp_path / f'{event["event_id"]}.json'; path.write_text(json.dumps(event))
+        _, result = cli("practice", "record", "--practice-id", pid, "--request", path,
+                        "--expected-revision", revision, "--workspace", config, "--json")
+        revision = result["result"]["revision"]
+    assert result["result"]["practice"]["completion"] == "with_hint"
+    assert result["result"]["practice"]["reported_outcome"] == "independent"
+
+
+def test_malformed_event_is_rejected_without_advancing_revision(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text(json.dumps({"event_id": "bad", "kind": "hint", "level": 1,
+                                     "summary": "hint", "unexpected": "whole chat"}))
+    code, rejected = cli("practice", "record", "--practice-id", pid, "--request", malformed,
+                         "--expected-revision", 1, "--workspace", config, "--json")
+    assert code == 1
+    assert rejected["validation"]["request"] == "failed"
+    outcome = tmp_path / "valid.json"
+    outcome.write_text(json.dumps({"event_id": "valid", "kind": "outcome",
+                                   "completion": "incomplete", "next_step": "retry"}))
+    _, valid = cli("practice", "record", "--practice-id", pid, "--request", outcome,
+                   "--expected-revision", 1, "--workspace", config, "--json")
+    assert valid["result"]["revision"] == 2
+
+
+def test_reported_but_unexecuted_test_fact_cannot_complete_practice(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    request = prepare_request(tmp_path / "practice.json")
+    _, prepared = cli("practice", "prepare", "--request", request, "--workspace", config, "--json")
+    pid = prepared["result"]["practice"]["practice_id"]
+    _, checked = cli("practice", "checkpoint", "--practice-id", pid, "--expected-revision", 1,
+                     "--workspace", config, "--json")
+    revision = checked["result"]["revision"]
+    for event in (
+        {"event_id": "attempt-reported", "kind": "attempt", "summary": "implemented boundary"},
+        {"event_id": "test-reported", "kind": "test", "command": ["pytest"],
+         "cases": {"normal": "passed", "expired": "passed", "boundary": "passed"},
+         "exit_code": 0, "observed_at": "2026-09-17T02:00:00+00:00",
+         "verification": "reported_not_executed"},
+    ):
+        path = tmp_path / f'{event["event_id"]}.json'; path.write_text(json.dumps(event))
+        _, result = cli("practice", "record", "--practice-id", pid, "--request", path,
+                        "--expected-revision", revision, "--workspace", config, "--json")
+        revision = result["result"]["revision"]
+    assert result["result"]["practice"]["completion"] == "in_progress"
