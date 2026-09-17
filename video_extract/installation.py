@@ -52,6 +52,7 @@ ENTRIES = (
     InstallEntry("agent.mandarin-netease", PROJECT / ".codex/agents/mandarin-netease-operator.toml", ("agents", "mandarin-netease-operator.toml"), "codex"),
     InstallEntry("agent.source-notes", PROJECT / ".codex/agents/source-notes-operator.toml", ("agents", "source-notes-operator.toml"), "codex"),
     InstallEntry("skill.extract-media", PROJECT / "integrations/skills/extract-media", ("skills", "extract-media"), "agents"),
+    InstallEntry("skill.learn-anything", PROJECT / "integrations/skills/learn-anything", ("skills", "learn-anything"), "agents"),
     InstallEntry("skill.learning", PROJECT / "integrations/skills/learning", ("skills", "learning"), "agents"),
     InstallEntry("skill.mandarin-audio", PROJECT / "integrations/skills/mandarin-audio", ("skills", "mandarin-audio"), "agents"),
     InstallEntry("skill.practice", PROJECT / "integrations/skills/practice", ("skills", "practice"), "agents"),

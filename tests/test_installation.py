@@ -52,7 +52,7 @@ class InstallationContractTests(unittest.TestCase):
         self.assertRegex(details["source"]["content_fingerprint"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             [item["id"] for item in details["entries"]],
-            ["agent.mandarin-netease", "agent.source-notes", "skill.extract-media", "skill.learning", "skill.mandarin-audio", "skill.practice", "skill.source-notes", "skill.review"],
+            ["agent.mandarin-netease", "agent.source-notes", "skill.extract-media", "skill.learn-anything", "skill.learning", "skill.mandarin-audio", "skill.practice", "skill.source-notes", "skill.review"],
         )
         self.assertTrue(all(item["state"] == "retired" for item in details["retired_entries"]))
         self.assertFalse(self.agents_root.exists())
