@@ -248,6 +248,71 @@ def _complete_authority(path: Path, record: dict[str, Any]) -> None:
     _commit_authority(path, record)
 
 
+def _mark_verification_stale(config: WorkspaceConfig, path: Path, record: dict[str, Any]) -> bool:
+    if record.get("status") != "completed" or record.get("provenance", {}).get("mode") != "localized":
+        return False
+    package = Path(record["intent"]["package"])
+    current = _public_transcript_fact(package, read_json(package / "manifest.json"))
+    recorded = record.get("artifact_facts", {}).get("source_transcript")
+    if current is not None and isinstance(recorded, dict) and current.get("sha256") == recorded.get("sha256"):
+        return False
+    record.update(status="awaiting_user",
+                  validation={**record.get("validation", {}), "source_transcript": "verification_stale",
+                              "localized_content": "failed"},
+                  diagnostics=["public transcript changed; localized verification is stale"],
+                  next_action={"type": "user", "operation_id": record["operation_id"],
+                               "reason": "provide an independent verification report matching the current public transcript"})
+    _complete_authority(path, record)
+    _receipt(config, record)
+    return True
+
+
+def _adoption_candidates(config: WorkspaceConfig, operation_id: str, intent: dict[str, Any]) -> list[dict[str, Any]]:
+    assert config.local is not None
+    candidates = []
+    for path in (config.local / "operations").glob("operation-*.json"):
+        if path.stem == operation_id:
+            continue
+        try: prior = read_json(path)
+        except (OSError, json.JSONDecodeError): continue
+        previous = prior.get("intent", {})
+        if (previous.get("capability_id") == "audio.mandarin"
+                and previous.get("package_identity") == intent.get("package_identity")
+                and previous.get("source_sha256") == intent.get("source_sha256")
+                and previous.get("effective_parameters") == intent.get("effective_parameters")
+                and prior.get("artifact_facts", {}).get("output", {}).get("sha256")):
+            candidates.append(prior)
+    return candidates
+
+
+def _adopt_prior(config: WorkspaceConfig, path: Path, record: dict[str, Any], prior: dict[str, Any],
+                 source: Path, output: Path, verification_path: str | None) -> dict[str, Any]:
+    facts = prior.get("artifact_facts", {}).get("output", {})
+    if (not output.is_file() or facts.get("sha256") != _sha256(output)
+            or prior.get("intent", {}).get("adapter_identity") != record["intent"].get("adapter_identity")):
+        record.update(status="uncertain", validation={"adopted_output": "failed"},
+                      diagnostics=["prior operation output or adapter identity cannot be safely adopted"],
+                      next_action={"type": "user", "reason": "select a verified prior operation"})
+        _complete_authority(path, record); _receipt(config, record)
+        return _public(config, record)
+    record.update(status="awaiting_user", artifact_refs=[str(output)],
+                  artifact_facts={"source": {"sha256": _sha256(source)}, "output": dict(facts)},
+                  validation={"source": "passed", "audio_spec": "passed", "source_transcript": "verification_stale",
+                              "localized_content": "failed", "adopted_output": "passed"},
+                  provenance={"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
+                              "source_id": record["intent"]["source_id"], "source_version": record["intent"]["source_version"],
+                              "mode": "localized", "adopted_operation_id": prior["operation_id"]},
+                  diagnostics=["prior paid output adopted; verification must match the current public transcript"],
+                  next_action={"type": "user", "operation_id": record["operation_id"],
+                               "reason": "provide a matching independent verification report"})
+    record["intent"]["adopted_operation_id"] = prior["operation_id"]
+    if verification_path:
+        return _finish(config, path, record, source, output, "localized",
+                       verification=read_json(Path(verification_path).expanduser().resolve()))
+    _complete_authority(path, record); _receipt(config, record)
+    return _public(config, record)
+
+
 def _language_primary(language: str) -> str | None:
     if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", language):
         return None
@@ -291,7 +356,9 @@ def _finish(config: WorkspaceConfig, path: Path, record: dict[str, Any], source:
                   **({"source_transcript": transcript_fact} if transcript_fact else {})},
                   provenance={"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
                               "source_id": record["intent"]["source_id"],
-                              "source_version": record["intent"]["source_version"], "mode": mode},
+                              "source_version": record["intent"]["source_version"], "mode": mode,
+                              **({"adopted_operation_id": record.get("provenance", {}).get("adopted_operation_id")}
+                                 if record.get("provenance", {}).get("adopted_operation_id") else {})},
                   diagnostics=[], next_action=None)
     if receipt:
         record.setdefault("attempts", [])[-1]["receipt"] = {
@@ -322,9 +389,16 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
     output = package / "listening/zh-CN/podcast.zh-CN.mp3"
     existing = read_json(path) if path.is_file() else None
     source_digest = _sha256(source)
+    primary = _language_primary(language)
+    native = primary == "zh"
+    base_intent = {"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
+                   "source_id": normalized["source_id"], "source_version": normalized["source_version"],
+                   "source_sha256": source_digest, "package": str(package), "package_identity": manifest["identity"],
+                   "effective_parameters": {key: normalized[key] for key in ("profile", "sample_rate", "channels", "bitrate_kbps", "adapter")}}
+    saved_request = {key: normalized[key] for key in ("contract_version", "package", "source_id", "source_version", "profile",
+                                                       "sample_rate", "channels", "bitrate_kbps", "adapter")}
     if normalized.get("check_only"):
         spec_valid = bool(audio_info(output).get("valid"))
-        primary = _language_primary(language)
         report_path = output.parent / "production-report.json"
         report = read_json(report_path) if report_path.is_file() else {}
         transcript_fact = _public_transcript_fact(package, manifest) if primary != "zh" else None
@@ -355,20 +429,12 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
                 existing.update(status="uncertain", diagnostics=["authoritative operation digest is invalid"],
                                 next_action={"type": "maintenance"})
                 return _public(config, existing)
+            if _mark_verification_stale(config, path, existing):
+                return _public(config, existing)
             facts = existing.get("artifact_facts", {}).get("output", {})
             content_state = existing.get("validation", {}).get("localized_content")
-            transcript_reusable = True
-            if content_state == "passed":
-                current_transcript = _public_transcript_fact(package, manifest)
-                transcript_reusable = (current_transcript is not None and
-                                       current_transcript.get("sha256") == existing.get("artifact_facts", {}).get("source_transcript", {}).get("sha256"))
-            if audio_info(output)["valid"] and facts.get("sha256") == _sha256(output) and content_state in {"passed", "not_required"} and transcript_reusable:
+            if audio_info(output)["valid"] and facts.get("sha256") == _sha256(output) and content_state in {"passed", "not_required"}:
                 return _public(config, existing, "verified_operation")
-            if content_state == "passed" and not transcript_reusable:
-                existing.update(status="missing_input", validation={**existing.get("validation", {}), "source_transcript": "failed"},
-                                diagnostics=["public transcript changed without a new source_version"],
-                                next_action={"type": "user", "reason": "provide the revised source_version and a matching verification report"})
-                return _public(config, existing)
         if existing.get("status") == "running":
             from .media_operations import _lease_active
             existing.update(status="busy" if _lease_active(existing) else "uncertain",
@@ -378,21 +444,14 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
             return _public(config, existing)
         if existing.get("status") == "uncertain":
             return _public(config, existing)
-        if existing.get("status") == "awaiting_user" and isinstance(existing.get("current_attempt"), dict):
+        if existing.get("status") == "awaiting_user" and (isinstance(existing.get("current_attempt"), dict)
+                or existing.get("validation", {}).get("source_transcript") == "verification_stale"):
             verification_path = normalized.get("verification_report")
             if not isinstance(verification_path, str):
                 return _public(config, existing)
             verification = read_json(Path(verification_path).expanduser().resolve())
             existing.pop("lease", None)
             return _finish(config, path, existing, source, output, "localized", verification=verification)
-    primary = _language_primary(language)
-    native = primary == "zh"
-    base_intent = {"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
-                   "source_id": normalized["source_id"], "source_version": normalized["source_version"],
-                   "source_sha256": source_digest, "package": str(package), "package_identity": manifest["identity"],
-                   "effective_parameters": {key: normalized[key] for key in ("profile", "sample_rate", "channels", "bitrate_kbps", "adapter")}}
-    saved_request = {key: normalized[key] for key in ("contract_version", "package", "source_id", "source_version", "profile",
-                                                       "sample_rate", "channels", "bitrate_kbps", "adapter")}
     if primary is None:
         record = existing or {"schema_version": 1, "operation_id": operation_id, "intent": base_intent,
                               "request": saved_request, "attempts": []}
@@ -411,6 +470,25 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
         saved_request["authorization_ref"] = normalized["authorization_ref"]
     record = existing or {"schema_version": 1, "operation_id": operation_id, "intent": intent,
                           "request": saved_request, "attempts": []}
+    if not native and normalized.get("adopt_operation_id"):
+        prior_path = _operation_path(config, normalized["adopt_operation_id"])
+        prior = read_json(prior_path) if prior_path.is_file() else None
+        eligible = {candidate["operation_id"] for candidate in _adoption_candidates(config, operation_id, intent)}
+        if not isinstance(prior, dict) or prior.get("operation_id") not in eligible:
+            record.update(status="awaiting_user", validation={"adopted_output": "failed"},
+                          diagnostics=["selected prior operation is not eligible for safe adoption"],
+                          next_action={"type": "user", "reason": "select an operation with the same package, source audio, adapter, and parameters"})
+            _complete_authority(path, record); _receipt(config, record)
+            return _public(config, record)
+        return _adopt_prior(config, path, record, prior, source, output, normalized.get("verification_report"))
+    candidates = _adoption_candidates(config, operation_id, intent) if not native else []
+    if existing is None and candidates:
+        record.update(status="awaiting_user", validation={"adopted_output": "pending"},
+                      diagnostics=["a prior paid output is eligible for adoption; automatic resubmission is disabled"],
+                      next_action={"type": "user", "reason": "rerun with adopt_operation_id after reviewing the source-version change",
+                                   "eligible_operation_ids": [candidate["operation_id"] for candidate in candidates]})
+        _complete_authority(path, record); _receipt(config, record)
+        return _public(config, record)
     if existing and not native and existing.get("intent", {}).get("adapter_identity") != adapter_identity:
         record.update(status="uncertain", diagnostics=["pinned adapter identity is unavailable or changed; do not resubmit"],
                       next_action={"type": "reconcile", "operation_id": operation_id})
@@ -502,7 +580,7 @@ run_mandarin_audio.__capability_contract__ = {
 }
 
 
-def show_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
+def _show_operation_unlocked(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
     path = _operation_path(config, operation_id)
     if not path.is_file():
         return response(status="missing_input", workspace=str(config.config_path), operation_id=operation_id,
@@ -513,7 +591,20 @@ def show_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]
         if record["commit"].get("digest") != _authority_digest(record):
             record.update(status="uncertain", validation={**record.get("validation", {}), "authoritative_record": "failed"},
                           diagnostics=["authoritative operation digest is invalid"], next_action={"type": "maintenance"})
+            return _public(config, record)
+    if _mark_verification_stale(config, path, record):
+        return _public(config, record)
     return _public(config, record)
+
+
+def show_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:
+    from .media_operations import _lock
+    with _lock(config, operation_id) as acquired:
+        if not acquired:
+            path = _operation_path(config, operation_id)
+            return _public(config, read_json(path)) if path.is_file() else response(
+                status="busy", workspace=str(config.config_path), operation_id=operation_id)
+        return _show_operation_unlocked(config, operation_id)
 
 
 def resume_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:

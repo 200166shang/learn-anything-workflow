@@ -373,7 +373,7 @@ def test_structured_verifier_rejects_placeholder_transcript_digest(tmp_path, cap
 
 
 def test_matching_public_transcript_digest_is_authoritative_and_change_invalidates_reuse(tmp_path, capsys):
-    _, package, request = fixture(tmp_path, "en")
+    workspace, package, request = fixture(tmp_path, "en")
     (package / "media/subtitle.srt").write_text("1\n00:00:00,000 --> 00:00:02,000\nLower-priority subtitle text.\n")
     manifest = json.loads((package / "manifest.json").read_text())
     manifest["artifacts"]["source_subtitle"] = "media/subtitle.srt"
@@ -390,10 +390,43 @@ def test_matching_public_transcript_digest_is_authoritative_and_change_invalidat
     }
 
     (package / "media/transcript.txt").write_text("A revised public transcript changes the alignment basis.")
+    _, shown = invoke(capsys, "operation", "show", completed["operation_id"], "--workspace", str(workspace))
+    receipt = json.loads((tmp_path / "results/operation-receipts" / f'{completed["operation_id"]}.json').read_text())
+    persisted = json.loads(next((tmp_path / "local/operations").glob("operation-*.json")).read_text())
+    assert shown["status"] == receipt["status"] == persisted["status"] == "awaiting_user"
+    assert shown["validation"]["source_transcript"] == "verification_stale"
+    assert receipt["authoritative_revision"] == persisted["commit"]["revision"] == 2
     changed_code, changed = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
-    assert changed_code == 3 and changed["status"] == "missing_input"
-    assert changed["validation"]["source_transcript"] == "failed"
-    assert len(adapter.calls) == 1
+    assert changed_code == 3 and changed["status"] == "awaiting_user" and len(adapter.calls) == 1
+
+    verification = tmp_path / "revised-verification.json"
+    verification.write_text(json.dumps(fixture_verification(package / "listening/zh-CN/podcast.zh-CN.mp3")))
+    data["verification_report"] = str(verification); request.write_text(json.dumps(data))
+    final_code, final = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert final_code == 0 and final["status"] == "completed" and len(adapter.calls) == 1
+
+
+def test_new_source_version_requires_explicit_safe_adoption_and_never_repays(tmp_path, capsys):
+    _, package, request = fixture(tmp_path, "en")
+    adapter = FakePaidAdapter(); register_mandarin_adapter("version-adopt", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="version-adopt", authorization_ref="approved-version")
+    request.write_text(json.dumps(data))
+    _, first = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert first["status"] == "completed" and len(adapter.calls) == 1
+
+    (package / "media/transcript.txt").write_text("The registered second version has a revised public transcript.")
+    data["source_version"] = "source-version-2"; request.write_text(json.dumps(data))
+    waiting_code, waiting = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert waiting_code == 3 and waiting["status"] == "awaiting_user" and len(adapter.calls) == 1
+    assert first["operation_id"] in waiting["next_action"]["eligible_operation_ids"]
+
+    verification = tmp_path / "version-2-verification.json"
+    verification.write_text(json.dumps(fixture_verification(package / "listening/zh-CN/podcast.zh-CN.mp3")))
+    data.update(adopt_operation_id=first["operation_id"], verification_report=str(verification))
+    request.write_text(json.dumps(data))
+    adopted_code, adopted = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert adopted_code == 0 and adopted["status"] == "completed" and len(adapter.calls) == 1
+    assert adopted["provenance"]["adopted_operation_id"] == first["operation_id"]
 
 
 def test_pyvideotrans_argparse_rejection_is_definitely_not_submitted(tmp_path, capsys):
