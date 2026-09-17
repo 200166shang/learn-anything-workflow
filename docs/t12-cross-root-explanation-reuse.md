@@ -6,6 +6,10 @@ coordinate/assumption choices, applicability conditions, citation intent, and
 the necessary explanation retained in the current root. It also verifies the
 target explanation's source versions. `explanation commit` publishes that
 local context and the citation atomically with the current root explanation.
+For a same-root refactor, a mapped question is affected when any of its
+section-marker blocks changes or its marker order changes. An affected stale
+reference requires a reuse review explicitly bound to that local question;
+an unchanged section may coexist with an independently revised child section.
 
 The citation pins source module, thread, question, explanation revision,
 section, object digest, and checked source versions. It does not change the

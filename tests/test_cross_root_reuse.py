@@ -219,3 +219,88 @@ def test_stale_reference_does_not_pollute_explanation_or_block_other_question_pr
                           "--profile", "linear_transform", "--workspace", config, "--json")
     assert code == 3
     assert unrelated["status"] == "awaiting_model"
+
+
+def setup_stale_root_with_child(tmp_path: Path):
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    _, source_question = create_root(tmp_path, config, source, "概念根")
+    commit_root(tmp_path, config, source, source_question)
+    target_thread, root_question = create_root(tmp_path, config, source, "项目根")
+    review_path = reuse_review(tmp_path / "reuse.json", source_question)
+    _, prepared = cli("explanation", "prepare", "--question-id", root_question,
+                      "--profile", "linear_transform", "--reuse-review", review_path,
+                      "--workspace", config, "--json")
+    draft, evidence, teaching = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    draft.write_text(draft.read_text() + "\n" + json.loads(review_path.read_text())["local_context"] + "\n")
+    _, committed = cli("explanation", "commit", "--question-id", root_question, "--draft", draft,
+                       "--evidence", evidence, "--teaching-review", teaching, "--profile", "linear_transform",
+                       "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
+    root_section = committed["result"]["explanation"]["section_map"][root_question][0]
+    root_text = Path(committed["result"]["explanation"]["document_path"]).read_text()
+    _, child = cli("learning", "pursue", "--thread-id", target_thread, "--from-question-id", root_question,
+                   "--relation", "deepens", "--question", "本根追问", "--workspace", config, "--json")
+    child_question = child["result"]["question"]["question_id"]
+    commit_root(tmp_path, config, source, source_question, "目标结论变化。")
+    return config, source, source_question, root_question, child_question, root_section, root_text, review_path
+
+
+def child_refactor_inputs(tmp_path: Path, config: Path, source: dict, child_question: str,
+                          root_question: str, root_section: str, root_text: str,
+                          *, review_path: Path | None = None):
+    args = ["explanation", "prepare", "--question-id", child_question, "--profile", "linear_transform"]
+    if review_path is not None:
+        review = json.loads(review_path.read_text()); review["local_question_id"] = root_question
+        review_path.write_text(json.dumps(review, ensure_ascii=False)); args += ["--reuse-review", review_path]
+    _, prepared = cli(*args, "--workspace", config, "--json")
+    child_section = prepared["result"]["section_id"]
+    draft, evidence, teaching = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    section_map = tmp_path / f"map-{child_section}.json"
+    section_map.write_text(json.dumps({root_question: [root_section], child_question: [child_section]}))
+    return prepared, draft, evidence, teaching, section_map, child_section
+
+
+def test_child_prepare_cannot_rewrite_mapped_stale_root_without_bound_recheck(tmp_path: Path) -> None:
+    config, source, _, root, child, root_section, root_text, _ = setup_stale_root_with_child(tmp_path)
+    prepared, draft, evidence, teaching, section_map, child_section = child_refactor_inputs(
+        tmp_path, config, source, child, root, root_section, root_text)
+    draft.write_text(root_text.replace("本项目采用列向量约定", "本项目改用另一套约定")
+                     + f"\n<!-- section-id: {child_section} -->\n本根追问仍用基向量例子 1 和仿射边界。\n")
+
+    code, blocked = cli("explanation", "commit", "--question-id", child, "--draft", draft,
+                        "--evidence", evidence, "--teaching-review", teaching, "--profile", "linear_transform",
+                        "--preparation-id", prepared["result"]["preparation_id"], "--section-map", section_map,
+                        "--workspace", config, "--json")
+    assert code == 3
+    assert blocked["validation"]["cross_root_references"] == "needs_review"
+
+
+def test_bound_root_recheck_allows_child_refactor_and_refreshes_reference(tmp_path: Path) -> None:
+    config, source, _, root, child, root_section, root_text, review_path = setup_stale_root_with_child(tmp_path)
+    prepared, draft, evidence, teaching, section_map, child_section = child_refactor_inputs(
+        tmp_path, config, source, child, root, root_section, root_text, review_path=review_path)
+    local_context = json.loads(review_path.read_text())["local_context"]
+    draft.write_text(root_text.replace(local_context, local_context + "（已再次核对）")
+                     + f"\n<!-- section-id: {child_section} -->\n本根追问仍用基向量例子 1 和仿射边界。\n")
+
+    code, committed = cli("explanation", "commit", "--question-id", child, "--draft", draft,
+                          "--evidence", evidence, "--teaching-review", teaching, "--profile", "linear_transform",
+                          "--preparation-id", prepared["result"]["preparation_id"], "--section-map", section_map,
+                          "--workspace", config, "--json")
+    assert code == 0, committed
+    _, located = cli("learning", "locate", root, "--workspace", config, "--json")
+    assert located["result"]["cross_root_references"][0]["status"] == "current"
+
+
+def test_child_only_section_change_can_preserve_stale_root_section_unchanged(tmp_path: Path) -> None:
+    config, source, _, root, child, root_section, root_text, _ = setup_stale_root_with_child(tmp_path)
+    prepared, draft, evidence, teaching, section_map, child_section = child_refactor_inputs(
+        tmp_path, config, source, child, root, root_section, root_text)
+    draft.write_text(root_text + f"\n<!-- section-id: {child_section} -->\n本根追问仍用基向量例子 1 和仿射边界。\n")
+
+    code, committed = cli("explanation", "commit", "--question-id", child, "--draft", draft,
+                          "--evidence", evidence, "--teaching-review", teaching, "--profile", "linear_transform",
+                          "--preparation-id", prepared["result"]["preparation_id"], "--section-map", section_map,
+                          "--workspace", config, "--json")
+    assert code == 0, committed
+    _, located = cli("learning", "locate", root, "--workspace", config, "--json")
+    assert located["result"]["cross_root_references"][0]["status"] == "needs_review"

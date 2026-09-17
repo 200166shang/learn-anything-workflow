@@ -876,11 +876,14 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str,
         missing = [key for key in required if not reuse_review.get(key)]
         target = record["questions"].get(reuse_review.get("target_question_id"))
         target_thread = record["threads"].get((target or {}).get("thread_id"))
-        if missing or target is None or target_thread is None:
+        local_reference_question = record["questions"].get(reuse_review.get("local_question_id", question_id))
+        local_reference_thread = record["threads"].get((local_reference_question or {}).get("thread_id"))
+        if missing or target is None or target_thread is None or local_reference_question is None \
+                or local_reference_thread is None or local_reference_thread["thread_id"] != thread["thread_id"]:
             return response(status="failed", workspace=str(config.config_path),
                             validation={"cross_root_review": "failed"},
-                            diagnostics=["reuse review must name an existing target and explicitly check concept semantics, coordinates/assumptions, conditions, intent, and local context"])
-        if target_thread["module_id"] == thread["module_id"]:
+                            diagnostics=["reuse review must name an existing target, bind a question in the prepared root, and explicitly check concept semantics, coordinates/assumptions, conditions, intent, and local context"])
+        if target_thread["module_id"] == local_reference_thread["module_id"]:
             return response(status="failed", workspace=str(config.config_path),
                             validation={"cross_root_review": "failed"},
                             diagnostics=["cross-root reuse target must belong to another module"])
@@ -989,6 +992,7 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str,
                        "created_at": _now(), "consumed_at": None}
         if cross_root_reference is not None:
             preparation["cross_root_reference"] = cross_root_reference
+            preparation["cross_root_reference_question_id"] = local_reference_question["question_id"]
         updated = {**record, "preparations": {**record["preparations"], preparation_id: preparation}}
         published = _publish(config, snapshot, updated)
     return response(status="awaiting_model", workspace=str(config.config_path), result={
@@ -1026,6 +1030,16 @@ def _quality_errors(text: str, profile: str, review: dict[str, Any]) -> list[str
                                ("failure behavior", r"慢|满|退出|slow|full|shutdown")):
             if not re.search(pattern, text, re.I): errors.append(f"frame_pipeline is missing {label}")
     return errors
+
+
+def _section_blocks(text: str) -> tuple[list[str], dict[str, str]]:
+    markers = list(re.finditer(r"<!--\s*section-id:\s*(section-[0-9a-f-]{36})\s*-->", text))
+    order = [match.group(1) for match in markers]
+    blocks = {}
+    for index, match in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        blocks[match.group(1)] = text[match.start():end].strip()
+    return order, blocks
 
 
 def _store_learning_object(config: WorkspaceConfig, body: bytes) -> tuple[str, Path]:
@@ -1239,6 +1253,36 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
         if same_root_errors:
             return response(status="failed", workspace=str(config.config_path),
                             validation={"same_root_scope": "failed"}, diagnostics=same_root_errors)
+        if existing:
+            current_revision_value = existing["revisions"][str(existing["current_revision"])]
+            previous_text = _object_path(config, current_revision_value["object_sha256"]).read_text(encoding="utf-8")
+            previous_order, previous_blocks = _section_blocks(previous_text)
+        else:
+            previous_order, previous_blocks = [], {}
+        proposed_order, proposed_blocks = _section_blocks(text)
+        rechecked_question_id = preparation.get("cross_root_reference_question_id")
+        for mapped_question_id, section_ids in section_map.items():
+            stale = [item for item in _cross_root_states(record, record["questions"][mapped_question_id])
+                     if item["status"] != "current"]
+            if not stale:
+                continue
+            affected = any(previous_blocks.get(section_id) != proposed_blocks.get(section_id)
+                           or (section_id in previous_order and section_id in proposed_order
+                               and previous_order.index(section_id) != proposed_order.index(section_id))
+                           for section_id in section_ids)
+            if not affected:
+                continue
+            prepared_source = (prepared_cross_reference or {}).get("source", {})
+            valid_recheck = (rechecked_question_id == mapped_question_id
+                             and len(stale) == 1
+                             and prepared_source.get("question_id") == stale[0]["source"]["question_id"])
+            if not valid_recheck:
+                return response(status="awaiting_user", workspace=str(config.config_path),
+                                validation={"cross_root_references": "needs_review"},
+                                result={"question_id": mapped_question_id,
+                                        "cross_root_references": stale},
+                                diagnostics=["a mapped section with a stale cross-root reference was changed without a reuse recheck bound to that question/reference"],
+                                next_action={"type": "user", "reason": "recheck the affected cross-root reference before rewriting its section"})
         if metadata is not None and (not isinstance(metadata, dict)
                                      or not str(metadata.get("summary", "")).strip()
                                      or set(metadata.get("affected_question_ids", [])) != set(section_map)):
@@ -1309,7 +1353,8 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
                 {"explanation_id": explanation_id, "explanation_revision": revision,
                  "section_id": section_id, "object_sha256": digest, "logical_path": logical_path}
                 for section_id in section_ids]}
-            if mapped_question_id == question_id and prepared_cross_reference is not None:
+            if mapped_question_id == preparation.get("cross_root_reference_question_id", question_id) \
+                    and prepared_cross_reference is not None:
                 prior = [item for item in updated_question.get("cross_root_references", [])
                          if item["source"]["question_id"] != prepared_cross_reference["source"]["question_id"]]
                 updated_question["cross_root_references"] = [*prior, prepared_cross_reference]
