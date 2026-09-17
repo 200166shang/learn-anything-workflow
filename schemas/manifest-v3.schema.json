@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.video-extract/schema/manifest-v3.json",
+  "title": "video-extract item manifest v3",
+  "type": "object",
+  "required": ["schema_version", "platform", "identity", "artifacts"],
+  "properties": {
+    "schema_version": {"const": 3},
+    "platform": {"enum": ["youtube", "bilibili", "xiaoe", "local"]},
+    "identity": {"type": "string", "minLength": 1},
+    "title": {"type": "string"},
+    "verified_gate": {"enum": ["media_ready", "transcript_ready", "candidates_ready", "evidence_selected", "notes_complete"]},
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "video": {"type": "string"}, "metadata": {"type": "string"},
+        "transcript_srt": {"type": "string"}, "candidate_json": {"type": "string"},
+        "contact_sheet": {"type": "string"}, "approved_json": {"type": "string"},
+        "notes_input": {"type": "string"}, "notes": {"type": "string"}
+      },
+      "additionalProperties": {"type": ["string", "null"]}
+    },
+    "stages": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["duration_ms", "input_fingerprint", "parameters", "cache_hit", "result"]
+      }
+    }
+  },
+  "additionalProperties": true
+}

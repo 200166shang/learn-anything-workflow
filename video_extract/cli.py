@@ -1,0 +1,913 @@
+"""Stable command-line interface for authorized video-learning work."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+from .contracts import SCHEMA_VERSION
+from .command_response import response
+from .manifest import read_json, sanitize
+from .media_request import normalize_media_request
+from . import media_workflow
+from .orchestrator import existing_capabilities
+from .playlists import build_playback_views, build_xiaoe_playback_views, verify_playback
+from .validate import validate, validate_goals, validate_media_request
+from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceError, discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
+
+PROJECT = Path(__file__).resolve().parent.parent
+
+
+def emit(value: Any, as_json: bool) -> None:
+    if as_json: print(json.dumps(sanitize(value), ensure_ascii=False, indent=2))
+    elif isinstance(value, dict):
+        for key, item in value.items(): print(f"{key}: {item}")
+    else: print(value)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    checks = {name: bool(shutil.which(name)) for name in ("ffmpeg", "ffprobe", "yt-dlp")}
+    if sys.platform == "darwin":
+        checks["say"] = Path("/usr/bin/say").is_file()
+    try:
+        import PIL  # noqa: F401
+        checks["pillow"] = True
+    except ImportError: checks["pillow"] = False
+    try:
+        import playwright  # noqa: F401
+        checks["playwright"] = True
+    except ImportError:
+        checks["playwright"] = False
+    result = {"ok": all(checks.values()), "schema_version": SCHEMA_VERSION, "checks": checks, "project": str(PROJECT)}
+    emit(result, args.json); return 0 if result["ok"] else 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    manifest = read_json(args.path / "manifest.json") if (args.path / "manifest.json").exists() else {}
+    if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
+        from .command_response import exit_code
+        result = _legacy_package_result("legacy package schemas are available only to the isolated migration converter")
+        emit(result, args.json); return exit_code(result)
+    if manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "media":
+        result = validate_media_request(args.path); emit(result, args.json); return 0 if result["ok"] else 1
+    result = validate(args.path, args.catalog).to_dict(); emit(result, args.json); return 0 if not result["missing"] and not result["invalid"] else 1
+
+
+_DISCOVERY_EXCLUDED_ROOTS = {
+    "backup", "backups", "legacy", "legacy-read-only", "migration-batches",
+    "migration-preserved", "migration-quarantine", "quarantine", "read-only-legacy",
+}
+
+
+def _excluded_discovery_root(name: str) -> bool:
+    normalized = name.casefold().replace("_", "-")
+    return (
+        normalized in _DISCOVERY_EXCLUDED_ROOTS
+        or normalized.startswith(("backup-", "legacy-", "read-only-legacy-"))
+        or normalized.endswith(("-backup", "-backups"))
+    )
+
+
+def _legacy_package_result(diagnostic: str) -> dict[str, Any]:
+    return response(status="unsupported", validation={"legacy_package": "rejected"},
+                    diagnostics=[diagnostic], next_action={"command": "video-extract migration plan"})
+
+
+def _discover(root: Path) -> list[dict[str, Any]]:
+    found = []
+    resolved = root.expanduser().resolve()
+    for directory, names, files in os.walk(resolved):
+        names[:] = [name for name in names if not _excluded_discovery_root(name)]
+        if "manifest.json" in files:
+            manifest = read_json(Path(directory) / "manifest.json")
+            if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
+                continue
+            found.append(validate(Path(directory)).to_dict())
+    return found
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    path = args.path.expanduser().resolve()
+    if (path / "manifest.json").exists() or any((path / name).exists() for name in ("collection.json", "course_catalog.json", "catalog.json")):
+        manifest = read_json(path / "manifest.json") if (path / "manifest.json").exists() else {}
+        if isinstance(manifest.get("schema_version"), int) and manifest["schema_version"] < 5:
+            from .command_response import exit_code
+            result = _legacy_package_result("legacy package schemas are excluded from normal runtime discovery and reads")
+            emit(result, args.json); return exit_code(result)
+        goals = manifest.get("request", {}).get("goals")
+        result: Any = validate_media_request(path) if manifest.get("schema_version") == 5 and manifest.get("request", {}).get("type") == "media" else {
+            "package": str(path), "requested_goals": goals,
+            "goal_status": validate_goals(path, goals),
+            "reusable_capabilities": sorted(existing_capabilities(path)),
+        } if goals else validate(path, args.catalog).to_dict()
+    else:
+        packages = _discover(path)
+        result = {"root": str(path), "catalog_known": False, "discovered_packages": len(packages), "packages": packages,
+                  "note": "No catalog was found; not-started count is unknown."}
+    emit(result, args.json); return 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    if args.request:
+        from .command_response import exit_code, response
+        from .media_operations import plan_request
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = plan_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json); return exit_code(result)
+    result = media_workflow.plan(args.source, normalize_media_request(args.media, args.language, args.quality), args.output)
+    emit(result, args.json); return 0 if not result.get("blockers") else 1
+
+
+def cmd_ensure(args: argparse.Namespace) -> int:
+    if args.request:
+        from .command_response import exit_code, response
+        from .media_operations import ensure_request
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = ensure_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json); return exit_code(result)
+    workspace = discover_workspace(args.workspace)
+    result = media_workflow.ensure(args.source, normalize_media_request(args.media, args.language, args.quality), args.output, workspace.media)
+    emit(result, args.json)
+    return 0 if result.get("status") == "complete" else 1
+
+
+def cmd_operation(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    from .media_operations import reconcile_operation, resume_operation, show_operation
+    workspace = discover_workspace(args.workspace)
+    if args.operation_action == "show":
+        result = show_operation(workspace, args.operation_id)
+    elif args.operation_action == "resume":
+        result = resume_operation(workspace, args.operation_id)
+    else:
+        result = reconcile_operation(workspace, args.operation_id)
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_source(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .source_import import import_source
+    from .source_registry import reconcile, register, relocate, verify
+    from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    if args.source_action != "import" and workspace.schema_version != PORTABLE_SCHEMA_VERSION:
+        result = response(status="unsupported", workspace=str(workspace.config_path),
+                          validation={"workspace_schema": "failed"},
+                          diagnostics=["source v6 requires workspace schema v2; old formats are not read in normal runtime"],
+                          next_action={"command": "video-extract migration plan"})
+        emit(result, args.json); return exit_code(result)
+    try:
+        if args.source_action == "associate":
+            from .authoritative_notes import associate_sources
+            evidence = read_json(args.evidence) if args.evidence else None
+            result = associate_sources(workspace, args.source_id, args.related_source_id, evidence)
+        elif args.source_action == "register":
+            provenance = read_json(args.provenance) if args.provenance else None
+            result = register(workspace, args.input, args.title, args.expected_revision, args.source_id, provenance)
+        elif args.source_action == "verify":
+            result = verify(workspace, args.source_id, args.source_version)
+        elif args.source_action == "relocate":
+            result = relocate(workspace, args.source_id, args.location, args.expected_revision)
+        elif args.source_action == "reconcile":
+            result = reconcile(workspace, args.source_id, args.source_version)
+        elif args.source_action == "import" and workspace.schema_version == PORTABLE_SCHEMA_VERSION:
+            result = register(workspace, args.input, args.title, getattr(args, "expected_revision", None),
+                              getattr(args, "source_id", None))
+        else:
+            result = import_source(args.input, workspace, args.package, args.title)
+    except (OSError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path),
+                          validation={"request": "failed"}, diagnostics=[str(exc)])
+    emit(result, args.json)
+    if args.source_action != "import" or workspace.schema_version == PORTABLE_SCHEMA_VERSION:
+        return exit_code(result)
+    return 0 if result.get("status") == "ready" else 1
+
+
+def cmd_notes(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    from .authoritative_notes import audit_notes, finalize_note, prepare_note, reconcile_notes
+    from .notes_workflow import finalize, prepare
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    if workspace.schema_version == PORTABLE_SCHEMA_VERSION:
+        try:
+            if args.notes_action == "prepare":
+                if args.media_operation:
+                    from .media_note_operations import prepare_media_note
+                    result = prepare_media_note(
+                        workspace, args.media_operation, args.target,
+                        transcript_adapter=args.transcript_adapter, frame_adapter=args.frame_adapter,
+                        require_visuals=args.require_visuals, selection=args.selection,
+                        human_reviewed=args.human_reviewed,
+                    )
+                else:
+                    result = prepare_note(workspace, args.target, args.source_version)
+            elif args.notes_action == "finalize":
+                if args.request is None:
+                    result = response(status="missing_input", workspace=str(workspace.config_path),
+                                      validation={"request": "failed"}, diagnostics=["--request is required"])
+                else:
+                    result = finalize_note(workspace, args.request)
+            elif args.notes_action == "audit":
+                result = audit_notes(workspace)
+            else:
+                result = reconcile_notes(workspace, args.commit_id)
+        except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+            result = response(status="missing_input", workspace=str(workspace.config_path),
+                              validation={"request": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json)
+        return exit_code(result)
+    package = Path(args.target)
+    result = prepare(package, workspace) if args.notes_action == "prepare" else finalize(package, workspace)
+    emit(result, args.json)
+    return 0 if result.get("status") in {"ready", "complete", "awaiting_ai"} else 1
+
+
+def cmd_learning(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .learning import (LearningPublishError, back, create_module, create_thread, locate,
+                           publish_failure_response, pursue, recommend_roots, reconcile, replay_candidate,
+                           record_feedback, resume, show_module, show_thread)
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.learning_entity == "module" and args.learning_action == "create":
+            result = create_module(workspace, args.goal, args.scope, args.source_id, args.source_version,
+                                   args.expected_revision, args.source_role)
+        elif args.learning_entity == "module" and args.learning_action == "show":
+            result = show_module(workspace, args.module_id)
+        elif args.learning_entity == "recommend":
+            result = recommend_roots(workspace, args.module_id)
+        elif args.learning_entity == "thread" and args.learning_action == "create":
+            result = create_thread(workspace, args.module_id, args.root_question, args.expected_revision)
+        elif args.learning_entity == "thread" and args.learning_action == "show":
+            result = show_thread(workspace, args.thread_id)
+        elif args.learning_entity == "pursue":
+            if args.existing_question_id and not (args.actual_question or "").strip():
+                result = response(status="missing_input", workspace=str(workspace.config_path),
+                                  validation={"actual_question": "failed"},
+                                  diagnostics=["--actual-question is required with --existing-question-id"])
+            else:
+                result = pursue(workspace, args.thread_id, args.from_question_id, args.relation, args.question,
+                                 args.expected_revision, args.existing_question_id, args.independent,
+                                 args.actual_question)
+        elif args.learning_entity == "replay":
+            result = replay_candidate(workspace, args.candidate)
+        elif args.learning_entity == "feedback":
+            result = record_feedback(workspace, args.question_id, args.state, args.text,
+                                     args.confusion, args.expected_revision)
+        elif args.learning_entity == "resume":
+            result = resume(workspace, args.thread_id, args.question_id,
+                            args.from_question_id, args.expected_revision, args.module_id)
+        elif args.learning_entity == "back":
+            result = back(workspace, args.thread_id, args.expected_revision)
+        elif args.learning_entity == "locate":
+            result = locate(workspace, args.question_id)
+        elif args.learning_entity == "reconcile":
+            result = reconcile(workspace, args.commit_id)
+        else:
+            result = response(status="unsupported", workspace=str(workspace.config_path))
+    except LearningPublishError as exc:
+        result = publish_failure_response(workspace, exc)
+    except (OSError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json)
+    return exit_code(result)
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .learning_view import build_view, locate_view, status_view
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.view_action == "build":
+            result = build_view(workspace, args.module_id)
+        elif args.view_action == "status":
+            result = status_view(workspace, args.module_id)
+        elif args.view_action == "locate":
+            result = locate_view(workspace, args.question_id)
+        else:
+            result = response(status="unsupported", workspace=str(workspace.config_path))
+    except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json)
+    return exit_code(result)
+
+
+def cmd_explanation(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .learning import (LearningPublishError, commit_explanation, prepare_explanation,
+                           publish_failure_response, replay_explanation_candidate, restore_explanation)
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.explanation_action == "prepare":
+            reuse_review = json.loads(args.reuse_review.read_text(encoding="utf-8")) if args.reuse_review else None
+            result = prepare_explanation(workspace, args.question_id, args.profile, reuse_review)
+        elif args.explanation_action == "restore":
+            result = restore_explanation(workspace, args.question_id, args.revision, args.expected_revision)
+        elif args.explanation_action == "replay":
+            result = replay_explanation_candidate(workspace, args.candidate)
+        else:
+            result = commit_explanation(workspace, args.question_id, args.draft, args.evidence,
+                                        args.teaching_review, args.profile, args.preparation_id,
+                                        args.expected_revision, args.section_map,
+                                        args.revision_metadata, args.corrections)
+    except LearningPublishError as exc:
+        result = publish_failure_response(workspace, exc)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .package_lock import PackageBusyError
+    from .review import prepare, record, show
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.review_action == "prepare":
+            result = prepare(workspace, args.question_id, args.preparation_id,
+                             card_version_id=args.card_version_id)
+        elif args.review_action == "record":
+            result = record(workspace, args.preparation_id, args.event_id, answer=args.answer,
+                            answer_summary=args.answer_summary, hints=args.hint,
+                            model_evaluation=args.model_evaluation, correction=args.correction,
+                            corrected_evaluation=args.corrected_evaluation,
+                            review_date=args.review_date)
+        else:
+            result = show(workspace, args.question_id)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)],
+                          next_action={"type": "retry", "reason": "another Review write is in progress"})
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_card(args: argparse.Namespace) -> int:
+    from .cards import propose, revise, schedule, select, show
+    from .command_response import exit_code, response
+    from .package_lock import PackageBusyError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.card_action == "propose":
+            result = propose(workspace, args.question_id, args.memory_target, args.conditions,
+                             args.prompt, args.answer, args.reason)
+        elif args.card_action == "select":
+            result = select(workspace, args.candidate, args.effective_date)
+        elif args.card_action == "revise":
+            result = revise(workspace, args.card_id, args.change_type, prompt=args.prompt,
+                            answer=args.answer, conditions=args.conditions,
+                            effective_date=args.effective_date)
+        elif args.card_action == "schedule":
+            result = schedule(workspace, card_id=args.card_id,
+                              card_version_id=args.card_version_id, on_date=args.on_date)
+        else:
+            result = show(workspace, args.card_id)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_suggestions(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .suggestions import today
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        result = today(workspace, args.on_date,
+                       preferred_question_ids=args.prefer_question_id,
+                       preferred_card_version_ids=args.prefer_card_version_id)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_delivery(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .delivery import disable, enable, reconcile, status, tick
+    from .package_lock import PackageBusyError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.delivery_action.startswith("schedule-"):
+            from .delivery_schedule import install as schedule_install, remove as schedule_remove, status as schedule_status
+            if args.delivery_action == "schedule-install":
+                result = schedule_install(workspace)
+            elif args.delivery_action == "schedule-remove":
+                result = schedule_remove(workspace)
+            else:
+                result = schedule_status(workspace)
+        elif args.delivery_action == "enable":
+            result = enable(workspace, args.logical_target, args.adapter,
+                            args.authorization_ref, args.effective_from)
+        elif args.delivery_action == "disable":
+            result = disable(workspace, args.logical_target)
+        elif args.delivery_action == "tick":
+            result = tick(workspace, args.on_date)
+        elif args.delivery_action == "reconcile":
+            result = reconcile(workspace, args.operation_id)
+        else:
+            result = status(workspace, args.operation_id)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)],
+                          next_action={"type": "retry", "action": args.delivery_action})
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_practice(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .package_lock import PackageBusyError
+    from .practice import checkpoint, prepare, record
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.practice_action == "prepare": result = prepare(workspace, args.request)
+        elif args.practice_action == "checkpoint": result = checkpoint(workspace, args.practice_id, args.expected_revision)
+        else: result = record(workspace, args.practice_id, args.request, args.expected_revision)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)],
+                          next_action={"type": "retry", "reason": "another practice write is publishing"})
+    except (OSError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path),
+                          validation={"request": "failed"}, diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    from .backup import create_backup, restore_backup, verify_backup
+    from .command_response import exit_code
+    if args.backup_action == "verify":
+        result = verify_backup(args.backup)
+    else:
+        workspace = discover_workspace(args.workspace)
+        result = (create_backup(workspace, args.backup) if args.backup_action == "create"
+                  else restore_backup(args.backup, workspace))
+    emit(result, args.json)
+    return exit_code(result)
+
+
+def cmd_migration(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .pilot_migration import convert, cutover, plan, rollback, verify
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.migration_action == "plan":
+            result = plan(workspace, args.batch, args.legacy_package, args.legacy_thread)
+        elif args.migration_action == "convert":
+            result = convert(workspace, args.batch)
+        elif args.migration_action == "verify":
+            result = verify(workspace, args.batch)
+        elif args.migration_action == "cutover":
+            result = cutover(workspace, args.batch, args.authorization)
+        else:
+            result = rollback(workspace, args.batch)
+    except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path),
+                          validation={"migration": "failed"}, diagnostics=[str(exc)])
+    emit(result, args.json)
+    return exit_code(result)
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    from .installation import apply, inspect, plan
+    agents_root = args.agents_root.expanduser().resolve()
+    codex_root = args.codex_root.expanduser().resolve()
+    obsidian_plugins_root = (args.obsidian_plugins_root.expanduser().resolve()
+                             if args.obsidian_plugins_root else None)
+    if args.install_action == "plan":
+        result = plan(agents_root, codex_root, obsidian_plugins_root)
+    elif args.install_action == "apply":
+        result = apply(agents_root, codex_root, args.backup_root, obsidian_plugins_root)
+    else:
+        result = inspect(agents_root, codex_root, obsidian_plugins_root)
+    emit(result, args.json)
+    return exit_code(result)
+
+
+def cmd_capability(args: argparse.Namespace) -> int:
+    from .capabilities import check_capabilities, exit_code, list_capabilities, run_capability
+    if args.capability_action == "list":
+        result = list_capabilities()
+    elif args.capability_action == "check":
+        result = check_capabilities(args.capability_id)
+    else:
+        result = run_capability(args.capability_id, args.request)
+    emit(result, args.json)
+    return exit_code(result)
+
+
+_RETIRED_COMMAND_REPLACEMENTS = {
+    "migrate-legacy": "video-extract migration plan",
+    "scan": "video-extract plan",
+    "acquire": "video-extract ensure",
+    "transcribe": "video-extract notes prepare",
+    "prepare-evidence": "video-extract notes prepare",
+}
+
+
+def cmd_retired(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    replacement = _RETIRED_COMMAND_REPLACEMENTS[args.command]
+    result = response(
+        status="unsupported",
+        validation={"retired_public_command": "failed"},
+        next_action={"command": replacement},
+        diagnostics=[f"video-extract {args.command} is retired and cannot execute legacy scripts"],
+    )
+    emit(result, args.json)
+    return exit_code(result)
+
+
+def cmd_xiaoe(args: argparse.Namespace) -> int:
+    from .xiaoe_download import download, login, parse_chapters, status
+
+    config = discover_workspace(args.workspace)
+    if args.xiaoe_action == "login":
+        result = login(config, args.course_url, args.wait_seconds)
+    elif args.xiaoe_action == "download":
+        result = download(config, args.course_url, parse_chapters(args.chapters), args.wait_seconds, args.visible)
+    else:
+        result = status(config, args.course_url)
+    emit(result, args.json)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_playlist(args: argparse.Namespace) -> int:
+    if args.library_root is None or args.output_root is None:
+        workspace = discover_workspace(getattr(args, "workspace", None))
+        args.library_root = args.library_root or workspace.media
+        args.output_root = args.output_root or workspace.media / "playback"
+    if args.playlist_action == "verify":
+        result = verify_playback(args.output_root)
+        emit(result, args.json)
+        return 0 if result["ok"] else 1
+    if not args.catalog:
+        raise ValueError("playlist build requires --catalog")
+    if args.source_root is None:
+        result = build_playback_views(args.catalog, args.library_root, args.output_root, args.section)
+        emit(result, args.json)
+        return 0 if result["ok"] else 1
+    result = build_xiaoe_playback_views(args.catalog, args.source_root, args.library_root, args.output_root, args.section)
+    emit(result, args.json)
+    return 0 if result["ok"] else 1
+
+
+def cmd_export_obsidian(args: argparse.Namespace) -> int:
+    from .obsidian_export import export_all_verified, export_package
+    if args.library_root is None or args.root is None:
+        workspace = discover_workspace(getattr(args, "workspace", None))
+        args.library_root = args.library_root or workspace.media
+        args.root = args.root or workspace.generated
+    result = export_all_verified(args.library_root, args.root) if args.all_verified else export_package(args.package, args.root)
+    emit(result, args.json)
+    return 0 if result.get("ok", False) else 1
+
+
+def cmd_library(args: argparse.Namespace) -> int:
+    from .library import library_status, rebuild_library, search_library, update_package
+    if args.library_root is None:
+        args.library_root = discover_workspace(getattr(args, "workspace", None)).media
+    if args.library_action == "rebuild": result = rebuild_library(args.library_root)
+    elif args.library_action == "update": result = update_package(args.package, args.library_root)
+    elif args.library_action == "search": result = search_library(args.query, args.library_root, args.limit, args.platform, args.collection, args.section, args.status)
+    else: result = library_status(args.library_root)
+    emit(result, args.json)
+    return 0 if result.get("ok", False) else 1
+
+
+def cmd_workspace(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .workspace import WorkspaceError
+    try:
+        config = discover_workspace(args.workspace)
+    except WorkspaceError as exc:
+        if args.workspace_action != "doctor":
+            raise
+        result = response(status="missing_input", workspace=str(args.workspace) if args.workspace else None,
+                          validation={"workspace": "failed"}, diagnostics=[str(exc)],
+                          next_action={"type": "user", "reason": "provide a valid workspace config"})
+        emit(result, args.json)
+        return exit_code(result)
+    if args.workspace_action == "doctor" and not config.workspace_id:
+        result = response(status="missing_input", workspace=str(config.config_path),
+                          validation={"workspace_id": "failed"},
+                          diagnostics=["workspace_id is required for stable public execution; add a persistent logical ID to workspace.toml"],
+                          next_action={"type": "user", "reason": "add workspace_id to workspace.toml; do not change it when moving the workspace"})
+        emit(result, args.json)
+        return exit_code(result)
+    if args.workspace_action == "show":
+        if config.schema_version == 2:
+            from .command_response import response
+            result = response(status="completed", workspace=str(config.config_path), result=config.as_dict(),
+                              validation={"workspace_schema": "passed"},
+                              provenance={"workspace_config": str(config.config_path)})
+        else:
+            result = config.as_dict()
+    elif args.workspace_action == "doctor":
+        if config.schema_version == 2:
+            from .source_registry import audit
+            try:
+                store = audit(config)
+                result = response(status="completed", workspace=str(config.config_path),
+                                  result={"workspace": config.as_dict(), "snapshot": store},
+                                  validation={"workspace_schema": "passed", "snapshot": "passed",
+                                              "objects": "passed"},
+                                  provenance={"workspace_config": str(config.config_path),
+                                              "commit_id": store["commit_id"]})
+            except (OSError, ValueError, WorkspaceError) as exc:
+                result = response(status="recoverable_failure", workspace=str(config.config_path),
+                                  result={"workspace": config.as_dict()},
+                                  validation={"workspace_schema": "passed", "snapshot": "failed",
+                                              "objects": "not_checked"},
+                                  provenance={"workspace_config": str(config.config_path)},
+                                  diagnostics=[str(exc)],
+                                  next_action={"command": "video-extract workspace doctor --json"})
+        else:
+            from .capabilities import check_capabilities
+            from .installation import inspect
+            doctor_result = workspace_doctor(config)
+            capabilities = check_capabilities()
+            installation = inspect(
+                args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve(),
+                args.obsidian_plugins_root.expanduser().resolve() if args.obsidian_plugins_root else None,
+            )
+            doctor_result["capabilities"] = capabilities
+            doctor_result["installation"] = installation
+            ok = doctor_result["ok"] and capabilities["status"] == "completed" and installation["status"] == "completed"
+            result = response(status="completed" if ok else "recoverable_failure",
+                              workspace=str(config.config_path), result=doctor_result,
+                              validation={"workspace": doctor_result["ok"],
+                                          "capabilities": capabilities["status"] == "completed",
+                                          "installation": installation["status"] == "completed"},
+                              provenance={"workspace_config": str(config.config_path)},
+                              next_action=None if ok else {"command": "video-extract install plan --json"},
+                              diagnostics=[] if ok else ["workspace, capability, or installation diagnostics require attention"])
+    elif args.workspace_action == "rebuild": result = workspace_rebuild(config, args.apply)
+    else: result = prepare_migration(config, args.full_hash)
+    emit(result, args.json)
+    if args.workspace_action == "doctor":
+        return exit_code(result)
+    return 0 if result.get("ok", False) or result.get("status") == "completed" else 1
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="video-extract", description="Stable deterministic interface for authorized video-learning packages")
+    commands = root.add_subparsers(dest="command", required=True)
+    def hide(parser: argparse.ArgumentParser) -> None:
+        command = parser.prog.rsplit(" ", 1)[-1]
+        commands._choices_actions[:] = [action for action in commands._choices_actions if action.dest != command]
+    workspace = commands.add_parser("workspace", help="inspect and rebuild a portable workspace")
+    workspace_actions = workspace.add_subparsers(dest="workspace_action", required=True)
+    for action in ("show", "doctor"):
+        p = workspace_actions.add_parser(action); p.add_argument("--workspace", type=Path)
+        if action == "doctor":
+            p.add_argument("--agents-root", type=Path, default=Path.home() / ".agents")
+            p.add_argument("--codex-root", type=Path, default=Path.home() / ".codex")
+            p.add_argument("--obsidian-plugins-root", type=Path)
+        p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_workspace)
+    rebuild = workspace_actions.add_parser("rebuild"); rebuild.add_argument("--workspace", type=Path); rebuild.add_argument("--json", action="store_true")
+    rebuild_mode = rebuild.add_mutually_exclusive_group(required=True); rebuild_mode.add_argument("--dry-run", action="store_true"); rebuild_mode.add_argument("--apply", action="store_true"); rebuild.set_defaults(func=cmd_workspace)
+    migration = workspace_actions.add_parser("prepare-migration"); migration.add_argument("--workspace", type=Path); migration.add_argument("--full-hash", action="store_true"); migration.add_argument("--json", action="store_true"); migration.set_defaults(func=cmd_workspace)
+    doctor = commands.add_parser("doctor", help="check local deterministic dependencies"); doctor.add_argument("--json", action="store_true"); doctor.set_defaults(func=cmd_doctor)
+    playlist = commands.add_parser("playlist", help="build or verify video-only playback directories and M3U8 playlists")
+    playlist.add_argument("playlist_action", nargs="?", choices=("build", "verify"), default="build")
+    playlist.add_argument("--catalog", type=Path)
+    playlist.add_argument("--source-root", type=Path, help="optional legacy course directory used while packages are being migrated")
+    playlist.add_argument("--library-root", type=Path)
+    playlist.add_argument("--output-root", type=Path)
+    playlist.add_argument("--workspace", type=Path)
+    playlist.add_argument("--section", action="append", help="exact section title; omit to build every section")
+    playlist.add_argument("--json", action="store_true")
+    playlist.set_defaults(func=cmd_playlist)
+    migrate = commands.add_parser("migrate-legacy", help="plan or execute deterministic same-device legacy migration")
+    migrate.add_argument("--source-root", type=Path); migrate.add_argument("--library-root", type=Path, required=True)
+    migrate.add_argument("--mode", choices=("plan", "move", "consolidate"), required=True); migrate.add_argument("--report", type=Path, required=True)
+    migrate.add_argument("--input-report", type=Path, action="append", default=[])
+    migrate.add_argument("--root-media-only", action="store_true")
+    migrate.add_argument("--journal", type=Path, required=True); migrate.add_argument("--json", action="store_true"); migrate.set_defaults(func=cmd_retired); hide(migrate)
+    export = commands.add_parser("export-obsidian", help="export verified reading notes into Obsidian")
+    export.add_argument("package", nargs="?", type=Path); export.add_argument("--all-verified", action="store_true")
+    export.add_argument("--library-root", type=Path); export.add_argument("--root", type=Path); export.add_argument("--workspace", type=Path)
+    export.add_argument("--json", action="store_true"); export.set_defaults(func=cmd_export_obsidian)
+    library = commands.add_parser("library", help="manage the rebuildable SQLite FTS5 index")
+    library_actions = library.add_subparsers(dest="library_action", required=True)
+    for action in ("rebuild", "status"):
+        p = library_actions.add_parser(action); p.add_argument("--library-root", type=Path); p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_library)
+    update = library_actions.add_parser("update"); update.add_argument("package", type=Path); update.add_argument("--library-root", type=Path); update.add_argument("--workspace", type=Path); update.add_argument("--json", action="store_true"); update.set_defaults(func=cmd_library)
+    search = library_actions.add_parser("search"); search.add_argument("query"); search.add_argument("--library-root", type=Path); search.add_argument("--workspace", type=Path); search.add_argument("--limit", type=int, default=10)
+    for name in ("platform", "collection", "section", "status"): search.add_argument(f"--{name}")
+    search.add_argument("--json", action="store_true"); search.set_defaults(func=cmd_library)
+    for name, func in (("verify", cmd_verify), ("status", cmd_status)):
+        p = commands.add_parser(name, help=f"{name} package state from actual artifacts"); p.add_argument("path", type=Path); p.add_argument("--catalog", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=func)
+    def media_arguments(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--media", choices=("video", "audio", "subtitles", "all"), default="all")
+        p.add_argument("--language", default="original")
+        p.add_argument("--quality", choices=("standard", "balanced", "high"), default="high")
+        p.add_argument("--workspace", type=Path)
+        p.add_argument("--json", action="store_true")
+    planning = commands.add_parser("plan", help="read-only media extraction plan"); planning.add_argument("source", nargs="?"); planning.add_argument("--request", type=Path, help="versioned scoped media request JSON"); planning.add_argument("--output", type=Path, help="existing package whose validated artifacts may be reused"); media_arguments(planning); planning.set_defaults(func=cmd_plan)
+    ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source", nargs="?"); ensuring.add_argument("--request", type=Path, help="versioned scoped media request JSON"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
+    operation = commands.add_parser("operation", help="inspect or resume a persistent operation")
+    operation_actions = operation.add_subparsers(dest="operation_action", required=True)
+    for action in ("show", "resume", "reconcile"):
+        p = operation_actions.add_parser(action); p.add_argument("operation_id"); p.add_argument("--workspace", type=Path, required=True); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_operation)
+    source = commands.add_parser("source", help="import local source material into a managed package")
+    source_actions = source.add_subparsers(dest="source_action", required=True)
+    source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--source-id"); source_import.add_argument("--expected-revision", type=int); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
+    source_register = source_actions.add_parser("register", help="register a document or in-place source tree")
+    source_register.add_argument("input", type=Path); source_register.add_argument("--title"); source_register.add_argument("--source-id")
+    source_register.add_argument("--provenance", type=Path, help="public source provenance JSON")
+    source_register.add_argument("--expected-revision", type=int); source_register.add_argument("--workspace", type=Path)
+    source_register.add_argument("--json", action="store_true"); source_register.set_defaults(func=cmd_source)
+    source_verify = source_actions.add_parser("verify", help="verify a registered source version")
+    source_verify.add_argument("source_id"); source_verify.add_argument("--source-version")
+    source_verify.add_argument("--workspace", type=Path); source_verify.add_argument("--json", action="store_true")
+    source_verify.set_defaults(func=cmd_source)
+    source_relocate = source_actions.add_parser("relocate", help="update a source location after content verification")
+    source_relocate.add_argument("source_id"); source_relocate.add_argument("location", type=Path)
+    source_relocate.add_argument("--expected-revision", type=int, required=True)
+    source_relocate.add_argument("--workspace", type=Path); source_relocate.add_argument("--json", action="store_true")
+    source_relocate.set_defaults(func=cmd_source)
+    source_reconcile = source_actions.add_parser("reconcile", help="complete durability checks after an uncertain publish")
+    source_reconcile.add_argument("source_id"); source_reconcile.add_argument("--source-version", required=True)
+    source_reconcile.add_argument("--workspace", type=Path); source_reconcile.add_argument("--json", action="store_true")
+    source_reconcile.set_defaults(func=cmd_source)
+    source_associate = source_actions.add_parser("associate", help="validate an explicit relationship between registered sources")
+    source_associate.add_argument("source_id"); source_associate.add_argument("related_source_id")
+    source_associate.add_argument("--evidence", type=Path, help="structured association evidence JSON")
+    source_associate.add_argument("--workspace", type=Path)
+    source_associate.add_argument("--json", action="store_true"); source_associate.set_defaults(func=cmd_source)
+    notes = commands.add_parser("notes", help="prepare or finalize source-grounded notes")
+    notes_actions = notes.add_subparsers(dest="notes_action", required=True)
+    for action in ("prepare", "finalize"):
+        p = notes_actions.add_parser(action); p.add_argument("target")
+        p.add_argument("--source-version"); p.add_argument("--request", type=Path)
+        p.add_argument("--media-operation", help="verified scoped media operation ID")
+        p.add_argument("--selection", type=Path, help="visual candidate decision JSON")
+        p.add_argument("--human-reviewed", action="store_true", help="selection was explicitly reviewed by the user")
+        p.add_argument("--require-visuals", action="store_true")
+        p.add_argument("--transcript-adapter", help=argparse.SUPPRESS)
+        p.add_argument("--frame-adapter", help=argparse.SUPPRESS)
+        p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
+    notes_audit = notes_actions.add_parser("audit", help="enumerate and deeply validate authoritative notes")
+    notes_audit.add_argument("--workspace", type=Path); notes_audit.add_argument("--json", action="store_true")
+    notes_audit.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
+    notes_reconcile = notes_actions.add_parser("reconcile", help="deeply validate and repeat notes durability barriers")
+    notes_reconcile.add_argument("--commit-id")
+    notes_reconcile.add_argument("--workspace", type=Path); notes_reconcile.add_argument("--json", action="store_true")
+    notes_reconcile.set_defaults(func=cmd_notes, target=None, source_version=None, request=None)
+    learning = commands.add_parser("learning", help="manage authoritative learning modules, threads, and questions")
+    learning_entities = learning.add_subparsers(dest="learning_entity", required=True)
+    module = learning_entities.add_parser("module"); module_actions = module.add_subparsers(dest="learning_action", required=True)
+    module_create = module_actions.add_parser("create"); module_create.add_argument("--goal", required=True); module_create.add_argument("--scope", required=True); module_create.add_argument("--source-id", required=True); module_create.add_argument("--source-version", required=True); module_create.add_argument("--source-role", choices=("course_fact", "current_code", "supplemental_source")); module_create.add_argument("--expected-revision", type=int); module_create.add_argument("--workspace", type=Path); module_create.add_argument("--json", action="store_true"); module_create.set_defaults(func=cmd_learning)
+    module_show = module_actions.add_parser("show"); module_show.add_argument("module_id"); module_show.add_argument("--workspace", type=Path); module_show.add_argument("--json", action="store_true"); module_show.set_defaults(func=cmd_learning)
+    recommend = learning_entities.add_parser("recommend", help="prepare source-grounded root question recommendations without persisting candidates"); recommend.add_argument("--module-id", required=True); recommend.add_argument("--workspace", type=Path); recommend.add_argument("--json", action="store_true"); recommend.set_defaults(func=cmd_learning)
+    thread = learning_entities.add_parser("thread"); thread_actions = thread.add_subparsers(dest="learning_action", required=True)
+    thread_create = thread_actions.add_parser("create"); thread_create.add_argument("--module-id", required=True); thread_create.add_argument("--root-question", required=True); thread_create.add_argument("--expected-revision", type=int); thread_create.add_argument("--workspace", type=Path); thread_create.add_argument("--json", action="store_true"); thread_create.set_defaults(func=cmd_learning)
+    thread_show = thread_actions.add_parser("show"); thread_show.add_argument("thread_id"); thread_show.add_argument("--workspace", type=Path); thread_show.add_argument("--json", action="store_true"); thread_show.set_defaults(func=cmd_learning)
+    pursue_parser = learning_entities.add_parser("pursue"); pursue_parser.add_argument("--thread-id", required=True); pursue_parser.add_argument("--from-question-id", required=True); pursue_parser.add_argument("--relation", required=True); pursue_target = pursue_parser.add_mutually_exclusive_group(required=True); pursue_target.add_argument("--question"); pursue_target.add_argument("--existing-question-id"); pursue_parser.add_argument("--actual-question", help="the user's words on this entry when reusing an existing question identity"); pursue_parser.add_argument("--independent", action="store_true", help="after identity clarification, create a distinct question even when wording matches"); pursue_parser.add_argument("--expected-revision", type=int); pursue_parser.add_argument("--workspace", type=Path); pursue_parser.add_argument("--json", action="store_true"); pursue_parser.set_defaults(func=cmd_learning)
+    replay_parser = learning_entities.add_parser("replay", help="replay a preserved pursue conflict against its observed revision"); replay_parser.add_argument("--candidate", type=Path, required=True); replay_parser.add_argument("--workspace", type=Path); replay_parser.add_argument("--json", action="store_true"); replay_parser.set_defaults(func=cmd_learning)
+    feedback_parser = learning_entities.add_parser("feedback"); feedback_parser.add_argument("--question-id", required=True); feedback_parser.add_argument("--state", choices=("understood", "confused", "parked"), required=True); feedback_parser.add_argument("--text", required=True); feedback_parser.add_argument("--confusion"); feedback_parser.add_argument("--expected-revision", type=int); feedback_parser.add_argument("--workspace", type=Path); feedback_parser.add_argument("--json", action="store_true"); feedback_parser.set_defaults(func=cmd_learning)
+    resume_parser = learning_entities.add_parser("resume"); resume_scope = resume_parser.add_mutually_exclusive_group(required=True); resume_scope.add_argument("--thread-id"); resume_scope.add_argument("--module-id"); resume_parser.add_argument("--question-id"); resume_parser.add_argument("--from-question-id"); resume_parser.add_argument("--expected-revision", type=int); resume_parser.add_argument("--workspace", type=Path); resume_parser.add_argument("--json", action="store_true"); resume_parser.set_defaults(func=cmd_learning)
+    back_parser = learning_entities.add_parser("back"); back_parser.add_argument("--thread-id", required=True); back_parser.add_argument("--expected-revision", type=int); back_parser.add_argument("--workspace", type=Path); back_parser.add_argument("--json", action="store_true"); back_parser.set_defaults(func=cmd_learning)
+    locate_parser = learning_entities.add_parser("locate"); locate_parser.add_argument("question_id"); locate_parser.add_argument("--workspace", type=Path); locate_parser.add_argument("--json", action="store_true"); locate_parser.set_defaults(func=cmd_learning)
+    reconcile_parser = learning_entities.add_parser("reconcile"); reconcile_parser.add_argument("--commit-id", required=True); reconcile_parser.add_argument("--workspace", type=Path); reconcile_parser.add_argument("--json", action="store_true"); reconcile_parser.set_defaults(func=cmd_learning)
+    view = commands.add_parser("view", help="build and inspect rebuildable Obsidian learning projections")
+    view_actions = view.add_subparsers(dest="view_action", required=True)
+    view_build = view_actions.add_parser("build"); view_build.add_argument("--module-id", required=True); view_build.add_argument("--workspace", type=Path); view_build.add_argument("--json", action="store_true"); view_build.set_defaults(func=cmd_view)
+    view_status = view_actions.add_parser("status"); view_status.add_argument("--module-id", required=True); view_status.add_argument("--workspace", type=Path); view_status.add_argument("--json", action="store_true"); view_status.set_defaults(func=cmd_view)
+    view_locate = view_actions.add_parser("locate"); view_locate.add_argument("question_id"); view_locate.add_argument("--workspace", type=Path); view_locate.add_argument("--json", action="store_true"); view_locate.set_defaults(func=cmd_view)
+    explanation = commands.add_parser("explanation", help="prepare and commit versioned teaching explanations")
+    explanation_actions = explanation.add_subparsers(dest="explanation_action", required=True)
+    explanation_prepare = explanation_actions.add_parser("prepare"); explanation_prepare.add_argument("--question-id", required=True); explanation_prepare.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_prepare.add_argument("--reuse-review", type=Path, help="structured cross-root applicability review"); explanation_prepare.add_argument("--workspace", type=Path); explanation_prepare.add_argument("--json", action="store_true"); explanation_prepare.set_defaults(func=cmd_explanation)
+    explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--preparation-id", required=True); explanation_commit.add_argument("--section-map", type=Path); explanation_commit.add_argument("--revision-metadata", type=Path); explanation_commit.add_argument("--corrections", type=Path); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
+    explanation_restore = explanation_actions.add_parser("restore", help="restore an earlier expression while preserving confirmed corrections and learning state"); explanation_restore.add_argument("--question-id", required=True); explanation_restore.add_argument("--revision", type=int, required=True); explanation_restore.add_argument("--expected-revision", type=int); explanation_restore.add_argument("--workspace", type=Path); explanation_restore.add_argument("--json", action="store_true"); explanation_restore.set_defaults(func=cmd_explanation)
+    explanation_replay = explanation_actions.add_parser("replay", help="replay a complete immutable explanation conflict candidate"); explanation_replay.add_argument("--candidate", type=Path, required=True); explanation_replay.add_argument("--workspace", type=Path); explanation_replay.add_argument("--json", action="store_true"); explanation_replay.set_defaults(func=cmd_explanation)
+    card = commands.add_parser("card", help="propose, select, revise, and schedule selected flash cards")
+    card_actions = card.add_subparsers(dest="card_action", required=True)
+    card_propose = card_actions.add_parser("propose")
+    for name in ("question-id", "memory-target", "conditions", "prompt", "answer", "reason"):
+        card_propose.add_argument(f"--{name}", required=True)
+    card_propose.add_argument("--workspace", type=Path); card_propose.add_argument("--json", action="store_true"); card_propose.set_defaults(func=cmd_card)
+    card_select = card_actions.add_parser("select"); card_select.add_argument("--candidate", type=Path, required=True); card_select.add_argument("--effective-date"); card_select.add_argument("--workspace", type=Path); card_select.add_argument("--json", action="store_true"); card_select.set_defaults(func=cmd_card)
+    card_revise = card_actions.add_parser("revise"); card_revise.add_argument("--card-id", required=True); card_revise.add_argument("--change-type", choices=("wording", "material"), required=True); card_revise.add_argument("--prompt"); card_revise.add_argument("--answer"); card_revise.add_argument("--conditions"); card_revise.add_argument("--effective-date", required=True); card_revise.add_argument("--workspace", type=Path); card_revise.add_argument("--json", action="store_true"); card_revise.set_defaults(func=cmd_card)
+    card_schedule = card_actions.add_parser("schedule"); card_identity = card_schedule.add_mutually_exclusive_group(required=True); card_identity.add_argument("--card-id"); card_identity.add_argument("--card-version-id"); card_schedule.add_argument("--on-date"); card_schedule.add_argument("--workspace", type=Path); card_schedule.add_argument("--json", action="store_true"); card_schedule.set_defaults(func=cmd_card)
+    card_show = card_actions.add_parser("show"); card_show.add_argument("--card-id"); card_show.add_argument("--workspace", type=Path); card_show.add_argument("--json", action="store_true"); card_show.set_defaults(func=cmd_card)
+    suggestions = commands.add_parser("suggestions", help="derive deterministic short Review suggestions from saved facts")
+    suggestion_actions = suggestions.add_subparsers(dest="suggestions_action", required=True)
+    suggestions_today = suggestion_actions.add_parser("today")
+    suggestions_today.add_argument("--on-date", help="Asia/Shanghai date (YYYY-MM-DD)")
+    suggestions_today.add_argument("--prefer-question-id", action="append", default=[])
+    suggestions_today.add_argument("--prefer-card-version-id", action="append", default=[])
+    suggestions_today.add_argument("--workspace", type=Path); suggestions_today.add_argument("--json", action="store_true")
+    suggestions_today.set_defaults(func=cmd_suggestions)
+    delivery = commands.add_parser("delivery", help="deliver one-way daily suggestions with durable recovery")
+    delivery_actions = delivery.add_subparsers(dest="delivery_action", required=True)
+    delivery_enable = delivery_actions.add_parser("enable")
+    delivery_enable.add_argument("--logical-target", required=True); delivery_enable.add_argument("--adapter", default="lark-cli")
+    delivery_enable.add_argument("--authorization-ref", required=True); delivery_enable.add_argument("--effective-from", required=True)
+    delivery_disable = delivery_actions.add_parser("disable"); delivery_disable.add_argument("--logical-target", required=True)
+    delivery_tick = delivery_actions.add_parser("tick"); delivery_tick.add_argument("--on-date")
+    delivery_status = delivery_actions.add_parser("status"); delivery_status.add_argument("--operation-id")
+    delivery_reconcile = delivery_actions.add_parser("reconcile"); delivery_reconcile.add_argument("--operation-id", required=True)
+    delivery_schedule_install = delivery_actions.add_parser("schedule-install", help="install the user launchd job")
+    delivery_schedule_remove = delivery_actions.add_parser("schedule-remove", help="remove the user launchd job")
+    delivery_schedule_status = delivery_actions.add_parser("schedule-status", help="diagnose the user launchd job")
+    for parser in (delivery_enable, delivery_disable, delivery_tick, delivery_status, delivery_reconcile,
+                   delivery_schedule_install, delivery_schedule_remove, delivery_schedule_status):
+        parser.add_argument("--workspace", type=Path); parser.add_argument("--json", action="store_true"); parser.set_defaults(func=cmd_delivery)
+    review = commands.add_parser("review", help="prepare active recall before revealing and record independent Review facts")
+    review_actions = review.add_subparsers(dest="review_action", required=True)
+    review_prepare = review_actions.add_parser("prepare"); review_target = review_prepare.add_mutually_exclusive_group(required=True); review_target.add_argument("--question-id"); review_target.add_argument("--card-version-id"); review_prepare.add_argument("--preparation-id", help="stable retry identity beginning review-preparation-"); review_prepare.add_argument("--workspace", type=Path); review_prepare.add_argument("--json", action="store_true"); review_prepare.set_defaults(func=cmd_review)
+    review_record = review_actions.add_parser("record"); review_record.add_argument("--preparation-id", required=True); review_record.add_argument("--event-id", required=True); review_record.add_argument("--answer"); review_record.add_argument("--answer-summary"); review_record.add_argument("--hint", action="append", default=[]); review_record.add_argument("--model-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored"), required=True); review_record.add_argument("--correction"); review_record.add_argument("--corrected-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored")); review_record.add_argument("--review-date", help="actual Asia/Shanghai review date (YYYY-MM-DD)"); review_record.add_argument("--workspace", type=Path); review_record.add_argument("--json", action="store_true"); review_record.set_defaults(func=cmd_review)
+    review_show = review_actions.add_parser("show"); review_show.add_argument("--question-id"); review_show.add_argument("--workspace", type=Path); review_show.add_argument("--json", action="store_true"); review_show.set_defaults(func=cmd_review)
+    practice = commands.add_parser("practice", help="prepare and record one isolated local mechanism practice")
+    practice_actions = practice.add_subparsers(dest="practice_action", required=True)
+    practice_prepare = practice_actions.add_parser("prepare"); practice_prepare.add_argument("--request", type=Path, required=True); practice_prepare.add_argument("--workspace", type=Path); practice_prepare.add_argument("--json", action="store_true"); practice_prepare.set_defaults(func=cmd_practice)
+    practice_checkpoint = practice_actions.add_parser("checkpoint"); practice_checkpoint.add_argument("--practice-id", required=True); practice_checkpoint.add_argument("--expected-revision", type=int, required=True); practice_checkpoint.add_argument("--workspace", type=Path); practice_checkpoint.add_argument("--json", action="store_true"); practice_checkpoint.set_defaults(func=cmd_practice, request=None)
+    practice_record = practice_actions.add_parser("record"); practice_record.add_argument("--practice-id", required=True); practice_record.add_argument("--request", type=Path, required=True); practice_record.add_argument("--expected-revision", type=int, required=True); practice_record.add_argument("--workspace", type=Path); practice_record.add_argument("--json", action="store_true"); practice_record.set_defaults(func=cmd_practice)
+    migration = commands.add_parser("migration", help="plan, convert, verify, cut over, or roll back one explicit legacy pilot batch")
+    migration_actions = migration.add_subparsers(dest="migration_action", required=True)
+    migration_plan = migration_actions.add_parser("plan", help="inventory one legacy course package and learning thread without changing them")
+    migration_plan.add_argument("--legacy-package", type=Path, required=True); migration_plan.add_argument("--legacy-thread", type=Path, required=True)
+    migration_parsers = [migration_plan]
+    migration_parsers.extend(migration_actions.add_parser(action) for action in ("convert", "verify", "cutover", "rollback"))
+    for action_parser in migration_parsers:
+        action_parser.add_argument("--batch", required=True); action_parser.add_argument("--workspace", type=Path, required=True)
+        action_parser.add_argument("--json", action="store_true"); action_parser.set_defaults(func=cmd_migration)
+    next(item for item in migration_parsers if item.prog.endswith(" cutover")).add_argument(
+        "--authorization", type=Path, required=True,
+        help="JSON explicitly approving this batch and its exact legacy package/thread paths")
+    backup = commands.add_parser("backup", help="create, verify, or restore a complete result-only generation")
+    backup_actions = backup.add_subparsers(dest="backup_action", required=True)
+    backup_create = backup_actions.add_parser("create"); backup_create.add_argument("backup", type=Path); backup_create.add_argument("--workspace", type=Path); backup_create.add_argument("--json", action="store_true"); backup_create.set_defaults(func=cmd_backup)
+    backup_verify = backup_actions.add_parser("verify"); backup_verify.add_argument("backup", type=Path); backup_verify.add_argument("--json", action="store_true"); backup_verify.set_defaults(func=cmd_backup, workspace=None)
+    backup_restore = backup_actions.add_parser("restore"); backup_restore.add_argument("backup", type=Path); backup_restore.add_argument("--workspace", type=Path, required=True); backup_restore.add_argument("--json", action="store_true"); backup_restore.set_defaults(func=cmd_backup)
+    install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
+    install_actions = install.add_subparsers(dest="install_action", required=True)
+    for action in ("plan", "apply", "check"):
+        p = install_actions.add_parser(action)
+        p.add_argument("--agents-root", type=Path, default=Path.home() / ".agents")
+        p.add_argument("--codex-root", type=Path, default=Path.home() / ".codex")
+        p.add_argument("--obsidian-plugins-root", type=Path)
+        if action == "apply": p.add_argument("--backup-root", type=Path)
+        p.add_argument("--json", action="store_true")
+        p.set_defaults(func=cmd_install)
+    capability = commands.add_parser("capability", help="list, check, or run a stable capability ID")
+    capability_actions = capability.add_subparsers(dest="capability_action", required=True)
+    capability_list = capability_actions.add_parser("list", help="list declared capability contracts")
+    capability_list.add_argument("--json", action="store_true"); capability_list.set_defaults(func=cmd_capability)
+    capability_check = capability_actions.add_parser("check", help="check a capability implementation and contract")
+    capability_check.add_argument("capability_id", nargs="?"); capability_check.add_argument("--json", action="store_true"); capability_check.set_defaults(func=cmd_capability)
+    capability_run = capability_actions.add_parser("run", help="run a capability from a versioned JSON request")
+    capability_run.add_argument("capability_id"); capability_run.add_argument("--request", type=Path, required=True)
+    capability_run.add_argument("--json", action="store_true"); capability_run.set_defaults(func=cmd_capability)
+    scan = commands.add_parser("scan"); scan.add_argument("source"); scan.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); scan.add_argument("--output", type=Path, required=True); scan.add_argument("--visible", action="store_true"); scan.add_argument("--wait-seconds", type=int); scan.add_argument("--json", action="store_true"); scan.set_defaults(func=cmd_retired); hide(scan)
+    acquire = commands.add_parser("acquire"); acquire.add_argument("source", nargs="?", default=""); acquire.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); acquire.add_argument("--urls-file", type=Path); acquire.add_argument("--output", type=Path, required=True); acquire.add_argument("--media", choices=("video", "audio", "both"), default="video"); acquire.add_argument("--quality", type=int); acquire.add_argument("--workers", type=int); acquire.add_argument("--session-dir", type=Path, default=Path("work/browser_session")); acquire.add_argument("--wait-seconds", type=int); acquire.add_argument("--headless", action="store_true"); acquire.add_argument("--cdp-url", help="连接已打开的 Chrome CDP 地址"); acquire.add_argument("--json", action="store_true"); acquire.set_defaults(func=cmd_retired); hide(acquire)
+    xiaoe = commands.add_parser("xiaoe", help="persistent, resumable Xiaoe course downloads")
+    xiaoe_actions = xiaoe.add_subparsers(dest="xiaoe_action", required=True)
+    xiaoe_login = xiaoe_actions.add_parser("login", help="authorize the persistent Xiaoe download profile once")
+    xiaoe_login.add_argument("course_url"); xiaoe_login.add_argument("--wait-seconds", type=int, default=300); xiaoe_login.add_argument("--workspace", type=Path); xiaoe_login.add_argument("--json", action="store_true"); xiaoe_login.set_defaults(func=cmd_xiaoe)
+    xiaoe_download = xiaoe_actions.add_parser("download", help="download selected course chapters with resume")
+    xiaoe_download.add_argument("course_url"); xiaoe_download.add_argument("--chapters", required=True, help="comma-separated numbers or ranges, e.g. 17,18,19 or 17-19"); xiaoe_download.add_argument("--wait-seconds", type=int, default=12); xiaoe_download.add_argument("--visible", action="store_true"); xiaoe_download.add_argument("--workspace", type=Path); xiaoe_download.add_argument("--json", action="store_true"); xiaoe_download.set_defaults(func=cmd_xiaoe)
+    xiaoe_status = xiaoe_actions.add_parser("status", help="show resumable Xiaoe download status")
+    xiaoe_status.add_argument("course_url"); xiaoe_status.add_argument("--workspace", type=Path); xiaoe_status.add_argument("--json", action="store_true"); xiaoe_status.set_defaults(func=cmd_xiaoe)
+    transcribe = commands.add_parser("transcribe"); transcribe.add_argument("--video", type=Path); transcribe.add_argument("--catalog", type=Path); transcribe.add_argument("--output", type=Path, required=True); transcribe.add_argument("--section"); transcribe.add_argument("--limit", type=int); transcribe.add_argument("--workers", type=int); transcribe.add_argument("--model", default="small"); transcribe.add_argument("--language", default="zh"); transcribe.add_argument("--task", choices=("transcribe", "translate"), default="transcribe"); transcribe.add_argument("--visible", action="store_true"); transcribe.add_argument("--json", action="store_true"); transcribe.set_defaults(func=cmd_retired); hide(transcribe)
+    prep = commands.add_parser("prepare-evidence"); prep.add_argument("--video", type=Path, required=True); prep.add_argument("--transcript", type=Path); prep.add_argument("--output", type=Path, required=True); prep.add_argument("--review-json", type=Path); prep.add_argument("--interval", type=float, default=15); prep.add_argument("--scene-threshold", type=float, default=.30); prep.add_argument("--max-candidates", type=int, default=40); prep.add_argument("--no-ocr", action="store_true"); prep.add_argument("--json", action="store_true"); prep.set_defaults(func=cmd_retired); hide(prep)
+    commands.metavar = "{" + ",".join(action.dest for action in commands._choices_actions) + "}"
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try: return args.func(args)
+    except KeyboardInterrupt: return 130
+    except Exception as exc:
+        emit({"ok": False, "error": str(exc)}, getattr(args, "json", False)); return 1
+
+
+if __name__ == "__main__": raise SystemExit(main())

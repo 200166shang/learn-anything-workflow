@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/source-package-v6.schema.json",
+  "title": "Source package v6",
+  "type": "object",
+  "required": ["schema_version", "source_id", "kind", "title", "current_version", "versions"],
+  "properties": {
+    "schema_version": {"const": 6},
+    "source_id": {"type": "string", "pattern": "^source-[0-9a-f-]{36}$"},
+    "kind": {"enum": ["document", "code"]},
+    "title": {"type": "string", "minLength": 1},
+    "current_version": {"type": "string", "pattern": "^source-version-[0-9a-f]{64}$"},
+    "versions": {
+      "type": "object", "minProperties": 1,
+      "propertyNames": {"pattern": "^source-version-[0-9a-f]{64}$"},
+      "additionalProperties": {"$ref": "#/$defs/version"}
+    }
+  },
+  "$defs": {
+    "version": {
+      "type": "object",
+      "required": ["source_version", "content_sha256", "kind", "captured_at", "version_basis", "entries", "storage"],
+      "properties": {
+        "source_version": {"type": "string", "pattern": "^source-version-[0-9a-f]{64}$"},
+        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "kind": {"enum": ["document", "code"]},
+        "captured_at": {"type": "string", "format": "date-time"},
+        "version_basis": {
+          "type": "object", "required": ["content_sha256"],
+          "properties": {
+            "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "git_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
+            "working_tree_dirty": {"type": ["boolean", "null"]},
+            "dirty_files": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "object", "required": ["modified", "added", "deleted"],
+                 "properties": {
+                   "modified": {"type": "array", "items": {"type": "string"}},
+                   "added": {"type": "array", "items": {"type": "string"}},
+                   "deleted": {"type": "array", "items": {"type": "string"}}
+                 }, "additionalProperties": false}
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["path", "sha256", "size"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "size": {"type": "integer", "minimum": 0}
+            },
+            "additionalProperties": false
+          }
+        },
+        "storage": {"enum": ["object", "reference"]},
+        "object_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance": {
+          "type": "object",
+          "required": ["origin", "author_or_organization", "published_version_or_date", "accessed_at", "summary", "locator", "applicability", "verification"],
+          "properties": {
+            "origin": {"type": "string", "minLength": 1},
+            "author_or_organization": {"type": "string", "minLength": 1},
+            "published_version_or_date": {"type": "string", "minLength": 1},
+            "accessed_at": {"type": "string", "format": "date-time"},
+            "summary": {"type": "string", "minLength": 1},
+            "locator": {"type": "string", "minLength": 1},
+            "applicability": {"type": "string", "minLength": 1},
+            "verification": {"enum": ["manual_review_required", "manually_verified"]}
+          },
+          "additionalProperties": false
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"storage": {"const": "object"}}},
+          "then": {"required": ["object_sha256"]}
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

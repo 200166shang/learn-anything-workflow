@@ -1,0 +1,5 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://video-extract.local/schemas/review-snapshot-v1.schema.json","type":"object","additionalProperties":false,
+  "required":["schema_version","commit_id","parent_commit_id","revision","created_at","record"],
+  "properties":{"schema_version":{"const":1},"commit_id":{"type":"string","pattern":"^review-commit-[0-9a-f]{64}$"},"parent_commit_id":{"type":["string","null"],"pattern":"^review-commit-[0-9a-f]{64}$"},"revision":{"type":"integer","minimum":1},"created_at":{"type":"string","format":"date-time"},"record":{"$ref":"review-record-v1.schema.json"}}
+}

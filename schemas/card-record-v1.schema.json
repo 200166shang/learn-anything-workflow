@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://video-extract.local/schemas/card-record-v1.schema.json", "title": "Card record v1",
+  "type": "object", "required": ["schema_version", "cards"], "additionalProperties": false,
+  "properties": {"schema_version": {"const": 1}, "cards": {"type": "object", "additionalProperties": {"$ref": "#/$defs/card"}}},
+  "$defs": {
+    "source_ref": {"type": "object", "required": ["source_id", "source_version"], "additionalProperties": false, "properties": {"source_id": {"type": "string", "pattern": "^source-"}, "source_version": {"type": "string", "pattern": "^source-version-[0-9a-f]{64}$"}}},
+    "pin": {"type": "object", "required": ["question_id", "explanation_id", "explanation_revision", "object_sha256", "logical_path", "source_refs", "learning_commit_id", "learning_revision"], "additionalProperties": false, "properties": {
+      "question_id": {"type": "string", "pattern": "^question-"}, "explanation_id": {"type": "string", "pattern": "^explanation-"}, "explanation_revision": {"type": "integer", "minimum": 1},
+      "object_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "logical_path": {"type": "string", "pattern": "^learning/objects/[0-9a-f]{2}/[0-9a-f]{64}$"},
+      "source_refs": {"type": "array", "items": {"$ref": "#/$defs/source_ref"}}, "learning_commit_id": {"type": "string", "pattern": "^learning-commit-[0-9a-f]{64}$"}, "learning_revision": {"type": "integer", "minimum": 1}
+    }},
+    "wording_revision": {"type": "object", "required": ["revised_at", "prompt", "answer", "reason"], "additionalProperties": false, "properties": {"revised_at": {"type": "string", "format": "date-time"}, "prompt": {"type": "string", "minLength": 1}, "answer": {"type": "string", "minLength": 1}, "reason": {"const": "wording"}}},
+    "version": {"type": "object", "required": ["card_version_id", "version_number", "prompt", "answer", "conditions", "effective_date", "created_at", "change_type", "rule_version", "explanation_pin", "revisions"], "additionalProperties": false, "properties": {
+      "card_version_id": {"type": "string", "pattern": "^card-version-"}, "version_number": {"type": "integer", "minimum": 1}, "prompt": {"type": "string", "minLength": 1}, "answer": {"type": "string", "minLength": 1},
+      "conditions": {"type": "string", "minLength": 1}, "effective_date": {"type": "string", "format": "date"}, "created_at": {"type": "string", "format": "date-time"}, "change_type": {"enum": ["selected", "material"]},
+      "rule_version": {"const": 1}, "explanation_pin": {"$ref": "#/$defs/pin"}, "revisions": {"type": "array", "items": {"$ref": "#/$defs/wording_revision"}}
+    }},
+    "selection_event": {"type": "object", "required": ["candidate_id", "question_id", "selected_at"], "additionalProperties": false, "properties": {"candidate_id": {"type": "string", "pattern": "^card-candidate-[0-9a-f]{64}$"}, "question_id": {"type": "string", "pattern": "^question-"}, "selected_at": {"type": "string", "format": "date-time"}}},
+    "card": {"type": "object", "required": ["card_id", "memory_target", "conditions", "question_ids", "active_version_id", "versions", "selection_events"], "additionalProperties": false, "properties": {
+      "card_id": {"type": "string", "pattern": "^card-"}, "memory_target": {"type": "string", "minLength": 1}, "conditions": {"type": "string", "minLength": 1},
+      "question_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^question-"}}, "active_version_id": {"type": "string", "pattern": "^card-version-"},
+      "versions": {"type": "object", "minProperties": 1, "additionalProperties": {"$ref": "#/$defs/version"}}, "selection_events": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/selection_event"}}
+    }}
+  }
+}

@@ -1,0 +1,15 @@
+schema_version = 2
+# Generate once, for example: python -c 'import uuid; print(uuid.uuid4())'
+workspace_id = "REPLACE_ME_WITH_UUID"
+
+[paths]
+project = "video-extract-core"
+results = "learning-results"
+sources = "source-materials"
+derived = "derived-views"
+local = ".video-extract-local"
+
+# Optional. Only mandarin-audio requires these machine-local paths.
+[tools.pyvideotrans]
+python = "/absolute/path/to/pyvideotrans/.venv/bin/python"
+cli = "/absolute/path/to/pyvideotrans-runtime/cli.py"

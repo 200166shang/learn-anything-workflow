@@ -1,0 +1,417 @@
+"""Consistent, result-only backup generations and isolated restore."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+import uuid
+from contextlib import ExitStack
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from jsonschema import Draft202012Validator, FormatChecker
+
+from .command_response import engineering_revision, response
+from .manifest import atomic_write_json, read_json
+from .package_lock import PackageBusyError, package_lock
+from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
+
+SCHEMA_VERSION = 1
+SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/backup-manifest-v1.schema.json").read_text())
+DELIVERY_SCHEMA = json.loads((Path(__file__).resolve().parent.parent /
+                              "schemas/delivery-operation-v1.schema.json").read_text())
+MANIFEST = "backup-manifest.json"
+STORE_PREFIXES = {"sources": "", "notes": "source-notes", "learning": "learning",
+                  "review": "review", "practice": "practices", "cards": "cards"}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _safe(root: Path, relative: str) -> Path:
+    if not relative or relative.startswith("/") or "\\" in relative:
+        raise WorkspaceError(f"unsafe backup path: {relative!r}")
+    parts = Path(relative).parts
+    if any(part in {"", ".", ".."} for part in parts):
+        raise WorkspaceError(f"unsafe backup path: {relative!r}")
+    current = root
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            raise WorkspaceError(f"refusing symbolic link in backup path: {current}")
+    resolved = current.resolve(strict=False)
+    base = root.resolve(strict=False)
+    if base not in resolved.parents:
+        raise WorkspaceError(f"backup path escapes root: {relative}")
+    return current
+
+
+def _validate_manifest(value: Any) -> None:
+    errors = list(Draft202012Validator(SCHEMA, format_checker=FormatChecker()).iter_errors(value))
+    if errors:
+        error = errors[0]
+        location = "/".join(map(str, error.absolute_path)) or "<root>"
+        raise WorkspaceError(f"backup manifest validation failed at {location}: {error.message}")
+    unsigned = {key: item for key, item in value.items() if key != "commit_id"}
+    expected = "backup-commit-" + hashlib.sha256(
+        json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if value["commit_id"] != expected:
+        raise WorkspaceError("backup commit identity does not match its manifest")
+
+
+def _pointer_generation(results: Path, store: str) -> tuple[dict[str, Any], list[Path]]:
+    prefix = Path(STORE_PREFIXES[store])
+    pointer = _safe(results, (prefix / "current.json").as_posix())
+    if not pointer.is_file():
+        commits = _safe(results, (prefix / "commits").as_posix())
+        if pointer.exists() or (commits.exists() and (not commits.is_dir() or any(commits.iterdir()))):
+            raise WorkspaceError(f"{store} authority has stored commits but no valid current pointer")
+        return {"store": store, "commit_id": None, "revision": 0, "schema_version": None}, []
+    selected = read_json(pointer)
+    commit_id = selected.get("commit_id")
+    manifest = _safe(results, (prefix / "commits" / f"{commit_id}.json").as_posix())
+    if not manifest.is_file() or _digest(manifest) != selected.get("manifest_sha256"):
+        raise WorkspaceError(f"{store} current pointer is incomplete or corrupt")
+    value = read_json(manifest)
+    objects_root = results / prefix / "objects" if store != "sources" else results / "objects"
+    objects = []
+    for digest, facts in sorted(value.get("objects", {}).items()):
+        path = _safe(results, (objects_root / digest[:2] / digest).relative_to(results).as_posix())
+        if not path.is_file() or path.stat().st_size != facts.get("size") or _digest(path) != digest:
+            raise WorkspaceError(f"{store} object is incomplete or corrupt: {digest}")
+        objects.append(path)
+    return {"store": store, "commit_id": commit_id, "revision": value.get("revision"),
+            "schema_version": value.get("schema_version")}, [pointer, manifest, *objects]
+
+
+def _generation(config: WorkspaceConfig, store: str) -> tuple[dict[str, Any], list[Path]]:
+    authority, paths = _pointer_generation(config.results, store)
+    if store in {"review", "practice", "cards"}:
+        from .review import backup_entries as review_entries
+        from .practice import backup_entries as practice_entries
+        from .cards import backup_entries as card_entries
+        exported = {"review": review_entries, "practice": practice_entries,
+                    "cards": card_entries}[store](config)
+        if exported["commit_id"] != authority["commit_id"]:
+            raise WorkspaceError(f"{store} generation changed while enumerating backup entries")
+        paths = [_safe(config.results, Path(raw).relative_to(config.results).as_posix())
+                 for raw in exported["entries"]]
+    return authority, paths
+
+
+def _receipt_files(results: Path) -> list[Path]:
+    root = results / "operation-receipts"
+    if root.is_symlink():
+        raise WorkspaceError("operation receipt root must not be a symbolic link")
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise WorkspaceError("operation receipt root must be a directory")
+    files = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise WorkspaceError(f"operation receipt must not be a symbolic link: {path}")
+        if path.is_file():
+            if path.suffix != ".json" or path.name.startswith("."):
+                raise WorkspaceError(f"unexpected formal receipt file: {path}")
+            value = read_json(path)
+            required = {"schema_version", "operation_id", "status", "authoritative_revision",
+                        "authoritative_digest", "intent", "artifact_facts", "attempts",
+                        "reconciliation", "receipt"}
+            is_delivery = value.get("intent", {}).get("capability_id") == "delivery.lark"
+            delivery_errors = list(Draft202012Validator(DELIVERY_SCHEMA).iter_errors(value)) if is_delivery else []
+            if is_delivery and (delivery_errors or value.get("status") != "completed"):
+                raise WorkspaceError(f"invalid operation receipt: {path}")
+            if not is_delivery and (not isinstance(value, dict) or set(value) != required \
+                    or value.get("schema_version") != 1 \
+                    or not isinstance(value.get("operation_id"), str) \
+                    or not isinstance(value.get("authoritative_revision"), int) \
+                    or value["authoritative_revision"] < 1 \
+                    or not isinstance(value.get("authoritative_digest"), str) \
+                    or len(value["authoritative_digest"]) != 64 \
+                    or any(character not in "0123456789abcdef" for character in value["authoritative_digest"]) \
+                    or not isinstance(value.get("intent"), dict) \
+                    or not isinstance(value.get("artifact_facts"), dict) \
+                    or not isinstance(value.get("attempts"), list) \
+                    or not isinstance(value.get("reconciliation"), list) \
+                    or not isinstance(value.get("receipt"), dict) \
+                    or not isinstance(value["receipt"].get("state"), str)):
+                raise WorkspaceError(f"invalid operation receipt: {path}")
+            forbidden = {"token", "authorization", "cookie", "password", "secret", "credential"}
+            def check(item: Any) -> None:
+                if isinstance(item, dict):
+                    for key, child in item.items():
+                        if key.lower() in forbidden:
+                            raise WorkspaceError(f"private field is forbidden in operation receipt: {key}")
+                        check(child)
+                elif isinstance(item, list):
+                    for child in item: check(child)
+            check(value); files.append(path)
+    return files
+
+
+def _entry(source: Path, destination: Path, payload: Path) -> dict[str, Any]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+    with destination.open("rb") as stream:
+        os.fsync(stream.fileno())
+    return {"path": destination.relative_to(payload.parent).as_posix(),
+            "size": destination.stat().st_size, "sha256": _digest(destination)}
+
+
+def _root_digest(entries: list[dict[str, Any]]) -> str:
+    value = [{key: item[key] for key in ("path", "size", "sha256")} for item in sorted(entries, key=lambda x: x["path"])]
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _deep_validate_payload(root: Path, manifest: dict[str, Any]) -> None:
+    payload = root / "payload"
+    config = WorkspaceConfig(Path("restored/workspace.toml"), "backup-verification", root,
+        root / "project", root / "sources", root / "derived", root / "derived/generated",
+        root / "derived/threads", root / "derived/concepts", root / "derived/REVIEW.md",
+        manifest["workspace_id"], schema_version=PORTABLE_SCHEMA_VERSION,
+        results=payload, sources=root / "sources", derived=root / "derived", local=root / "local")
+    from .source_registry import _load_snapshot, _validate_snapshot_objects
+    from .authoritative_notes import _load_current
+    from .learning import _load
+    source = _load_snapshot(config)
+    _validate_snapshot_objects(config, source)
+    notes = _load_current(config)
+    learning = _load(config)
+    expected = manifest["authorities"]
+    observed = {"sources": source, "notes": notes, "learning": learning}
+    from .review import _load as load_review
+    from .practice import _load as load_practice
+    from .cards import _load as load_cards
+    for name, loader in (("review", load_review), ("practice", load_practice), ("cards", load_cards)):
+        snapshot = loader(config)
+        if name in expected:
+            observed[name] = snapshot
+        elif snapshot.get("commit_id") is not None:
+            raise WorkspaceError(f"backup contains an undeclared {name} authority")
+    for name, value in observed.items():
+        authority = expected[name]
+        generation, paths = _generation(config, name)
+        if any(authority[key] != generation[key] for key in generation):
+            raise WorkspaceError(f"{name} authority metadata does not match its stored generation")
+        if authority["commit_id"] != value.get("commit_id") or authority["revision"] != value.get("revision"):
+            raise WorkspaceError(f"{name} authority does not match the pinned backup generation")
+        if "entry_paths" in authority and set(authority["entry_paths"]) != {
+                path.relative_to(root).as_posix() for path in paths}:
+            raise WorkspaceError(f"{name} authority entries do not match its reachable objects")
+    # Foreign keys remain tied to the pinned source generation even when its external location is absent.
+    versions = {(source_id, version_id) for source_id, package in source.get("sources", {}).items()
+                for version_id in package.get("versions", {})}
+    for note in notes.get("notes", {}).values():
+        for history in note.get("history", []):
+            if (note["source_id"], history["source_version"]) not in versions:
+                raise WorkspaceError("note history has a broken source-version association")
+    for module in learning.get("record", {}).get("modules", {}).values():
+        for ref in module.get("source_refs", []):
+            if (ref["source_id"], ref["source_version"]) not in versions:
+                raise WorkspaceError("learning record has a broken source-version association")
+    for preparation in observed.get("review", {}).get("record", {}).get("preparations", {}).values():
+        if any((ref["source_id"], ref["source_version"]) not in versions
+               for ref in preparation["pin"]["source_refs"]):
+            raise WorkspaceError("review pin has a broken source-version association")
+    for card in observed.get("cards", {}).get("record", {}).get("cards", {}).values():
+        for version in card["versions"].values():
+            if any((ref["source_id"], ref["source_version"]) not in versions
+                   for ref in version["explanation_pin"]["source_refs"]):
+                raise WorkspaceError("card version has a broken source-version association")
+    _receipt_files(payload)
+
+
+def create_backup(config: WorkspaceConfig, target: Path) -> dict[str, Any]:
+    target = target.expanduser().resolve(strict=False)
+    if config.schema_version != PORTABLE_SCHEMA_VERSION or config.results is None:
+        return response(status="unsupported", workspace=str(config.config_path),
+                        validation={"workspace_schema": "failed"}, diagnostics=["backup requires workspace schema v2"])
+    if target.exists():
+        return response(status="awaiting_user", workspace=str(config.config_path),
+                        validation={"target": "conflict"}, diagnostics=[f"backup target already exists: {target}"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+    try:
+        from .practice import prepare_backup_capture, validate_backup_capture
+        capture = prepare_backup_capture(config)
+        with ExitStack() as locks:
+            for prefix in STORE_PREFIXES.values():
+                locks.enter_context(package_lock(config.results / prefix))
+            validate_backup_capture(config, capture)
+            before = {name: _generation(config, name) for name in STORE_PREFIXES}
+            payload = stage / "payload"; entries: list[dict[str, Any]] = []
+            payload.mkdir()
+            authorities: dict[str, Any] = {}
+            copied_paths: dict[str, dict[str, Any]] = {}
+            for name, (authority, paths) in before.items():
+                store_entries = []
+                for source in paths:
+                    relative = source.relative_to(config.results)
+                    key = relative.as_posix()
+                    if key not in copied_paths:
+                        copied_paths[key] = _entry(source, payload / relative, payload)
+                        entries.append(copied_paths[key])
+                    store_entries.append(copied_paths[key])
+                authorities[name] = {**authority, "root_sha256": _root_digest(store_entries),
+                                     "entry_paths": sorted(item["path"] for item in store_entries)}
+            receipt_entries = []
+            for source in _receipt_files(config.results):
+                item = _entry(source, payload / source.relative_to(config.results), payload)
+                entries.append(item); receipt_entries.append(item)
+            authorities["operation_receipts"] = {"store": "operation_receipts", "commit_id": None,
+                "revision": len(receipt_entries), "schema_version": 1,
+                "root_sha256": _root_digest(receipt_entries)}
+            after = {name: _generation(config, name)[0] for name in STORE_PREFIXES}
+            if any(before[name][0] != after[name] for name in after):
+                raise WorkspaceError("an authoritative generation changed while backup was being prepared")
+            validate_backup_capture(config, capture)
+        unsigned = {"schema_version": SCHEMA_VERSION, "workspace_id": config.workspace_id,
+            "created_at": _now(), "tool_version": engineering_revision(), "authorities": authorities,
+            "entries": sorted(entries, key=lambda item: item["path"]),
+            "exclusions": ["local", "locks", "credentials", "temporary_files", "candidates", "derived_data", "source_media"]}
+        manifest = {**unsigned, "commit_id": "backup-commit-" + hashlib.sha256(
+            json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+        _validate_manifest(manifest)
+        atomic_write_json(stage / MANIFEST, manifest)
+        verified = verify_backup(stage)
+        if verified["status"] != "completed":
+            raise WorkspaceError("staged backup failed deep verification: " + "; ".join(verified["diagnostics"]))
+        if os.environ.get("VIDEO_EXTRACT_BACKUP_TEST_FAULT") == "before_publish":
+            raise OSError("injected backup interruption before publish")
+        os.replace(stage, target)
+        descriptor = os.open(target.parent, os.O_RDONLY)
+        try: os.fsync(descriptor)
+        finally: os.close(descriptor)
+        return response(status="completed", workspace=str(config.config_path), operation_id="operation-" + str(uuid.uuid4()),
+            result={"backup": str(target), "commit_id": manifest["commit_id"], "entries": len(entries)},
+            validation={"manifest": "passed", "digests": "passed", "associations": "passed"},
+            provenance={"tool_version": manifest["tool_version"], "authority_revisions": {
+                key: value["revision"] for key, value in authorities.items()}})
+    except PackageBusyError as exc:
+        return response(status="busy", workspace=str(config.config_path), diagnostics=[str(exc)])
+    except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+        return response(status="recoverable_failure", workspace=str(config.config_path),
+                        validation={"published": "no"}, diagnostics=[str(exc)])
+    finally:
+        if stage.exists(): shutil.rmtree(stage)
+
+
+def verify_backup(root: Path) -> dict[str, Any]:
+    root = root.expanduser().resolve(strict=False)
+    validation = {"manifest": "failed", "digests": "not_checked", "associations": "not_checked"}
+    try:
+        if root.is_symlink() or not root.is_dir():
+            raise WorkspaceError(f"backup directory is missing or symbolic: {root}")
+        manifest_path = root / MANIFEST
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise WorkspaceError("backup manifest is missing or symbolic")
+        manifest = read_json(manifest_path); _validate_manifest(manifest); validation["manifest"] = "passed"
+        listed_paths = [item["path"] for item in manifest["entries"]]
+        if len(listed_paths) != len(set(listed_paths)):
+            raise WorkspaceError("backup manifest contains duplicate paths")
+        actual_paths = set()
+        for item in manifest["entries"]:
+            path = _safe(root, item["path"]); actual_paths.add(item["path"])
+            if not path.is_file() or path.stat().st_size != item["size"] or _digest(path) != item["sha256"]:
+                validation["digests"] = "failed"
+                raise WorkspaceError(f"backup entry is missing or corrupt: {item['path']}")
+        payload_nodes = list((root / "payload").rglob("*"))
+        if any(path.is_symlink() for path in payload_nodes):
+            raise WorkspaceError("backup payload contains a symbolic link")
+        on_disk = {path.relative_to(root).as_posix() for path in payload_nodes if path.is_file()}
+        if on_disk != actual_paths:
+            validation["digests"] = "failed"
+            raise WorkspaceError("backup contains unlisted or missing payload files")
+        validation["digests"] = "passed"
+        entries_by_path = {item["path"]: item for item in manifest["entries"]}
+        covered_paths = set()
+        for name, authority in manifest["authorities"].items():
+            if "entry_paths" in authority:
+                if any(path not in entries_by_path for path in authority["entry_paths"]):
+                    raise WorkspaceError(f"{name} authority references a missing backup entry")
+                selected = [entries_by_path[path] for path in authority["entry_paths"]]
+            else:
+                selected = [item for item in manifest["entries"] if (
+                item["path"].startswith("payload/operation-receipts/") if name == "operation_receipts" else
+                item["path"].startswith(f"payload/{STORE_PREFIXES[name]}/") if name != "sources" else
+                item["path"].startswith("payload/objects/") or item["path"].startswith("payload/commits/") or item["path"] == "payload/current.json")]
+            if _root_digest(selected) != authority["root_sha256"]:
+                raise WorkspaceError(f"{name} authority root digest mismatch")
+            covered_paths.update(item["path"] for item in selected)
+        if covered_paths != actual_paths:
+            raise WorkspaceError("backup contains entries outside declared authorities")
+        _deep_validate_payload(root, manifest); validation["associations"] = "passed"
+        return response(status="completed", result={"backup": str(root), "commit_id": manifest["commit_id"],
+            "workspace_id": manifest["workspace_id"], "entries": len(manifest["entries"])}, validation=validation,
+            provenance={"tool_version": manifest["tool_version"]})
+    except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+        return response(status="failed", result={"backup": str(root)}, validation=validation, diagnostics=[str(exc)])
+
+
+def restore_backup(root: Path, config: WorkspaceConfig) -> dict[str, Any]:
+    checked = verify_backup(root)
+    if checked["status"] != "completed":
+        return response(status="failed", workspace=str(config.config_path), validation=checked["validation"],
+                        diagnostics=checked["diagnostics"])
+    if config.schema_version != PORTABLE_SCHEMA_VERSION or config.results is None:
+        return response(status="unsupported", workspace=str(config.config_path), diagnostics=["restore requires workspace schema v2"])
+    target = config.results.resolve(strict=False)
+    if target.exists():
+        return response(status="awaiting_user", workspace=str(config.config_path),
+                        validation={"target": "conflict"}, diagnostics=[f"restore target already exists: {target}"],
+                        next_action={"type": "user", "reason": "choose an empty isolated results root; existing data was preserved"})
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.restore-", dir=target.parent))
+    try:
+        manifest = read_json(root / MANIFEST)
+        _validate_manifest(manifest)
+        if manifest["commit_id"] != checked["result"]["commit_id"]:
+            raise WorkspaceError("backup generation changed after verification")
+        payload = stage / "payload"
+        payload.mkdir()
+        for item in manifest["entries"]:
+            source = _safe(root, item["path"])
+            destination = _safe(stage, item["path"])
+            destination.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(source, destination)
+        atomic_write_json(stage / MANIFEST, manifest)
+        copied = verify_backup(stage)
+        if copied["status"] != "completed":
+            raise WorkspaceError("copied backup failed verification: " + "; ".join(copied["diagnostics"]))
+        atomic_write_json(payload / "recovery-state.json", {"schema_version": 1,
+            "backup_commit_id": manifest["commit_id"], "restored_at": _now(),
+            "delivery": "paused", "external_operations": "paused", "unique_host_verified": False})
+        source_authority = manifest["authorities"]["sources"]
+        source = (read_json(payload / "commits" / f"{source_authority['commit_id']}.json")
+                  if source_authority["commit_id"] else {"sources": {}})
+        if os.environ.get("VIDEO_EXTRACT_BACKUP_TEST_FAULT") == "restore_before_publish":
+            raise OSError("injected restore interruption before publish")
+        os.replace(payload, target)
+        descriptor = os.open(target.parent, os.O_RDONLY)
+        try: os.fsync(descriptor)
+        finally: os.close(descriptor)
+        missing = []
+        for source_id, package in source.get("sources", {}).items():
+            version = package["versions"][package["current_version"]]
+            if version.get("storage") == "reference": missing.append({"source_id": source_id,
+                "source_version": version["source_version"], "availability": "missing_external_source"})
+        return response(status="completed", workspace=str(config.config_path), operation_id="operation-" + str(uuid.uuid4()),
+            result={"results": str(target), "backup_commit_id": manifest["commit_id"],
+                    "source_availability": missing, "delivery": "paused", "external_operations": "paused"},
+            validation={"backup": "passed", "authorities": "passed", "target": "new_isolated_root"},
+            next_action={"type": "user", "reason": "verify a unique delivery host before enabling reminders or external operations"})
+    except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+        return response(status="recoverable_failure", workspace=str(config.config_path),
+                        validation={"published": "no"}, diagnostics=[str(exc)])
+    finally:
+        if stage.exists(): shutil.rmtree(stage)

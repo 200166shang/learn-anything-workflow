@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/manifest-v5.schema.json",
+  "title": "Video Extract Media Package v5",
+  "type": "object",
+  "required": ["schema_version", "platform", "identity", "request", "artifacts"],
+  "properties": {
+    "schema_version": {"const": 5},
+    "platform": {"enum": ["youtube", "bilibili", "xiaoe", "local"]},
+    "identity": {"type": ["string", "object"]},
+    "request": {
+      "oneOf": [
+        {"type": "object", "required": ["type", "kinds", "language"], "properties": {"type": {"const": "media"}, "kinds": {"type": "array"}, "language": {"type": "string"}}},
+        {"type": "object", "required": ["type", "source_kind"], "properties": {"type": {"const": "source"}, "source_kind": {"enum": ["video", "audio", "transcript", "document"]}}}
+      ]
+    },
+    "source_kind": {"enum": ["video", "audio", "transcript", "document"]},
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "source_video": {"type": "string"},
+        "source_audio": {"type": "string"},
+        "source_subtitle": {"type": "string"},
+        "source_document": {"type": "string"},
+        "transcript_srt": {"type": "string"},
+        "approved_json": {"type": "string"},
+        "notes_input": {"type": "string"},
+        "notes": {"type": "string"},
+        "localized_audio": {"const": "media/audio.zh-CN.m4a"}
+      },
+      "additionalProperties": {"type": "string"}
+    },
+    "provenance": {"type": "object"},
+    "pause": {"type": "object"}
+  }
+}

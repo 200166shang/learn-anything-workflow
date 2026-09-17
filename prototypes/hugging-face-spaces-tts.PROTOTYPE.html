@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PROTOTYPE — Hugging Face Spaces TTS 可行性验证</title>
+  <style>
+    :root{--ink:#172019;--muted:#667068;--paper:#f5f3ed;--card:#fff;--accent:#176b4d;--bad:#a33a2b;--line:#d9ddd8}
+    *{box-sizing:border-box} body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 ui-sans-serif,system-ui,"PingFang SC",sans-serif}
+    main{max-width:960px;margin:auto;padding:42px 22px 70px} h1{font-size:30px;margin:0 0 8px} h2{font-size:18px;margin:0 0 14px}.lead{color:var(--muted);max-width:780px}.tag{display:inline-block;color:var(--bad);border:1px solid #d7aaa4;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:700}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:24px 0}.metric,.panel{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:16px}.metric b{display:block;font-size:24px}.metric span{color:var(--muted);font-size:12px}
+    .panel{margin:14px 0}.state{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.state div{border-left:3px solid var(--accent);padding-left:10px}.state small{display:block;color:var(--muted)}
+    button,a.button{border:1px solid var(--accent);background:white;color:var(--accent);padding:9px 12px;border-radius:9px;font:inherit;cursor:pointer;text-decoration:none;display:inline-block;margin:4px}.primary{background:var(--accent)!important;color:white!important}.danger{border-color:var(--bad)!important;color:var(--bad)!important}
+    .tabs{display:flex;gap:6px}.tabs button.active{background:var(--accent);color:#fff}.scenario{display:none}.scenario.active{display:block}.log{min-height:90px;background:#172019;color:#d8f3e7;border-radius:10px;padding:12px;white-space:pre-wrap;font:13px/1.45 ui-monospace,monospace}.note{color:var(--muted);font-size:13px}code{background:#eef0ed;padding:2px 5px;border-radius:5px}
+    @media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.state{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <span class="tag">THROWAWAY PROTOTYPE</span>
+  <h1>Hugging Face Spaces 能否承担免费中文 TTS？</h1>
+  <p class="lead">问题：公开 Space 是否可被程序调用、能否用参考音频生成中文，以及它是否足够快且稳定，可进入“5 分钟完成 34 分钟视频”的工作流。数据来自 2026-09-14 对公开 GPT-SoVITS Space 的真实调用。</p>
+
+  <section class="grid">
+    <div class="metric"><b>43.8 秒</b><span>API 总耗时</span></div>
+    <div class="metric"><b>7.14 秒</b><span>输出音频长度</span></div>
+    <div class="metric"><b>5.6×</b><span>生成耗时 / 音频时长</span></div>
+    <div class="metric"><b>≈3.2 小时</b><span>34 分钟串行外推</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>当前判断状态</h2>
+    <div id="state" class="state"></div>
+  </section>
+
+  <section class="panel">
+    <h2>自由验证</h2>
+    <button data-action="probe">探测公开端点</button>
+    <button data-action="generate">模拟本次真实生成</button>
+    <button data-action="scale">外推 34 分钟</button>
+    <button data-action="parallel">评估 8 路并发</button>
+    <button class="danger" data-action="fail">模拟 Space 失效</button>
+    <button data-action="reset">重置</button>
+    <a class="button" target="_blank" href="https://huggingface.co/spaces/saehesrh/GPT-SoVITS-v2">打开实测 Space</a>
+    <div id="log" class="log">等待操作…</div>
+  </section>
+
+  <section class="panel">
+    <h2>引导场景</h2>
+    <div class="tabs">
+      <button class="active" data-tab="happy">真实成功路径</button>
+      <button data-tab="deadline">五分钟目标</button>
+      <button data-tab="failure">服务失效</button>
+    </div>
+    <div id="happy" class="scenario active"><p>验证 API 存在、队列可用、中文语音确实返回。</p><button data-seq="probe,generate">执行完整路径</button></div>
+    <div id="deadline" class="scenario"><p>观察共享队列下，即使提高并发也无法保证五分钟 SLA。</p><button data-seq="generate,scale,parallel">执行容量评估</button></div>
+    <div id="failure" class="scenario"><p>验证 Space 运行错误或被关闭时，流程必须立即降级。</p><button data-seq="probe,fail">执行失效路径</button></div>
+  </section>
+
+  <section class="panel">
+    <h2>结论</h2>
+    <p><strong>可用于原型和备用，不可作为五分钟工作流的主链路。</strong>接口要求 Gradio 队列，社区实例无 SLA，另两个候选在探测时分别处于登录限制和运行错误。推荐设置 20–30 秒熔断，失败后切换到 Azure、腾讯云或其他稳定 TTS。</p>
+    <p class="note">参考音频使用 macOS 系统合成的中性中文语音，不包含现有视频人物声音。实测端点：<code>/get_tts_wav</code>；参考音频 5.0 秒；测试文本 25 个中文字符。</p>
+  </section>
+
+<script>
+const Model=(()=>{
+  const initial=()=>({phase:'未探测',endpoint:'未知',queue:'未知',output:'无',deadline:'未评估',fallback:'待命'});
+  function reduce(s,a){
+    if(a==='reset') return initial();
+    if(a==='probe') return {...s,phase:'端点可达',endpoint:'公开 /get_tts_wav',queue:'强制 Gradio 队列'};
+    if(a==='generate') return {...s,phase:'调用成功',output:'7.14 秒 WAV',queue:'39.65 秒排队+生成'};
+    if(a==='scale') return {...s,deadline:'串行约 3.2 小时，不通过'};
+    if(a==='parallel') return {...s,deadline:'理论约 24 分钟；共享队列不可保证',fallback:'必须启用'};
+    if(a==='fail') return {...s,phase:'Space 失效',endpoint:'不可用',output:'无',fallback:'立即切换稳定 TTS'};
+    return s;
+  }
+  return {initial,reduce};
+})();
+let state=Model.initial();
+const labels={phase:'阶段',endpoint:'端点',queue:'队列',output:'输出',deadline:'五分钟目标',fallback:'降级策略'};
+const messages={probe:'HTTP/API 元数据探测成功；普通 POST 被拒绝，必须加入队列。',generate:'真实测量：连接 4.13 秒，队列与生成 39.65 秒，总计 43.78 秒。',scale:'按本次实时系数 5.56× 外推，34 分钟音频串行约需 189 分钟。',parallel:'8 路理想并发约 24 分钟；公开共享队列无法保证实际并发。',fail:'候选 Space 可能处于 RUNTIME_ERROR、要求登录或被作者关闭。',reset:'状态已重置。'};
+function render(msg){document.querySelector('#state').innerHTML=Object.entries(state).map(([k,v])=>`<div><small>${labels[k]}</small><strong>${v}</strong></div>`).join('');document.querySelector('#log').textContent=msg||'等待操作…'}
+function act(a){state=Model.reduce(state,a);render(messages[a])}
+document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>act(b.dataset.action));
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.scenario').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelector('#'+b.dataset.tab).classList.add('active');state=Model.initial();render('场景已重置。')});
+document.querySelectorAll('[data-seq]').forEach(b=>b.onclick=()=>{state=Model.initial();const steps=b.dataset.seq.split(',');steps.forEach(a=>state=Model.reduce(state,a));render(steps.map(a=>messages[a]).join('\n'))});
+render();
+</script>
+</main></body></html>

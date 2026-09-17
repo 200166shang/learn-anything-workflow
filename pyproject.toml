@@ -1,0 +1,79 @@
+[project]
+name = "video-extract"
+version = "0.2.0"
+description = "Deterministic acquisition, evidence preparation, and validation for authorized video learning"
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "playwright>=1.40.0",
+    "yt-dlp>=2025.1.15",
+    "httpx[socks]>=0.27.0",
+    "pillow>=10.0",
+    "jsonschema>=4.23",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["video_extract"]
+include = [
+    "video_extract/**/*.py",
+    "batch_process.py",
+    "bilibili_collection.py",
+    "bilibili_source.py",
+    "convert_voice_to_article.py",
+    "download_youtube.py",
+    "output_paths.py",
+    "prefetch_bilibili.py",
+    "prepare_bilibili_learning_package.py",
+    "prepare_learning_package.py",
+    "scan_course.py",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"batch_process.py" = "batch_process.py"
+"bilibili_collection.py" = "bilibili_collection.py"
+"bilibili_source.py" = "bilibili_source.py"
+"convert_voice_to_article.py" = "convert_voice_to_article.py"
+"download_youtube.py" = "download_youtube.py"
+"output_paths.py" = "output_paths.py"
+"prefetch_bilibili.py" = "prefetch_bilibili.py"
+"prepare_bilibili_learning_package.py" = "prepare_bilibili_learning_package.py"
+"prepare_learning_package.py" = "prepare_learning_package.py"
+"scan_course.py" = "scan_course.py"
+"schemas/manifest-v3.schema.json" = "schemas/manifest-v3.schema.json"
+"schemas/manifest-v4.schema.json" = "schemas/manifest-v4.schema.json"
+"schemas/manifest-v5.schema.json" = "schemas/manifest-v5.schema.json"
+"schemas/workspace-v2.schema.json" = "schemas/workspace-v2.schema.json"
+"schemas/source-package-v6.schema.json" = "schemas/source-package-v6.schema.json"
+"schemas/snapshot-v1.schema.json" = "schemas/snapshot-v1.schema.json"
+"schemas/current-pointer-v1.schema.json" = "schemas/current-pointer-v1.schema.json"
+"schemas/learning-record-v2.schema.json" = "schemas/learning-record-v2.schema.json"
+"schemas/learning-snapshot-v2.schema.json" = "schemas/learning-snapshot-v2.schema.json"
+"schemas/practice-snapshot-v1.schema.json" = "schemas/practice-snapshot-v1.schema.json"
+"schemas/practice-event-v1.schema.json" = "schemas/practice-event-v1.schema.json"
+"schemas/learning-candidate-v2.schema.json" = "schemas/learning-candidate-v2.schema.json"
+"schemas/learning-view-generation-v1.schema.json" = "schemas/learning-view-generation-v1.schema.json"
+"schemas/learning-view-generation-v2.schema.json" = "schemas/learning-view-generation-v2.schema.json"
+"schemas/review-record-v1.schema.json" = "schemas/review-record-v1.schema.json"
+"schemas/review-snapshot-v1.schema.json" = "schemas/review-snapshot-v1.schema.json"
+"schemas/review-current-pointer-v1.schema.json" = "schemas/review-current-pointer-v1.schema.json"
+"schemas/card-record-v1.schema.json" = "schemas/card-record-v1.schema.json"
+"schemas/notes-snapshot-v1.schema.json" = "schemas/notes-snapshot-v1.schema.json"
+"schemas/media-acquire-request-v1.schema.json" = "schemas/media-acquire-request-v1.schema.json"
+"schemas/mandarin-audio-request-v1.schema.json" = "schemas/mandarin-audio-request-v1.schema.json"
+"schemas/netease-publish-request-v1.schema.json" = "schemas/netease-publish-request-v1.schema.json"
+"schemas/backup-manifest-v1.schema.json" = "schemas/backup-manifest-v1.schema.json"
+"schemas/delivery-operation-v1.schema.json" = "schemas/delivery-operation-v1.schema.json"
+"integrations/skills" = "integrations/skills"
+"integrations/obsidian-learning-map" = "integrations/obsidian-learning-map"
+".codex/agents" = ".codex/agents"
+
+[project.scripts]
+video-extract = "video_extract.cli:main"

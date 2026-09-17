@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "media-acquire-request-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "workspace", "source_id", "source_version", "scope", "media", "language", "quality"],
+  "properties": {
+    "contract_version": {"const": 1},
+    "workspace": {"type": "string", "minLength": 1},
+    "source_id": {"type": "string", "minLength": 1},
+    "source_version": {"type": "string", "minLength": 1},
+    "scope": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "media": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["video", "audio", "subtitles"]}},
+    "language": {"type": "string", "minLength": 1},
+    "quality": {"enum": ["standard", "balanced", "high"]},
+    "authorization_ref": {"type": "string", "minLength": 1, "maxLength": 256}
+  }
+}

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PROTOTYPE — pyVideoTrans 30分钟网络配音验证</title>
+  <style>
+    :root{--bg:#f5f2ea;--paper:#fff;--ink:#18211d;--muted:#68716c;--green:#17654b;--red:#a13b30;--line:#d9ddd8}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,"PingFang SC",sans-serif}main{max-width:960px;margin:auto;padding:42px 22px 70px}h1{font-size:29px;margin:7px 0}.lead{color:var(--muted);max-width:780px}.tag{display:inline-block;border:1px solid #d5aaa4;color:var(--red);border-radius:99px;padding:3px 9px;font-size:12px;font-weight:700}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0}.card,.panel{background:var(--paper);border:1px solid var(--line);border-radius:13px;padding:16px}.card b{display:block;font-size:23px}.card small,.note{color:var(--muted)}.panel{margin:14px 0}.state{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.state div{border-left:3px solid var(--green);padding-left:10px}.state small{display:block;color:var(--muted)}button{font:inherit;border:1px solid var(--green);color:var(--green);background:white;border-radius:8px;padding:8px 11px;margin:4px;cursor:pointer}.danger{border-color:var(--red);color:var(--red)}.tabs button.active{background:var(--green);color:#fff}.scenario{display:none}.scenario.active{display:block}.log{white-space:pre-wrap;background:#19211e;color:#d8f1e6;border-radius:9px;padding:12px;min-height:90px;font:13px/1.5 ui-monospace,monospace}.verdict{border-left:5px solid var(--red)}code{background:#edf0ec;border-radius:4px;padding:2px 5px}@media(max-width:720px){.grid{grid-template-columns:1fr 1fr}.state{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <span class="tag">THROWAWAY PROTOTYPE</span>
+  <h1>pyVideoTrans 能否直接承担30分钟网络音色克隆？</h1>
+  <p class="lead">验证问题：不本地运行语音模型，仅使用免费网络服务，把现有33分52秒英文音频转换为音色相似的中文音频。素材、既有耗时、最新版源码依赖与 Provider 注册表均已实际检查。</p>
+  <div class="grid">
+    <div class="card"><b>33:52</b><small>真实输入时长</small></div>
+    <div class="card"><b>996 秒</b><small>既有本地 ASR 耗时</small></div>
+    <div class="card"><b>0 个</b><small>内置“云端＋克隆”Provider</small></div>
+    <div class="card"><b>不通过</b><small>当前选型结论</small></div>
+  </div>
+  <section class="panel"><h2>当前状态</h2><div id="state" class="state"></div></section>
+  <section class="panel"><h2>自由验证</h2>
+    <button data-action="source">载入真实素材</button><button data-action="install">验证安装</button><button data-action="providers">检查网络渠道</button><button data-action="clone">检查音色克隆</button><button class="danger" data-action="decide">作出结论</button><button data-action="reset">重置</button>
+    <div id="log" class="log">等待操作…</div>
+  </section>
+  <section class="panel"><h2>引导场景</h2><div class="tabs"><button class="active" data-tab="required">目标场景</button><button data-tab="preset">固定音色</button><button data-tab="local">本地克隆</button></div>
+    <div id="required" class="scenario active"><p>网络运行、免费优先、保持原音色。</p><button data-seq="source,install,providers,clone,decide">执行验收</button></div>
+    <div id="preset" class="scenario"><p>放弃原音色后，Edge-TTS 免费网络链路成立。</p><button data-seq="source,providers">检查可行路径</button></div>
+    <div id="local" class="scenario"><p>允许本地模型后，CosyVoice/F5/Qwen3-TTS 可以克隆，但违背速度要求。</p><button data-seq="source,clone">检查替代路径</button></div>
+  </section>
+  <section class="panel verdict"><h2>验证结论</h2>
+    <p><strong>不建议把 pyVideoTrans 原样作为当前 Skill 引擎。</strong>它能完成整体流程，但最新版在 Apple Silicon 源码安装时因 <code>pynini</code> 缺少 OpenFST 头文件失败；更关键的是，项目的音色克隆 Provider 全部是本地内置或本地 API。免费网络渠道 Edge-TTS/gTTS 只提供固定音色。</p>
+    <p class="note">真实素材：<code>output/jwChiek_aRY/source/source.m4a</code>；时长 2032.141 秒；英文 SRT 已存在。验证提交：pyVideoTrans v4.12，commit 3eb3b2f。提前终止全量生成是因为核心能力已被源码证伪。</p>
+  </section>
+<script>
+const Model=(()=>{const initial=()=>({素材:'未检查',安装:'未检查',网络转写翻译:'未检查',网络配音:'未检查',相似音色:'未检查',结论:'待定'});function reduce(s,a){if(a==='reset')return initial();if(a==='source')return{...s,素材:'33:52英文音频＋现成SRT',网络转写翻译:'可跳过既有慢ASR'};if(a==='install')return{...s,安装:'macOS ARM失败：pynini/OpenFST'};if(a==='providers')return{...s,网络转写翻译:'支持多种云API',网络配音:'Edge-TTS/gTTS免费'};if(a==='clone')return{...s,相似音色:'仅本地模型/本地API支持'};if(a==='decide')return{...s,结论:'不符合网络免费音色克隆要求'};return s}return{initial,reduce}})();
+let state=Model.initial();const msg={source:'读取真实清单：2032.141秒，英文，已有SRT；此前本地ASR耗时996.09秒。',install:'最新版隔离安装失败：pynini 2.1.6 在Apple Silicon编译找不到 fst/util.h；默认依赖集还包含大量本地模型与GUI包。',providers:'云端ASR/翻译可配置；免费网络TTS为Edge-TTS和gTTS，只提供预设音色。',clone:'源码SUPPORT_CLONE只列本地内置/本地API：Qwen3Local、F5、CosyVoice、GPT-SoVITS、VoxCPM等；云端Provider均未列入。',decide:'验收不通过：项目可做流程外壳，但不能原样满足“免费网络＋相似音色”。',reset:'已重置。'};
+function render(m){document.querySelector('#state').innerHTML=Object.entries(state).map(([k,v])=>`<div><small>${k}</small><strong>${v}</strong></div>`).join('');document.querySelector('#log').textContent=m||'等待操作…'}function act(a){state=Model.reduce(state,a);render(msg[a])}document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>act(b.dataset.action));document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.scenario').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelector('#'+b.dataset.tab).classList.add('active');state=Model.initial();render('场景已重置。')});document.querySelectorAll('[data-seq]').forEach(b=>b.onclick=()=>{state=Model.initial();const xs=b.dataset.seq.split(',');xs.forEach(a=>state=Model.reduce(state,a));render(xs.map(a=>msg[a]).join('\n'))});render();
+</script></main></body></html>
