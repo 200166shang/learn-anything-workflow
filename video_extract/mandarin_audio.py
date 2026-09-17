@@ -233,14 +233,44 @@ def _public(config: WorkspaceConfig, record: dict[str, Any], reuse: str | None =
 
 def _receipt(config: WorkspaceConfig, record: dict[str, Any]) -> None:
     assert config.results is not None
-    intent = {key: value for key, value in record["intent"].items() if key != "requires_authorization"}
+    projection = _receipt_projection(record)
+    projection["projection_digest"] = _projection_digest(projection)
     atomic_write_json(config.results / "operation-receipts" / f'{record["operation_id"]}.json', {
-        "schema_version": 1, "operation_id": record["operation_id"], "status": record["status"],
-        "authoritative_revision": record.get("commit", {}).get("revision"),
-        "authoritative_digest": record.get("commit", {}).get("digest"),
-        "intent": intent, "artifact_facts": record.get("artifact_facts", {}),
+        **projection,
         "attempts": record.get("attempts", []), "reconciliation": record.get("reconciliation", []),
     })
+
+
+def _receipt_projection(record: dict[str, Any]) -> dict[str, Any]:
+    intent = record.get("intent", {})
+    normalized_intent = {key: intent[key] for key in (
+        "capability_id", "capability_contract_version", "package", "package_identity", "source_id",
+        "source_version", "source_sha256", "effective_parameters", "adapter_identity",
+        "authorization_category", "authorization_ref", "adopted_operation_id",
+    ) if key in intent}
+    provenance = record.get("provenance", {})
+    normalized_provenance = {key: provenance[key] for key in (
+        "capability_id", "capability_contract_version", "source_id", "source_version", "mode",
+        "adopted_operation_id",
+    ) if key in provenance}
+    facts = record.get("artifact_facts", {})
+    normalized_facts = {key: facts[key] for key in ("source", "output", "source_transcript") if key in facts}
+    return {
+        "schema_version": 1, "operation_id": record.get("operation_id"), "status": record.get("status"),
+        "authoritative_revision": record.get("commit", {}).get("revision"),
+        "authoritative_digest": record.get("commit", {}).get("digest"),
+        "intent": normalized_intent, "provenance": normalized_provenance,
+        "artifact_facts": normalized_facts,
+    }
+
+
+def _projection_digest(projection: dict[str, Any]) -> str:
+    value = {key: projection[key] for key in (
+        "schema_version", "operation_id", "status", "authoritative_revision", "authoritative_digest",
+        "intent", "provenance", "artifact_facts",
+    )}
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _complete_authority(path: Path, record: dict[str, Any]) -> None:
@@ -303,10 +333,12 @@ def _prior_authority(config: WorkspaceConfig, prior: dict[str, Any]) -> tuple[bo
         return False, "prior authoritative receipt is missing"
     try: receipt = read_json(receipt_path)
     except (OSError, json.JSONDecodeError): return False, "prior authoritative receipt is invalid"
-    if (receipt.get("status") != "completed"
-            or receipt.get("authoritative_revision") != commit["revision"]
-            or receipt.get("authoritative_digest") != commit["digest"]):
+    expected = _receipt_projection(prior)
+    observed = {key: receipt.get(key) for key in expected}
+    if observed != expected:
         return False, "prior receipt does not match the authoritative commit"
+    if receipt.get("projection_digest") != _projection_digest(expected):
+        return False, "prior receipt projection digest is invalid"
     return True, "verified authoritative operation and receipt"
 
 

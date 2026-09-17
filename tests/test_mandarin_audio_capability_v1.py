@@ -427,9 +427,17 @@ def test_new_source_version_requires_explicit_safe_adoption_and_never_repays(tmp
     adopted_code, adopted = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
     assert adopted_code == 0 and adopted["status"] == "completed" and len(adapter.calls) == 1
     assert adopted["provenance"]["adopted_operation_id"] == first["operation_id"]
+    adopted_receipt = json.loads((tmp_path / "results/operation-receipts" / f'{adopted["operation_id"]}.json').read_text())
+    assert adopted_receipt["intent"]["adopted_operation_id"] == first["operation_id"]
+    assert adopted_receipt["provenance"]["adopted_operation_id"] == first["operation_id"]
+    assert len(adopted_receipt["projection_digest"]) == 64
 
 
-@pytest.mark.parametrize("damage", ["commit_digest", "receipt_missing", "receipt_digest"])
+@pytest.mark.parametrize("damage", [
+    "commit_digest", "receipt_missing", "receipt_digest", "receipt_operation_id",
+    "receipt_intent_adapter", "receipt_output_size", "receipt_transcript_sha",
+    "receipt_provenance", "receipt_projection_digest",
+])
 def test_adoption_rejects_untrustworthy_prior_authority_or_receipt(tmp_path, capsys, damage):
     _, package, request = fixture(tmp_path, "en")
     adapter = FakePaidAdapter(); register_mandarin_adapter("authority-adopt", adapter)
@@ -443,8 +451,17 @@ def test_adoption_rejects_untrustworthy_prior_authority_or_receipt(tmp_path, cap
         operation_path.write_text(json.dumps(operation))
     elif damage == "receipt_missing":
         receipt_path.unlink()
-    else:
+    elif damage == "receipt_digest":
         receipt = json.loads(receipt_path.read_text()); receipt["authoritative_digest"] = "f" * 64
+        receipt_path.write_text(json.dumps(receipt))
+    else:
+        receipt = json.loads(receipt_path.read_text())
+        if damage == "receipt_operation_id": receipt["operation_id"] = "operation-" + "0" * 24
+        elif damage == "receipt_intent_adapter": receipt["intent"]["adapter_identity"] = "tampered/adapter"
+        elif damage == "receipt_output_size": receipt["artifact_facts"]["output"]["size"] += 1
+        elif damage == "receipt_transcript_sha": receipt["artifact_facts"]["source_transcript"]["sha256"] = "0" * 64
+        elif damage == "receipt_provenance": receipt["provenance"]["mode"] = "native"
+        else: receipt["projection_digest"] = "0" * 64
         receipt_path.write_text(json.dumps(receipt))
 
     (package / "media/transcript.txt").write_text("A new registered version needs new verification.")
