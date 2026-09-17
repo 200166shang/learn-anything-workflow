@@ -51,7 +51,7 @@ The focused acceptance fixtures cover:
 - rollback preservation of new course files, linked Learn state and receipts
   with no replay;
 - transactional install rollback, preservation of hand-edited old Skills,
-  old-entry reintroduction detection, and optional Obsidian plugin publication;
+  old-entry reintroduction detection, and required Obsidian plugin publication;
 - hidden/rejected legacy commands and exclusion of isolated roots from normal
   discovery.
 
