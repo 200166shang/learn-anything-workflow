@@ -89,6 +89,13 @@ CAPABILITIES: dict[str, Capability] = {
         authorization_category="local_workspace",
         recovery_query="capability run learning.cards with the same candidate or card identity",
     ),
+    "learning.suggestions": Capability(
+        id="learning.suggestions", contract_version=1, implementation_version=1,
+        implementation="video_extract.suggestions:run_suggestions",
+        input_type="suggestions-request-v1", output_type="command-response-v1",
+        side_effect="read_only", dependencies=(), authorization_category="local_workspace_read",
+        recovery_query="capability run learning.suggestions with the same date",
+    ),
     "learning.practice": Capability(
         id="learning.practice", contract_version=1, implementation_version=1,
         implementation="video_extract.practice:run_practice", input_type="practice-request-v1",

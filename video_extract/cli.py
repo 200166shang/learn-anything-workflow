@@ -371,6 +371,18 @@ def cmd_card(args: argparse.Namespace) -> int:
     emit(result, args.json); return exit_code(result)
 
 
+def cmd_suggestions(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .suggestions import today
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        result = today(workspace, args.on_date)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
 def cmd_practice(args: argparse.Namespace) -> int:
     from .command_response import exit_code, response
     from .package_lock import PackageBusyError
@@ -834,6 +846,12 @@ def parser() -> argparse.ArgumentParser:
     card_revise = card_actions.add_parser("revise"); card_revise.add_argument("--card-id", required=True); card_revise.add_argument("--change-type", choices=("wording", "material"), required=True); card_revise.add_argument("--prompt"); card_revise.add_argument("--answer"); card_revise.add_argument("--conditions"); card_revise.add_argument("--effective-date", required=True); card_revise.add_argument("--workspace", type=Path); card_revise.add_argument("--json", action="store_true"); card_revise.set_defaults(func=cmd_card)
     card_schedule = card_actions.add_parser("schedule"); card_identity = card_schedule.add_mutually_exclusive_group(required=True); card_identity.add_argument("--card-id"); card_identity.add_argument("--card-version-id"); card_schedule.add_argument("--on-date"); card_schedule.add_argument("--workspace", type=Path); card_schedule.add_argument("--json", action="store_true"); card_schedule.set_defaults(func=cmd_card)
     card_show = card_actions.add_parser("show"); card_show.add_argument("--card-id"); card_show.add_argument("--workspace", type=Path); card_show.add_argument("--json", action="store_true"); card_show.set_defaults(func=cmd_card)
+    suggestions = commands.add_parser("suggestions", help="derive deterministic short Review suggestions from saved facts")
+    suggestion_actions = suggestions.add_subparsers(dest="suggestions_action", required=True)
+    suggestions_today = suggestion_actions.add_parser("today")
+    suggestions_today.add_argument("--on-date", help="Asia/Shanghai date (YYYY-MM-DD)")
+    suggestions_today.add_argument("--workspace", type=Path); suggestions_today.add_argument("--json", action="store_true")
+    suggestions_today.set_defaults(func=cmd_suggestions)
     review = commands.add_parser("review", help="prepare active recall before revealing and record independent Review facts")
     review_actions = review.add_subparsers(dest="review_action", required=True)
     review_prepare = review_actions.add_parser("prepare"); review_target = review_prepare.add_mutually_exclusive_group(required=True); review_target.add_argument("--question-id"); review_target.add_argument("--card-version-id"); review_prepare.add_argument("--preparation-id", help="stable retry identity beginning review-preparation-"); review_prepare.add_argument("--workspace", type=Path); review_prepare.add_argument("--json", action="store_true"); review_prepare.set_defaults(func=cmd_review)
