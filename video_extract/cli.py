@@ -105,9 +105,37 @@ def cmd_ensure(args: argparse.Namespace) -> int:
 
 
 def cmd_source(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
     from .source_import import import_source
-    result = import_source(args.input, discover_workspace(args.workspace), args.package, args.title)
+    from .source_registry import reconcile, register, relocate, verify
+    from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    if args.source_action != "import" and workspace.schema_version != PORTABLE_SCHEMA_VERSION:
+        result = response(status="unsupported", workspace=str(workspace.config_path),
+                          validation={"workspace_schema": "failed"},
+                          diagnostics=["source v6 requires workspace schema v2; old formats are not read in normal runtime"],
+                          next_action={"command": "video-extract migration plan"})
+        emit(result, args.json); return exit_code(result)
+    try:
+        if args.source_action == "register":
+            result = register(workspace, args.input, args.title, args.expected_revision, args.source_id)
+        elif args.source_action == "verify":
+            result = verify(workspace, args.source_id, args.source_version)
+        elif args.source_action == "relocate":
+            result = relocate(workspace, args.source_id, args.location, args.expected_revision)
+        elif args.source_action == "reconcile":
+            result = reconcile(workspace, args.source_id, args.source_version)
+        elif args.source_action == "import" and workspace.schema_version == PORTABLE_SCHEMA_VERSION:
+            result = register(workspace, args.input, args.title, getattr(args, "expected_revision", None),
+                              getattr(args, "source_id", None))
+        else:
+            result = import_source(args.input, workspace, args.package, args.title)
+    except (OSError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path),
+                          validation={"request": "failed"}, diagnostics=[str(exc)])
     emit(result, args.json)
+    if args.source_action != "import" or workspace.schema_version == PORTABLE_SCHEMA_VERSION:
+        return exit_code(result)
     return 0 if result.get("status") == "ready" else 1
 
 
@@ -336,30 +364,56 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                           next_action={"type": "user", "reason": "add workspace_id to workspace.toml; do not change it when moving the workspace"})
         emit(result, args.json)
         return exit_code(result)
-    if args.workspace_action == "show": result = config.as_dict()
+    if args.workspace_action == "show":
+        if config.schema_version == 2:
+            from .command_response import response
+            result = response(status="completed", workspace=str(config.config_path), result=config.as_dict(),
+                              validation={"workspace_schema": "passed"},
+                              provenance={"workspace_config": str(config.config_path)})
+        else:
+            result = config.as_dict()
     elif args.workspace_action == "doctor":
-        from .capabilities import check_capabilities
-        from .installation import inspect
-        doctor_result = workspace_doctor(config)
-        capabilities = check_capabilities()
-        installation = inspect(args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve())
-        doctor_result["capabilities"] = capabilities
-        doctor_result["installation"] = installation
-        ok = doctor_result["ok"] and capabilities["status"] == "completed" and installation["status"] == "completed"
-        result = response(status="completed" if ok else "recoverable_failure",
-                          workspace=str(config.config_path), result=doctor_result,
-                          validation={"workspace": doctor_result["ok"],
-                                      "capabilities": capabilities["status"] == "completed",
-                                      "installation": installation["status"] == "completed"},
-                          provenance={"workspace_config": str(config.config_path)},
-                          next_action=None if ok else {"command": "video-extract install plan --json"},
-                          diagnostics=[] if ok else ["workspace, capability, or installation diagnostics require attention"])
+        if config.schema_version == 2:
+            from .source_registry import audit
+            try:
+                store = audit(config)
+                result = response(status="completed", workspace=str(config.config_path),
+                                  result={"workspace": config.as_dict(), "snapshot": store},
+                                  validation={"workspace_schema": "passed", "snapshot": "passed",
+                                              "objects": "passed"},
+                                  provenance={"workspace_config": str(config.config_path),
+                                              "commit_id": store["commit_id"]})
+            except (OSError, ValueError, WorkspaceError) as exc:
+                result = response(status="recoverable_failure", workspace=str(config.config_path),
+                                  result={"workspace": config.as_dict()},
+                                  validation={"workspace_schema": "passed", "snapshot": "failed",
+                                              "objects": "not_checked"},
+                                  provenance={"workspace_config": str(config.config_path)},
+                                  diagnostics=[str(exc)],
+                                  next_action={"command": "video-extract workspace doctor --json"})
+        else:
+            from .capabilities import check_capabilities
+            from .installation import inspect
+            doctor_result = workspace_doctor(config)
+            capabilities = check_capabilities()
+            installation = inspect(args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve())
+            doctor_result["capabilities"] = capabilities
+            doctor_result["installation"] = installation
+            ok = doctor_result["ok"] and capabilities["status"] == "completed" and installation["status"] == "completed"
+            result = response(status="completed" if ok else "recoverable_failure",
+                              workspace=str(config.config_path), result=doctor_result,
+                              validation={"workspace": doctor_result["ok"],
+                                          "capabilities": capabilities["status"] == "completed",
+                                          "installation": installation["status"] == "completed"},
+                              provenance={"workspace_config": str(config.config_path)},
+                              next_action=None if ok else {"command": "video-extract install plan --json"},
+                              diagnostics=[] if ok else ["workspace, capability, or installation diagnostics require attention"])
     elif args.workspace_action == "rebuild": result = workspace_rebuild(config, args.apply)
     else: result = prepare_migration(config, args.full_hash)
     emit(result, args.json)
     if args.workspace_action == "doctor":
         return exit_code(result)
-    return 0 if result.get("ok", False) else 1
+    return 0 if result.get("ok", False) or result.get("status") == "completed" else 1
 
 
 def parser() -> argparse.ArgumentParser:
@@ -418,7 +472,24 @@ def parser() -> argparse.ArgumentParser:
     ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
     source = commands.add_parser("source", help="import local source material into a managed package")
     source_actions = source.add_subparsers(dest="source_action", required=True)
-    source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
+    source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--source-id"); source_import.add_argument("--expected-revision", type=int); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
+    source_register = source_actions.add_parser("register", help="register a document or in-place source tree")
+    source_register.add_argument("input", type=Path); source_register.add_argument("--title"); source_register.add_argument("--source-id")
+    source_register.add_argument("--expected-revision", type=int); source_register.add_argument("--workspace", type=Path)
+    source_register.add_argument("--json", action="store_true"); source_register.set_defaults(func=cmd_source)
+    source_verify = source_actions.add_parser("verify", help="verify a registered source version")
+    source_verify.add_argument("source_id"); source_verify.add_argument("--source-version")
+    source_verify.add_argument("--workspace", type=Path); source_verify.add_argument("--json", action="store_true")
+    source_verify.set_defaults(func=cmd_source)
+    source_relocate = source_actions.add_parser("relocate", help="update a source location after content verification")
+    source_relocate.add_argument("source_id"); source_relocate.add_argument("location", type=Path)
+    source_relocate.add_argument("--expected-revision", type=int, required=True)
+    source_relocate.add_argument("--workspace", type=Path); source_relocate.add_argument("--json", action="store_true")
+    source_relocate.set_defaults(func=cmd_source)
+    source_reconcile = source_actions.add_parser("reconcile", help="complete durability checks after an uncertain publish")
+    source_reconcile.add_argument("source_id"); source_reconcile.add_argument("--source-version", required=True)
+    source_reconcile.add_argument("--workspace", type=Path); source_reconcile.add_argument("--json", action="store_true")
+    source_reconcile.set_defaults(func=cmd_source)
     notes = commands.add_parser("notes", help="prepare or finalize source-grounded notes")
     notes_actions = notes.add_subparsers(dest="notes_action", required=True)
     for action in ("prepare", "finalize"):

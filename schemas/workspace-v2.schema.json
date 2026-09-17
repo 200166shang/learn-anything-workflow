@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/workspace-v2.schema.json",
+  "title": "Portable workspace v2",
+  "type": "object",
+  "required": ["schema_version", "workspace_id", "paths"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "paths": {
+      "type": "object",
+      "required": ["project", "results", "sources", "derived", "local"],
+      "properties": {
+        "project": {"type": "string", "minLength": 1},
+        "results": {"type": "string", "minLength": 1},
+        "sources": {"type": "string", "minLength": 1},
+        "derived": {"type": "string", "minLength": 1},
+        "local": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

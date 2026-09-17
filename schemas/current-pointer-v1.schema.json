@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/current-pointer-v1.schema.json",
+  "title": "Current snapshot pointer v1",
+  "type": "object",
+  "required": ["schema_version", "commit_id", "manifest_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "commit_id": {"type": "string", "pattern": "^commit-[0-9a-f]{64}$"},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

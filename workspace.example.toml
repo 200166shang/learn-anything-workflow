@@ -1,17 +1,13 @@
-schema_version = 1
+schema_version = 2
 # Generate once, for example: python -c 'import uuid; print(uuid.uuid4())'
 workspace_id = "REPLACE_ME_WITH_UUID"
 
 [paths]
 project = "video-extract-core"
-media = "media"
-obsidian = "学习系统"
-
-[obsidian]
-generated = "资料库/网站视频转录"
-threads = "threads"
-concepts = "concepts"
-review = "REVIEW.md"
+results = "learning-results"
+sources = "source-materials"
+derived = "derived-views"
+local = ".video-extract-local"
 
 # Optional. Only mandarin-audio requires these machine-local paths.
 [tools.pyvideotrans]
