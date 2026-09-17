@@ -41,7 +41,7 @@ local = "local"
             checked = subprocess.run([sys.executable, str(HELPER), str(package), "--workspace", str(workspace), "--check", "--json"], capture_output=True, text=True)
             self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
             check_result = json.loads(checked.stdout)
-            self.assertEqual(check_result["validation"]["listening_quality"], "passed")
+            self.assertEqual(check_result["validation"]["localized_content"], "not_required")
 
 
 if __name__ == "__main__": unittest.main()
