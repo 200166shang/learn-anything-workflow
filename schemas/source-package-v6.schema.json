@@ -30,7 +30,18 @@
           "properties": {
             "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "git_commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
-            "working_tree_dirty": {"type": ["boolean", "null"]}
+            "working_tree_dirty": {"type": ["boolean", "null"]},
+            "dirty_files": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "object", "required": ["modified", "added", "deleted"],
+                 "properties": {
+                   "modified": {"type": "array", "items": {"type": "string"}},
+                   "added": {"type": "array", "items": {"type": "string"}},
+                   "deleted": {"type": "array", "items": {"type": "string"}}
+                 }, "additionalProperties": false}
+              ]
+            }
           },
           "additionalProperties": false
         },

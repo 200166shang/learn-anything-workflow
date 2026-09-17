@@ -339,7 +339,7 @@ def test_current_code_and_inference_evidence_follow_confirmed_source_role(tmp_pa
         f'# Code\n{prepared["result"]["required_marker"]}\n直觉因果机制：入口 entry 后 producer 放 queue，consumer 在线程 async 边界处理并从 output 出口返回；例子覆盖慢、满、退出 shutdown，说明条件边界。\n')
     evidence = tmp_path / "code-evidence.json"; evidence.write_text(json.dumps([
         {"source_id": source["source_id"], "source_version": source["source_version"],
-         "locator": {"kind": "symbol", "value": "pipeline.py::entry"}, "claim_type": "current_code", "claim": "actual entry"},
+         "locator": {"kind": "symbol", "value": "pipeline.py"}, "claim_type": "current_code", "claim": "actual entry"},
         {"source_id": source["source_id"], "source_version": source["source_version"],
          "locator": {"kind": "symbol", "value": "entry"}, "claim_type": "inference", "claim": "likely boundary"}]))
     review = tmp_path / "code-review.json"; review.write_text(json.dumps({
@@ -350,10 +350,15 @@ def test_current_code_and_inference_evidence_follow_confirmed_source_role(tmp_pa
                          "--evidence", evidence, "--teaching-review", review, "--profile", "frame_pipeline",
                          "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
     assert code == 1
-    assert "content_sha256" in " ".join(rejected["diagnostics"])
+    assert "file::symbol" in " ".join(rejected["diagnostics"])
     values = json.loads(evidence.read_text())
+    values[0]["locator"]["value"] = "pipeline.py::entry"
     values[0]["locator"]["content_sha256"] = __import__("hashlib").sha256(
         (code_root / "pipeline.py").read_bytes()).hexdigest()
+    values.insert(1, {"source_id": source["source_id"], "source_version": source["source_version"],
+                      "locator": {"kind": "line_range", "value": "pipeline.py:1-1",
+                                  "content_sha256": values[0]["locator"]["content_sha256"]},
+                      "claim_type": "current_code", "claim": "actual implementation line"})
     evidence.write_text(json.dumps(values))
     code, committed = cli("explanation", "commit", "--question-id", question_id, "--draft", draft,
                           "--evidence", evidence, "--teaching-review", review, "--profile", "frame_pipeline",
@@ -367,6 +372,13 @@ def test_current_code_and_inference_evidence_follow_confirmed_source_role(tmp_pa
     code_check = next(item for item in located["result"]["source_checks"] if item["claim_type"] == "current_code")
     assert code_check["status"] == "current"
     assert located["result"]["explanation_state"] == "needs_review"  # inference still needs human review
+
+    import shutil
+    shutil.rmtree(code_root)
+    _, missing = cli("learning", "locate", question_id, "--workspace", config, "--json")
+    code_check = next(item for item in missing["result"]["source_checks"] if item["claim_type"] == "current_code")
+    assert code_check["availability"] == "missing"
+    assert code_check["status"] == "needs_review"
 
 
 def test_explicit_supplemental_source_role_allows_supplemental_evidence(tmp_path: Path) -> None:

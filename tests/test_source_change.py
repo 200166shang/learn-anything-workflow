@@ -112,8 +112,9 @@ def test_changed_key_evidence_preserves_old_explanation_location_but_pauses_that
     code, blocked = cli("explanation", "prepare", "--question-id", question_id,
                         "--profile", "linear_transform", "--workspace", config, "--json")
     assert code == 3
-    assert blocked["status"] == "missing_input"
-    assert "historical" in " ".join(blocked["result"]["blocked_source_errors"])
+    assert blocked["status"] == "awaiting_user"
+    assert blocked["result"]["explanation_state"] == "needs_review"
+    assert blocked["result"]["locations"][0]["document_path"] == old_path
 
 
 def test_code_version_change_reports_only_changed_inventory_entries(tmp_path: Path) -> None:

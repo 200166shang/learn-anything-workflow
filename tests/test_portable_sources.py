@@ -205,10 +205,13 @@ def test_register_code_directory_records_git_and_dirty_content(tmp_path: Path) -
     subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
     subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
     (repo / "main.py").write_text("answer = 1\n", encoding="utf-8")
-    subprocess.run(["git", "-C", repo, "add", "main.py"], check=True)
+    (repo / "removed.py").write_text("remove = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repo, "add", "main.py", "removed.py"], check=True)
     subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
     commit = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
     (repo / "main.py").write_text("answer = 2\n", encoding="utf-8")
+    (repo / "added.py").write_text("added = True\n", encoding="utf-8")
+    (repo / "removed.py").unlink()
 
     code, result = cli("source", "register", repo, "--workspace", config, "--json")
 
@@ -218,7 +221,11 @@ def test_register_code_directory_records_git_and_dirty_content(tmp_path: Path) -
     assert basis["git_commit"] == commit
     assert basis["working_tree_dirty"] is True
     assert basis["content_sha256"]
+    assert basis["dirty_files"] == {"modified": ["main.py"], "added": ["added.py"], "deleted": ["removed.py"]}
     assert result["result"]["storage"] == "reference"
+    _, verified = cli("source", "verify", result["result"]["source_id"],
+                      "--workspace", config, "--json")
+    assert verified["result"]["observed_version_basis"] == basis
 
 
 def test_relocate_finds_same_version_and_does_not_accept_different_content(tmp_path: Path) -> None:
@@ -513,6 +520,36 @@ def test_pre_publish_retry_replays_source_id_title_and_operation_identity(tmp_pa
     _, verified = cli("source", "verify", retried["result"]["source_id"],
                       "--workspace", config_path, "--json")
     assert verified["result"]["title"] == title
+
+
+def test_pre_publish_retry_replays_immutable_provenance(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    workspace = WorkspaceConfig.load(config_path)
+    source = tmp_path / "source with spaces.txt"; source.write_text("one\n")
+    provenance = {"origin": "https://example.org/a b", "author_or_organization": "Example Org",
+                  "published_version_or_date": "2026-09-01", "accessed_at": "2026-09-17T09:00:00+08:00",
+                  "summary": "public fact", "locator": "section 1", "applicability": "version 1",
+                  "verification": "manual_review_required"}
+    real_sync = __import__("video_extract.source_registry", fromlist=["_sync_directory"])._sync_directory
+    failed_once = False
+
+    def fail_first_hash_dir(path: Path) -> None:
+        nonlocal failed_once
+        if Path(path).parent.name == "objects" and not failed_once:
+            failed_once = True
+            raise OSError("first hash directory sync failed")
+        real_sync(path)
+
+    with patch("video_extract.source_registry._sync_directory", side_effect=fail_first_hash_dir):
+        failed = register(workspace, source, expected_revision=0, provenance=provenance)
+    assert failed["status"] == "recoverable_failure"
+    assert "--provenance" in failed["next_action"]["command"]
+    completed = run_recovery_command(failed["next_action"]["command"])
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    retried = json.loads(completed.stdout)
+    _, verified = cli("source", "verify", retried["result"]["source_id"],
+                      "--workspace", config_path, "--json")
+    assert verified["result"]["provenance"] == provenance
 
 
 def test_committed_source_id_cannot_be_recovered_to_unmapped_different_source(tmp_path: Path) -> None:

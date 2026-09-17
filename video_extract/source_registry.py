@@ -101,8 +101,22 @@ def _git_basis(path: Path) -> dict[str, Any]:
         return {"git_commit": None, "working_tree_dirty": None}
     commit = run("rev-parse", "HEAD")
     dirty = run("status", "--porcelain", "--untracked-files=all")
+    dirty_files = {"modified": [], "added": [], "deleted": []}
+    if dirty.returncode == 0:
+        for line in dirty.stdout.splitlines():
+            state, relative = line[:2], line[3:]
+            if " -> " in relative:
+                relative = relative.split(" -> ", 1)[1]
+            if state == "??" or "A" in state:
+                dirty_files["added"].append(relative)
+            elif "D" in state:
+                dirty_files["deleted"].append(relative)
+            else:
+                dirty_files["modified"].append(relative)
+        dirty_files = {key: sorted(values) for key, values in dirty_files.items()}
     return {"git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
-            "working_tree_dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None}
+            "working_tree_dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None,
+            "dirty_files": dirty_files if dirty.returncode == 0 else None}
 
 
 def _require_v2(config: WorkspaceConfig) -> None:
@@ -398,6 +412,9 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
                                 f" --source-id {shlex.quote(source_id)}")
             if title is not None:
                 recovery_command += f" --title {shlex.quote(title)}"
+            if provenance is not None:
+                provenance_request = _candidate(config, provenance)
+                recovery_command += f" --provenance {shlex.quote(str(provenance_request))}"
             recovery_command += (f"{revision_argument} --workspace "
                                 f"{shlex.quote(str(config.config_path))} --json")
             recovery_type = "retry"
@@ -495,13 +512,14 @@ def verify(config: WorkspaceConfig, source_id: str, source_version: str | None =
     location = locations.get(source_id)
     availability = "missing"
     content: str | None = None
+    observed_version_basis: dict[str, Any] | None = None
     if version.get("object_sha256"):
         objects, _, _, _ = _store_roots(config)
         body = _safe_path(objects.parent, "objects", version["object_sha256"][:2], version["object_sha256"]).read_bytes()
         content = body.decode("utf-8")
         availability = "available_from_results"
     elif location and Path(location).exists():
-        _, current_digest, _, _, _ = _capture(Path(location))
+        _, current_digest, _, observed_version_basis, _ = _capture(Path(location))
         availability = "available_at_location" if current_digest == version["content_sha256"] else "version_mismatch"
     result = {"source_id": source_id, "source_version": version_id, "kind": package["kind"],
               "title": package["title"], "revision": snapshot["revision"],
@@ -510,7 +528,7 @@ def verify(config: WorkspaceConfig, source_id: str, source_version: str | None =
               "package_schema_version": PACKAGE_SCHEMA_VERSION,
               "snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
               "version_basis": version["version_basis"], "storage": version["storage"],
-              "entries": version.get("entries", [])}
+              "entries": version.get("entries", []), "observed_version_basis": observed_version_basis}
     result["current_version"] = package["current_version"]
     result["version_state"] = "current" if version_id == package["current_version"] else "historical"
     result["change_check"] = "current" if result["version_state"] == "current" else "needs_review"
