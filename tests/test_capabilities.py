@@ -73,6 +73,17 @@ def test_check_reports_missing_entry_at_the_single_maintenance_mapping() -> None
     ]
 
 
+def test_check_reports_declared_dependency_state() -> None:
+    with patch("video_extract.capabilities._dependency_available", return_value=False):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 3
+    capability = result["result"]["capabilities"][0]
+    assert capability["dependency_state"] == {"command:ffmpeg": False, "python:PIL": False}
+    assert result["status"] == "missing_dependency"
+    assert result["validation"] == {"implementations": "passed", "dependencies": "failed"}
+
+
 def test_run_existing_capability_normalizes_model_pause_and_exit_code(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
     source = tmp_path / "input.md"
@@ -126,6 +137,30 @@ def test_compatible_replacement_only_changes_the_single_mapping(tmp_path: Path) 
     assert result["provenance"]["implementation"].endswith(":replacement_source_notes")
 
 
+def test_operation_identity_survives_relocation_and_tracks_contract_versions(tmp_path: Path) -> None:
+    request_one = tmp_path / "one.json"
+    request_two = tmp_path / "two.json"
+    first_package = tmp_path / "first-package"
+    second_package = tmp_path / "second-package"
+    for package in (first_package, second_package):
+        package.mkdir()
+        (package / "manifest.json").write_text(json.dumps({"identity": "source-123"}), encoding="utf-8")
+    base = {"contract_version": 1, "action": "prepare", "workspace": "/old/workspace",
+            "package": str(first_package), "source_version": "v1"}
+    request_one.write_text(json.dumps(base), encoding="utf-8")
+    request_two.write_text(json.dumps({**base, "workspace": "/new/workspace", "package": str(second_package)}), encoding="utf-8")
+    with patch.object(capability_module, "run_source_notes", return_value={"status": "awaiting_ai"}):
+        _, first = run_cli("capability", "run", "source.notes", "--request", str(request_one))
+        _, relocated = run_cli("capability", "run", "source.notes", "--request", str(request_two))
+    upgraded = Capability(**{**CAPABILITIES["source.notes"].__dict__, "implementation_version": 2})
+    with patch.object(capability_module, "run_source_notes", return_value={"status": "awaiting_ai"}), \
+            patch.dict(CAPABILITIES, {"source.notes": upgraded}, clear=True):
+        _, changed = run_cli("capability", "run", "source.notes", "--request", str(request_two))
+
+    assert first["operation_id"] == relocated["operation_id"]
+    assert changed["operation_id"] != relocated["operation_id"]
+
+
 def test_run_rejects_contract_mismatch_without_guessing_an_adapter(tmp_path: Path) -> None:
     request = tmp_path / "request.json"
     request.write_text(json.dumps({"contract_version": 9}), encoding="utf-8")
@@ -162,7 +197,33 @@ def test_workspace_doctor_includes_capability_and_is_read_only(tmp_path: Path) -
     )
 
     assert code == 1
-    assert result["capabilities"]["status"] == "completed"
-    assert result["installation"]["status"] == "recoverable_failure"
+    assert set(result) == {"api_version", "workspace_id", "operation_id", "status", "observed_revision", "result", "artifact_refs", "validation", "provenance", "next_action", "diagnostics"}
+    assert result["result"]["capabilities"]["status"] == "completed"
+    assert result["result"]["installation"]["status"] == "recoverable_failure"
     assert not agents_root.exists()
     assert not codex_root.exists()
+
+
+def test_invalid_workspace_is_a_normalized_missing_input_response(tmp_path: Path) -> None:
+    code, result = run_cli(
+        "workspace", "doctor", "--workspace", str(tmp_path / "missing.toml"),
+        "--agents-root", str(tmp_path / "agents"), "--codex-root", str(tmp_path / "codex"),
+    )
+
+    assert code == 3
+    assert result["api_version"] == 1
+    assert result["status"] == "missing_input"
+    assert result["validation"]["workspace"] == "failed"
+
+
+def test_capability_invalid_workspace_is_normalized(tmp_path: Path) -> None:
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"contract_version": 1, "action": "prepare",
+                                   "workspace": str(tmp_path / "missing.toml"),
+                                   "package": str(tmp_path / "package")}), encoding="utf-8")
+
+    code, result = run_cli("capability", "run", "source.notes", "--request", str(request))
+
+    assert code == 3
+    assert result["status"] == "missing_input"
+    assert result["validation"]["request"] == "failed"

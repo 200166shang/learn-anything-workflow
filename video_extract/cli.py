@@ -120,6 +120,7 @@ def cmd_notes(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
     from .installation import apply, inspect, plan
     agents_root = args.agents_root.expanduser().resolve()
     codex_root = args.codex_root.expanduser().resolve()
@@ -130,7 +131,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     else:
         result = inspect(agents_root, codex_root)
     emit(result, args.json)
-    return 0 if result.get("ok") else 1
+    return exit_code(result)
 
 
 def cmd_capability(args: argparse.Namespace) -> int:
@@ -316,18 +317,41 @@ def cmd_library(args: argparse.Namespace) -> int:
 
 
 def cmd_workspace(args: argparse.Namespace) -> int:
-    config = discover_workspace(args.workspace)
+    from .command_response import exit_code, response
+    from .workspace import WorkspaceError
+    try:
+        config = discover_workspace(args.workspace)
+    except WorkspaceError as exc:
+        if args.workspace_action != "doctor":
+            raise
+        result = response(status="missing_input", workspace=str(args.workspace) if args.workspace else None,
+                          validation={"workspace": "failed"}, diagnostics=[str(exc)],
+                          next_action={"type": "user", "reason": "provide a valid workspace config"})
+        emit(result, args.json)
+        return exit_code(result)
     if args.workspace_action == "show": result = config.as_dict()
     elif args.workspace_action == "doctor":
         from .capabilities import check_capabilities
         from .installation import inspect
-        result = workspace_doctor(config)
-        result["capabilities"] = check_capabilities()
-        result["installation"] = inspect(args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve())
-        result["ok"] = result["ok"] and result["capabilities"]["status"] == "completed" and result["installation"]["ok"]
+        doctor_result = workspace_doctor(config)
+        capabilities = check_capabilities()
+        installation = inspect(args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve())
+        doctor_result["capabilities"] = capabilities
+        doctor_result["installation"] = installation
+        ok = doctor_result["ok"] and capabilities["status"] == "completed" and installation["status"] == "completed"
+        result = response(status="completed" if ok else "recoverable_failure",
+                          workspace=str(config.config_path), result=doctor_result,
+                          validation={"workspace": doctor_result["ok"],
+                                      "capabilities": capabilities["status"] == "completed",
+                                      "installation": installation["status"] == "completed"},
+                          provenance={"workspace_config": str(config.config_path)},
+                          next_action=None if ok else {"command": "video-extract install plan --json"},
+                          diagnostics=[] if ok else ["workspace, capability, or installation diagnostics require attention"])
     elif args.workspace_action == "rebuild": result = workspace_rebuild(config, args.apply)
     else: result = prepare_migration(config, args.full_hash)
     emit(result, args.json)
+    if args.workspace_action == "doctor":
+        return exit_code(result)
     return 0 if result.get("ok", False) else 1
 
 
