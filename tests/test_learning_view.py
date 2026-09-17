@@ -261,6 +261,9 @@ def test_project_ships_unloadable_read_only_obsidian_plugin() -> None:
     assert "openLinkText" in main
     assert "graphPath" in main
     assert 'openLinkText(href, graphPath' in main
+    assert "adapter.read(graphPath)" in main
+    assert "frame.srcdoc" in main
+    assert "getResourcePath(graphPath)" not in main
     assert "learning-views/status" in main
     assert "file-open" not in main
     assert "onunload" in main
