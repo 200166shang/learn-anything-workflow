@@ -34,6 +34,18 @@ class Capability:
 
 
 CAPABILITIES: dict[str, Capability] = {
+    "audio.mandarin": Capability(
+        id="audio.mandarin",
+        contract_version=1,
+        implementation_version=1,
+        implementation="video_extract.mandarin_audio:run_mandarin_audio",
+        input_type="mandarin-audio-request-v1",
+        output_type="command-response-v1",
+        side_effect="local_normalization_or_authorized_paid_tts",
+        dependencies=("command:ffmpeg", "command:ffprobe"),
+        authorization_category="local_workspace_or_paid_tts",
+        recovery_query="operation show/resume/reconcile with the returned operation_id",
+    ),
     "source.notes": Capability(
         id="source.notes",
         contract_version=1,
@@ -73,6 +85,12 @@ def _resolve(entry: Capability) -> Callable[[dict[str, Any]], dict[str, Any]] | 
 
 
 def _operation_id(entry: Capability, request: dict[str, Any]) -> str:
+    if entry.id == "audio.mandarin":
+        try:
+            from .mandarin_audio import operation_identity
+            return operation_identity(request)
+        except (KeyError, TypeError, ValueError, FileNotFoundError, WorkspaceError):
+            pass
     # Authorization references prove permission for an already identified
     # operation; renewing or supplying one must not create a second external
     # request identity.

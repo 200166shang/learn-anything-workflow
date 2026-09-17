@@ -520,6 +520,9 @@ def show_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]
         return response(status="missing_input", workspace=str(config.config_path), operation_id=operation_id,
                         validation={"operation": "failed"}, diagnostics=["unknown operation_id"])
     record = read_json(path)
+    if record.get("intent", {}).get("capability_id") == "audio.mandarin":
+        from .mandarin_audio import show_operation as show_mandarin_operation
+        return show_mandarin_operation(config, operation_id)
     if record.get("status") == "completed":
         normalized = record["request"]
         items, _ = _catalog(config, normalized)
@@ -539,6 +542,9 @@ def resume_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, An
     path = _path(config, operation_id)
     if not path.is_file():
         return show_operation(config, operation_id)
+    if read_json(path).get("intent", {}).get("capability_id") == "audio.mandarin":
+        from .mandarin_audio import resume_operation as resume_mandarin_operation
+        return resume_mandarin_operation(config, operation_id)
     request = dict(read_json(path)["request"])
     request["workspace"] = str(config.config_path)
     return ensure_request(request, resume=True)
@@ -606,6 +612,9 @@ def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str,
     path = _path(config, operation_id)
     if not path.is_file():
         return show_operation(config, operation_id)
+    if read_json(path).get("intent", {}).get("capability_id") == "audio.mandarin":
+        from .mandarin_audio import reconcile_operation as reconcile_mandarin_operation
+        return reconcile_mandarin_operation(config, operation_id)
     with _lock(config, operation_id) as acquired:
         if not acquired:
             record = read_json(path); record["status"] = "busy"; return _public(config, record)
