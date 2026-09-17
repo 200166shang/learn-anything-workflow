@@ -16,174 +16,140 @@ MAX_SUGGESTIONS = 3
 MAX_TOTAL_MINUTES = 15
 
 
-def _latest_by(items: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
-    for item in sorted(items, key=lambda value: (value.get("created_at", ""), value.get("event_id", ""))):
-        latest[item[key]] = item
-    return latest
+def _normalized(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
-def _current_question_pin(record: dict[str, Any], question_id: str) -> dict[str, Any] | None:
-    question = record["questions"].get(question_id)
-    if question is None or not question["explanation_refs"]:
-        return None
-    return question["explanation_refs"][-1]
+def _card_candidates(learning: dict[str, Any], cards: dict[str, Any], as_of: date,
+                     preferred_versions: set[str]) -> tuple[list[tuple[tuple[Any, ...], dict[str, Any]]], int]:
+    ranked: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    invalid = 0; questions = learning["questions"]
+    for card in cards["cards"]:
+        version = card["version"]; pin = version["explanation_pin"]
+        question = questions.get(pin["question_id"])
+        preferred = version["card_version_id"] in preferred_versions
+        current = question and question["explanation_pin"]
+        if current is None or any(current.get(key) != pin.get(key) for key in (
+                "explanation_id", "explanation_revision", "object_sha256", "logical_path")):
+            invalid += 1; continue
+        feedback = question["latest_feedback"]
+        if feedback and feedback["state"] == "parked" and not preferred:
+            continue
+        due_date = card["schedule"]["due_date"]
+        if date.fromisoformat(due_date) > as_of and not preferred:
+            continue
+        semantic_key = f"{_normalized(card['memory_target'])}\0{_normalized(card['conditions'])}"
+        item = {
+            "kind": "card_review", "object_id": card["card_id"],
+            "object_version": version["card_version_id"], "question_id": pin["question_id"],
+            "reason": ("你明确选择今天强化这张卡片" if preferred else
+                       f"卡片已于 {due_date} 到期，适合进行一次主动回忆"),
+            "estimated_minutes": 5,
+            "semantic_context": {"memory_target": card["memory_target"],
+                                 "conditions": card["conditions"],
+                                 "module_goal": question["module_goal"],
+                                 "module_scope": question["module_scope"]},
+            "action": {"command": "review prepare", "card_version_id": version["card_version_id"]},
+            "due_date": due_date,
+        }
+        ranked.append(((-1 if preferred else 0, due_date, semantic_key, card["card_id"]), item))
+    return ranked, invalid
 
 
-def _card_is_current(record: dict[str, Any], version: dict[str, Any]) -> bool:
-    pin = version["explanation_pin"]
-    current = _current_question_pin(record, pin["question_id"])
-    return current is not None and all(current.get(key) == pin.get(key) for key in (
-        "explanation_id", "explanation_revision", "object_sha256", "logical_path"
-    ))
+def _question_candidates(learning: dict[str, Any], reviews: dict[str, Any], as_of: date,
+                         preferred_questions: set[str], card_questions: set[str]
+                         ) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+    ranked: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    for question_id, question in learning["questions"].items():
+        if question_id in card_questions or question["explanation_pin"] is None:
+            continue
+        preferred = question_id in preferred_questions; feedback = question["latest_feedback"]
+        if feedback and feedback["state"] in {"understood", "parked"} and not preferred:
+            continue
+        review = reviews["latest_by_question"].get(question_id)
+        if review and date.fromisoformat(review["review_day"]) == as_of and not preferred:
+            continue
+        difficult = bool(question["unresolved_confusions"]) or (feedback and feedback["state"] == "confused") \
+            or (review and review["effective_evaluation"] in {"prompted", "not_recalled"})
+        if not preferred and not difficult and not (question["is_current"] or question["is_root"]):
+            continue
+        if preferred:
+            reason, recency = "你明确选择今天强化这个已学问题", question["created_at"]
+        elif feedback and feedback["state"] == "confused":
+            reason, recency = "最近仍标记为不理解，建议用主动回忆定位具体卡点", feedback["created_at"]
+        elif question["unresolved_confusions"]:
+            reason, recency = "仍有未解决的困惑，建议先回忆再决定是否继续讲解", question["created_at"]
+        elif review and review["effective_evaluation"] in {"prompted", "not_recalled"}:
+            reason, recency = "最近一次回忆需要提示或未想起，适合短时强化", review["created_at"]
+        else:
+            reason, recency = "这是已开始主线上的当前问题，适合做一次短时主动回忆", question["created_at"]
+        pin = question["explanation_pin"]
+        item = {
+            "kind": "question_review", "object_id": question_id,
+            "object_version": {"learning_commit_id": learning["commit_id"],
+                               "explanation_revision": pin["explanation_revision"],
+                               "object_sha256": pin["object_sha256"]},
+            "question_id": question_id, "title": question["title"], "reason": reason,
+            "estimated_minutes": 10,
+            "semantic_context": {"module_goal": question["module_goal"],
+                                 "module_scope": question["module_scope"],
+                                 "unresolved_confusions": question["unresolved_confusions"],
+                                 "feedback_state": feedback["state"] if feedback else None},
+            "action": {"command": "review prepare", "question_id": question_id},
+        }
+        semantic_key = (_normalized(question["module_goal"]), _normalized(question["module_scope"]),
+                        _normalized(question["title"]))
+        ranked.append(((-1 if preferred else 1 if difficult else 2,
+                        -datetime.fromisoformat(recency).timestamp(), semantic_key, question_id), item))
+    return ranked
+
+
+def _within_budget(ranked: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> tuple[list[dict[str, Any]], int]:
+    suggestions: list[dict[str, Any]] = []; minutes = 0; seen: set[tuple[str, str]] = set()
+    for _, item in sorted(ranked, key=lambda pair: pair[0]):
+        if len(suggestions) >= MAX_SUGGESTIONS:
+            break
+        dedupe = (item["kind"], repr(item["semantic_context"]))
+        if dedupe in seen or minutes + item["estimated_minutes"] > MAX_TOTAL_MINUTES:
+            continue
+        seen.add(dedupe); suggestions.append(item); minutes += item["estimated_minutes"]
+    return suggestions, minutes
 
 
 def today(config: WorkspaceConfig, on_date: str | None = None, *,
           preferred_question_ids: list[str] | None = None,
           preferred_card_version_ids: list[str] | None = None) -> dict[str, Any]:
-    """Return at most three stable, read-only suggestions for one Shanghai date."""
-    from .cards import _load as load_cards, schedule
-    from .learning import _load as load_learning
-    from .review import _load as load_review
+    """Return a stable, read-only short Review group for one Shanghai date."""
+    from .cards import suggestion_facts as card_facts
+    from .learning import suggestion_facts as learning_facts
+    from .review import suggestion_facts as review_facts
 
     as_of = date.fromisoformat(on_date) if on_date else datetime.now(SHANGHAI).date()
-    learning = load_learning(config)
-    cards = load_cards(config)
-    reviews = load_review(config)
-    record = learning["record"]
-    preferred_questions = set(preferred_question_ids or [])
-    preferred_versions = set(preferred_card_version_ids or [])
-
-    feedbacks = _latest_by(list(record["feedbacks"].values()), "question_id")
-    latest_reviews = _latest_by([
-        {**event, "question_id": event["pin"]["question_id"]}
-        for event in reviews["record"]["events"].values()
-        if event.get("review_date") is None or date.fromisoformat(event["review_date"]) <= as_of
-    ], "question_id")
-
-    ranked: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-    card_questions: set[str] = set()
-    invalid_cards = 0
-    for card in cards["record"]["cards"].values():
-        version = card["versions"][card["active_version_id"]]
-        question_id = version["explanation_pin"]["question_id"]
-        preferred = version["card_version_id"] in preferred_versions
-        feedback = feedbacks.get(question_id)
-        if feedback and feedback["state"] == "parked" and not preferred:
-            continue
-        if not _card_is_current(record, version):
-            invalid_cards += 1
-            continue
-        computed = schedule(config, card_version_id=version["card_version_id"],
-                            on_date=as_of.isoformat())["result"]
-        if date.fromisoformat(computed["due_date"]) > as_of and not preferred:
-            continue
-        card_questions.add(question_id)
-        item = {
-            "kind": "card_review",
-            "object_id": card["card_id"],
-            "object_version": version["card_version_id"],
-            "question_id": question_id,
-            "reason": ("你明确选择今天强化这张卡片" if preferred else
-                       f"卡片已于 {computed['due_date']} 到期，适合进行一次主动回忆"),
-            "estimated_minutes": 5,
-            "action": {"command": "review prepare", "card_version_id": version["card_version_id"]},
-            "due_date": computed["due_date"],
-        }
-        ranked.append(((-1 if preferred else 0, computed["due_date"], card["card_id"]), item))
-
-    for question_id, question in record["questions"].items():
-        if question_id in card_questions or _current_question_pin(record, question_id) is None:
-            continue
-        thread = record["threads"].get(question["thread_id"])
-        if thread is None:
-            continue
-        preferred = question_id in preferred_questions
-        feedback = feedbacks.get(question_id)
-        if feedback and feedback["state"] in {"understood", "parked"} and not preferred:
-            continue
-        review = latest_reviews.get(question_id)
-        review_day = (date.fromisoformat(review["review_date"]) if review and review.get("review_date")
-                      else date.fromisoformat(review["created_at"][:10]) if review else None)
-        if review_day == as_of and not preferred:
-            continue
-        difficult = bool(question["unresolved_confusions"]) or (feedback and feedback["state"] == "confused") \
-            or (review and review["effective_evaluation"] in {"prompted", "not_recalled"})
-        current_or_root = question_id in {thread["current_question_id"], thread["root_question_id"]}
-        if not preferred and not difficult and not current_or_root:
-            continue
-        if preferred:
-            reason = "你明确选择今天强化这个已学问题"
-            recency = question["created_at"]
-        elif feedback and feedback["state"] == "confused":
-            reason = "最近仍标记为不理解，建议用主动回忆定位具体卡点"
-            recency = feedback["created_at"]
-        elif question["unresolved_confusions"]:
-            reason = "仍有未解决的困惑，建议先回忆再决定是否继续讲解"
-            recency = question["created_at"]
-        elif review and review["effective_evaluation"] in {"prompted", "not_recalled"}:
-            reason = "最近一次回忆需要提示或未想起，适合短时强化"
-            recency = review["created_at"]
-        else:
-            reason = "这是已开始主线上的当前问题，适合做一次短时主动回忆"
-            recency = question["created_at"]
-        pin = _current_question_pin(record, question_id)
-        item = {
-            "kind": "question_review",
-            "object_id": question_id,
-            "object_version": {
-                "learning_commit_id": learning["commit_id"],
-                "explanation_revision": pin["explanation_revision"],
-                "object_sha256": pin["object_sha256"],
-            },
-            "question_id": question_id,
-            "title": question["title"],
-            "reason": reason,
-            "estimated_minutes": 10,
-            "action": {"command": "review prepare", "question_id": question_id},
-        }
-        recent_first = -datetime.fromisoformat(recency).timestamp()
-        ranked.append(((-1 if preferred else 1 if difficult else 2, recent_first, question_id), item))
-
-    suggestions: list[dict[str, Any]] = []
-    total_minutes = 0
-    for _, item in sorted(ranked, key=lambda pair: pair[0]):
-        if len(suggestions) >= MAX_SUGGESTIONS:
-            break
-        if total_minutes + item["estimated_minutes"] > MAX_TOTAL_MINUTES:
-            continue
-        suggestions.append(item)
-        total_minutes += item["estimated_minutes"]
-    return response(
-        status="completed",
-        workspace=str(config.config_path),
-        result={
-            "as_of_date": as_of.isoformat(),
-            "timezone": "Asia/Shanghai",
-            "suggestions": suggestions,
-            "total_estimated_minutes": total_minutes,
-            "maximum_total_minutes": MAX_TOTAL_MINUTES,
-            "empty_reason": None if suggestions else "no_eligible_started_learning_or_due_cards",
-            "selection": {
-                "choose": "run review prepare for the selected question_id or card_version_id",
-                "change": "any other valid question_id or card_version_id may be prepared instead",
-                "skip": "do nothing; no Learn or Review fact is written",
-                "long_practice": "available only when explicitly chosen and may exceed 15 minutes",
-            },
-            "source_revisions": {
-                "learning_commit_id": learning.get("commit_id"),
-                "card_commit_id": cards.get("commit_id"),
-                "review_commit_id": reviews.get("commit_id"),
-            },
+    learning = learning_facts(config); cards = card_facts(config, as_of.isoformat())
+    reviews = review_facts(config, as_of.isoformat())
+    card_ranked, invalid_cards = _card_candidates(
+        learning, cards, as_of, set(preferred_card_version_ids or []))
+    card_questions = {item["question_id"] for _, item in card_ranked}
+    question_ranked = _question_candidates(
+        learning, reviews, as_of, set(preferred_question_ids or []), card_questions)
+    suggestions, total_minutes = _within_budget([*card_ranked, *question_ranked])
+    return response(status="completed", workspace=str(config.config_path), result={
+        "as_of_date": as_of.isoformat(), "timezone": "Asia/Shanghai",
+        "suggestions": suggestions, "total_estimated_minutes": total_minutes,
+        "maximum_total_minutes": MAX_TOTAL_MINUTES,
+        "empty_reason": None if suggestions else "no_eligible_started_learning_or_due_cards",
+        "selection": {
+            "choose": "run review prepare for the selected question_id or card_version_id",
+            "change": "any other valid question_id or card_version_id may be prepared instead",
+            "skip": "do nothing; no Learn or Review fact is written",
+            "long_practice": "available only when explicitly chosen and may exceed 15 minutes",
         },
-        validation={
-            "learning_record": "passed",
-            "card_record": "passed",
-            "review_record": "passed",
-            "invalid_cards_excluded": invalid_cards,
-            "recommendation_persisted": False,
-        },
-    )
+        "source_revisions": {"learning_commit_id": learning["commit_id"],
+                             "card_commit_id": cards["commit_id"],
+                             "review_commit_id": reviews["commit_id"]},
+    }, validation={"learning_record": "passed", "card_record": "passed",
+                   "review_record": "passed", "invalid_cards_excluded": invalid_cards,
+                   "recommendation_persisted": False})
 
 
 def run_suggestions(request: dict[str, Any]) -> dict[str, Any]:

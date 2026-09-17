@@ -480,6 +480,28 @@ def _question_state(record: dict[str, Any], question_id: str) -> dict[str, Any]:
             "unresolved_confusions": list(question["unresolved_confusions"])}
 
 
+def suggestion_facts(config: WorkspaceConfig) -> dict[str, Any]:
+    """Project stable, read-only semantic facts needed by daily suggestions."""
+    snapshot = _load(config); record = snapshot["record"]
+    questions: dict[str, dict[str, Any]] = {}
+    for question_id, question in record["questions"].items():
+        thread = record["threads"][question["thread_id"]]
+        module = record["modules"][thread["module_id"]]
+        state = _question_state(record, question_id)
+        questions[question_id] = {
+            "question_id": question_id, "title": question["title"],
+            "created_at": question["created_at"],
+            "unresolved_confusions": state["unresolved_confusions"],
+            "latest_feedback": state["latest_feedback"],
+            "module_id": module["module_id"], "module_goal": module["goal"],
+            "module_scope": module["scope"],
+            "is_root": question_id == thread["root_question_id"],
+            "is_current": question_id == thread["current_question_id"],
+            "explanation_pin": question["explanation_refs"][-1] if question["explanation_refs"] else None,
+        }
+    return {"commit_id": snapshot.get("commit_id"), "questions": questions}
+
+
 def _snapshot_at_revision(config: WorkspaceConfig, snapshot: dict[str, Any], revision: int) -> dict[str, Any] | None:
     if revision < 0 or revision > snapshot["revision"]:
         return None
