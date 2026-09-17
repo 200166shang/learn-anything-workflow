@@ -9,7 +9,8 @@ prepare SOURCE_ID --workspace WORKSPACE --json`. Continue the returned
 then call `video-extract notes finalize SOURCE_ID --request REQUEST --workspace
 WORKSPACE --json`. Preserve the exact `source_id` and `source_version`, use only
 the locator policy in the prepared input, and never invent timestamps or claim
-that an SRT is matched to video without explicit association evidence.
+that an SRT is matched to video without a `source associate` record backed by
+structured, verifiable matching facts. Free-form claims remain unverified.
 
 # Source notes
 

@@ -120,7 +120,8 @@ def cmd_source(args: argparse.Namespace) -> int:
     try:
         if args.source_action == "associate":
             from .authoritative_notes import associate_sources
-            result = associate_sources(workspace, args.source_id, args.related_source_id, args.evidence)
+            evidence = read_json(args.evidence) if args.evidence else None
+            result = associate_sources(workspace, args.source_id, args.related_source_id, evidence)
         elif args.source_action == "register":
             result = register(workspace, args.input, args.title, args.expected_revision, args.source_id)
         elif args.source_action == "verify":
@@ -519,7 +520,8 @@ def parser() -> argparse.ArgumentParser:
     source_reconcile.set_defaults(func=cmd_source)
     source_associate = source_actions.add_parser("associate", help="validate an explicit relationship between registered sources")
     source_associate.add_argument("source_id"); source_associate.add_argument("related_source_id")
-    source_associate.add_argument("--evidence"); source_associate.add_argument("--workspace", type=Path)
+    source_associate.add_argument("--evidence", type=Path, help="structured association evidence JSON")
+    source_associate.add_argument("--workspace", type=Path)
     source_associate.add_argument("--json", action="store_true"); source_associate.set_defaults(func=cmd_source)
     notes = commands.add_parser("notes", help="prepare or finalize source-grounded notes")
     notes_actions = notes.add_subparsers(dest="notes_action", required=True)

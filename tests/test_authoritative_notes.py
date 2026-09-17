@@ -3,8 +3,12 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
-from video_extract.authoritative_notes import associate_sources, audit_notes, finalize_note, prepare_note
+import pytest
+
+from video_extract.authoritative_notes import associate_sources, audit_notes, finalize_note, prepare_note, reconcile_notes
+from video_extract.workspace import WorkspaceError
 from video_extract.source_registry import register
 from video_extract.workspace import WorkspaceConfig
 
@@ -34,7 +38,7 @@ def draft(path: Path, prepared: dict, body: str, *, expected_revision: int = 0) 
         "citations": [{"claim": "输入经阶段产生输出", "locator": "paragraph:2", "locator_type": "paragraph"}],
         "corrections": [],
         "attachments": [],
-        "association": {"status": "not_applicable", "evidence": "standalone document"},
+        "association": {"status": "not_applicable", "evidence": None},
     }
     path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
     return path
@@ -79,8 +83,25 @@ def test_source_association_never_claims_matching_media_without_evidence(tmp_pat
     association = associate_sources(config, one, two, None)
 
     assert association["status"] == "completed"
-    assert association["result"]["association"]["status"] == "insufficient_evidence"
+    assert association["result"]["association"]["status"] == "unverified"
     assert association["validation"]["association_evidence"] == "insufficient"
+
+
+def test_association_verifies_only_structured_digest_equality(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "ws")
+    first = tmp_path / "one.srt"; first.write_text("1\n00:00:01,000 --> 00:00:02,000\nOne\n", encoding="utf-8")
+    second = tmp_path / "two.srt"; second.write_text(first.read_text(encoding="utf-8"), encoding="utf-8")
+    one = register(config, first)["result"]; two = register(config, second)["result"]
+    evidence = {"type": "content_digest_equality", "source_id": one["source_id"], "source_version": one["source_version"],
+                "related_source_id": two["source_id"], "related_source_version": two["source_version"],
+                "source_content_sha256": one["version_basis"]["content_sha256"],
+                "related_content_sha256": two["version_basis"]["content_sha256"]}
+
+    verified = associate_sources(config, one["source_id"], two["source_id"], evidence)
+    arbitrary = associate_sources(config, one["source_id"], two["source_id"], {"type": "user_claim", "text": "same"})
+
+    assert verified["result"]["association"]["status"] == "verified"
+    assert arbitrary["result"]["association"]["status"] == "unverified"
 
 
 def test_finalize_publishes_body_citations_and_history_as_one_deeply_valid_commit(tmp_path: Path) -> None:
@@ -127,9 +148,82 @@ def test_failure_before_publish_leaves_previous_note_current(tmp_path: Path, mon
     monkeypatch.delenv("VIDEO_EXTRACT_NOTES_TEST_FAULT")
 
     assert failed["status"] == "recoverable_failure"
+    with pytest.raises(WorkspaceError, match="not on the current commit chain"):
+        audit_notes(config)
+    # Recovery refuses to claim durability while an orphan commit remains.
+    with pytest.raises(WorkspaceError):
+        reconcile_notes(config)
+    orphan = next((config.results / "source-notes/commits").glob("*.json"))
+    pointer = json.loads((config.results / "source-notes/current.json").read_text())
+    for item in (config.results / "source-notes/commits").glob("*.json"):
+        if item.stem != pointer["commit_id"]:
+            item.unlink()
     current = audit_notes(config)
     assert current["result"]["notes"][0]["revision"] == 1
     assert Path(current["result"]["notes"][0]["note"]).read_text(encoding="utf-8").startswith("# First")
+
+
+def test_history_revision_pins_every_reconstructable_artifact(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "ws")
+    source = tmp_path / "fixture.md"; source.write_text("One\n\nTwo\n", encoding="utf-8")
+    registered = register(config, source); prepared = prepare_note(config, registered["result"]["source_id"])
+    finalize_note(config, draft(tmp_path / "first.json", prepared, "# First\n\nTwo\n"))
+    finalize_note(config, draft(tmp_path / "second.json", prepared, "# Second\n\nTwo\n", expected_revision=1))
+    pointer = json.loads((config.results / "source-notes/current.json").read_text())
+    commit = json.loads((config.results / "source-notes/commits" / f"{pointer['commit_id']}.json").read_text())
+    history = commit["notes"][registered["result"]["source_id"]]["history"]
+
+    assert len(history) == 2
+    assert all(set(entry) >= {"body_object", "citations_object", "corrections_object",
+                              "attachment_objects", "association", "source_version"} for entry in history)
+
+
+def test_finalize_rejects_imprecise_or_malformed_locators_with_command_response(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "ws")
+    source = tmp_path / "fixture.md"; source.write_text("# Exact heading\n\nExact paragraph.\n", encoding="utf-8")
+    registered = register(config, source); prepared = prepare_note(config, registered["result"]["source_id"])
+    request = draft(tmp_path / "bad.json", prepared, "# Note\n")
+    value = json.loads(request.read_text()); value["citations"] = ["not-an-object"]
+    request.write_text(json.dumps(value))
+    command = [sys.executable, "-m", "video_extract.cli", "notes", "finalize", registered["result"]["source_id"],
+               "--request", str(request), "--workspace", str(config.config_path), "--json"]
+
+    completed = subprocess.run(command, capture_output=True, text=True)
+    result = json.loads(completed.stdout)
+
+    assert completed.returncode == 3
+    assert result["api_version"] == 1 and result["status"] == "missing_input"
+    assert result["validation"] == {"request": "failed"}
+
+
+def test_locators_match_exact_structured_boundaries(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "ws")
+    document = tmp_path / "fixture.md"; document.write_text("# Exact heading\n\nExact paragraph.\n", encoding="utf-8")
+    registered = register(config, document); prepared = prepare_note(config, registered["result"]["source_id"])
+    request = draft(tmp_path / "heading.json", prepared, "# Note\n")
+    value = json.loads(request.read_text()); value["citations"] = [{"claim": "x", "locator_type": "heading", "locator": "Exact"}]
+    request.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="heading citation"):
+        finalize_note(config, request)
+
+    transcript = tmp_path / "fixture.srt"; transcript.write_text("1\n00:00:03,000 --> 00:00:05,000\nEvidence\n", encoding="utf-8")
+    srt = register(config, transcript); srt_prepared = prepare_note(config, srt["result"]["source_id"])
+    bad_srt = draft(tmp_path / "srt.json", srt_prepared, "# Note\n")
+    srt_value = json.loads(bad_srt.read_text()); srt_value["citations"] = [{"claim": "x", "locator_type": "timestamp", "locator": "00:00:03,000"}]
+    bad_srt.write_text(json.dumps(srt_value))
+    with pytest.raises(ValueError, match="timestamp citation"):
+        finalize_note(config, bad_srt)
+
+
+def test_reconcile_does_not_confirm_when_any_object_barrier_fails(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "ws")
+    source = tmp_path / "fixture.md"; source.write_text("One\n\nTwo\n", encoding="utf-8")
+    registered = register(config, source); prepared = prepare_note(config, registered["result"]["source_id"])
+    finalize_note(config, draft(tmp_path / "draft.json", prepared, "# Note\n\nTwo\n"))
+
+    with patch("video_extract.authoritative_notes._sync_file", side_effect=OSError("barrier failed")):
+        with pytest.raises(OSError, match="barrier failed"):
+            reconcile_notes(config)
 
 
 def test_identical_finalize_reuses_valid_revision(tmp_path: Path) -> None:
