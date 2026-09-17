@@ -329,6 +329,13 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                           next_action={"type": "user", "reason": "provide a valid workspace config"})
         emit(result, args.json)
         return exit_code(result)
+    if args.workspace_action == "doctor" and not config.workspace_id:
+        result = response(status="missing_input", workspace=str(config.config_path),
+                          validation={"workspace_id": "failed"},
+                          diagnostics=["workspace_id is required for stable public execution; add a persistent logical ID to workspace.toml"],
+                          next_action={"type": "user", "reason": "add workspace_id to workspace.toml; do not change it when moving the workspace"})
+        emit(result, args.json)
+        return exit_code(result)
     if args.workspace_action == "show": result = config.as_dict()
     elif args.workspace_action == "doctor":
         from .capabilities import check_capabilities

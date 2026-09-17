@@ -1,4 +1,5 @@
 schema_version = 1
+workspace_id = "replace-with-a-persistent-logical-id"
 
 [paths]
 project = "video-extract-core"

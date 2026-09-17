@@ -18,6 +18,7 @@ def make_workspace(root: Path) -> WorkspaceConfig:
     (root / "vault").mkdir()
     config = root / "workspace.toml"
     config.write_text('''schema_version = 1
+workspace_id = "fixture-workspace"
 [paths]
 project = "project"
 media = "media"
@@ -182,10 +183,26 @@ def test_check_rejects_incompatible_contract_declaration_and_callable() -> None:
             patch.dict(CAPABILITIES, {"source.notes": bad}, clear=True):
         code, result = run_cli("capability", "check", "source.notes")
 
-    assert code == 3
+    assert code == 1
     checked = result["result"]["capabilities"][0]
     assert checked["contract_state"] == "incompatible"
     assert result["validation"]["contracts"] == "failed"
+
+
+def test_contract_failure_with_dependencies_present_is_unsupported() -> None:
+    def incompatible(_request: dict) -> dict:
+        return {"status": "complete"}
+
+    bad = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                        "implementation": "video_extract.capabilities:incompatible"})
+    with patch.object(capability_module, "incompatible", incompatible, create=True), \
+            patch("video_extract.capabilities._dependency_available", return_value=True), \
+            patch.dict(CAPABILITIES, {"source.notes": bad}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 1
+    assert result["status"] == "unsupported"
+    assert result["validation"] == {"implementations": "passed", "dependencies": "passed", "contracts": "failed"}
 
 
 def test_run_incompatible_return_keeps_v1_envelope(tmp_path: Path) -> None:
@@ -196,6 +213,8 @@ def test_run_incompatible_return_keeps_v1_envelope(tmp_path: Path) -> None:
     request.write_text(json.dumps({"contract_version": 1}), encoding="utf-8")
     replacement = Capability(**{**CAPABILITIES["source.notes"].__dict__,
                                 "implementation": "video_extract.capabilities:returns_list"})
+    returns_list.__capability_contract__ = {"input_type": "source-notes-request-v1",
+                                            "output_type": "command-response-v1"}
     with patch.object(capability_module, "returns_list", returns_list, create=True), \
             patch.dict(CAPABILITIES, {"source.notes": replacement}, clear=True):
         code, result = run_cli("capability", "run", "source.notes", "--request", str(request))
@@ -269,10 +288,26 @@ def test_workspace_identity_survives_workspace_relocation(tmp_path: Path) -> Non
                         "--agents-root", str(first_agents), "--codex-root", str(first_codex))
     moved = tmp_path / "moved"
     first.rename(moved)
+    with (moved / "workspace.toml").open("a", encoding="utf-8") as stream:
+        stream.write('\n[tools.pyvideotrans]\npython = "tools/python"\ncli = "tools/cli.py"\n')
     _, after = run_cli("workspace", "doctor", "--workspace", str(moved / "workspace.toml"),
                        "--agents-root", str(first_agents), "--codex-root", str(first_codex))
 
     assert before["workspace_id"] == after["workspace_id"]
+
+
+def test_legacy_workspace_doctor_requires_persistent_identity(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    text = workspace.config_path.read_text(encoding="utf-8").replace('workspace_id = "fixture-workspace"\n', '')
+    workspace.config_path.write_text(text, encoding="utf-8")
+
+    code, result = run_cli("workspace", "doctor", "--workspace", str(workspace.config_path),
+                           "--agents-root", str(tmp_path / "agents"),
+                           "--codex-root", str(tmp_path / "codex"))
+
+    assert code == 3
+    assert result["status"] == "missing_input"
+    assert "workspace_id" in result["diagnostics"][0]
 
 
 def test_malformed_workspace_toml_is_normalized(tmp_path: Path) -> None:

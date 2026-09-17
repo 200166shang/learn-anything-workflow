@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -41,7 +40,7 @@ def workspace_id(path: str | None) -> str:
             if isinstance(explicit, str) and explicit.strip():
                 raw = "explicit:" + explicit.strip()
             else:
-                raw = json.dumps(parsed, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+                raw = "legacy-workspace-without-persistent-id"
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             raw = "unresolved-workspace"
     return "workspace-" + hashlib.sha256(raw.encode()).hexdigest()[:16]

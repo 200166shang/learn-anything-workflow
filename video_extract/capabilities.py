@@ -90,6 +90,9 @@ def _contract_compatible(entry: Capability, implementation: Callable[..., Any] |
         return False
     if implementation is None:
         return False
+    declared = getattr(implementation, "__capability_contract__", None)
+    if declared != {"input_type": entry.input_type, "output_type": entry.output_type}:
+        return False
     try:
         signature = inspect.signature(implementation)
         signature.bind({})
@@ -137,7 +140,10 @@ def check_capabilities(capability_id: str | None = None) -> dict[str, Any]:
     dependencies_ok = all(all(item["dependency_state"].values()) for item in results)
     implementations_ok = all(item["implementation_state"] == "available" for item in results)
     contracts_ok = all(item["contract_state"] == "compatible" for item in results)
-    status = "completed" if not diagnostics else "missing_dependency"
+    if not contracts_ok and dependencies_ok and implementations_ok:
+        status = "unsupported"
+    else:
+        status = "completed" if not diagnostics else "missing_dependency"
     return response(status=status, result={"capabilities": results},
                      validation={"implementations": "passed" if implementations_ok else "failed",
                                  "dependencies": "passed" if dependencies_ok else "failed",
@@ -149,6 +155,8 @@ def run_source_notes(request: dict[str, Any]) -> dict[str, Any]:
     from .notes_workflow import finalize, prepare
 
     workspace = discover_workspace(Path(request["workspace"]))
+    if not workspace.workspace_id:
+        raise WorkspaceError("workspace_id is required for stable public capability execution; add a persistent logical ID to workspace.toml")
     package = Path(request["package"])
     action = request.get("action")
     if action == "prepare":
@@ -156,6 +164,12 @@ def run_source_notes(request: dict[str, Any]) -> dict[str, Any]:
     if action == "finalize":
         return finalize(package, workspace)
     return {"status": "needs_input", "error": "action must be prepare or finalize"}
+
+
+run_source_notes.__capability_contract__ = {
+    "input_type": "source-notes-request-v1",
+    "output_type": "command-response-v1",
+}
 
 
 def run_capability(capability_id: str, request_path: Path) -> dict[str, Any]:

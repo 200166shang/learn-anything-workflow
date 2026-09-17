@@ -51,6 +51,7 @@ class WorkspaceConfig:
     threads: Path
     concepts: Path
     review: Path
+    workspace_id: str | None = None
     pyvideotrans_python: Path | None = None
     pyvideotrans_cli: Path | None = None
 
@@ -65,6 +66,9 @@ class WorkspaceConfig:
             raise WorkspaceError(f"invalid workspace config: {path}: {exc}") from exc
         if raw.get("schema_version") != SCHEMA_VERSION:
             raise WorkspaceError(f"unsupported workspace schema_version: {raw.get('schema_version')!r}")
+        workspace_id = raw.get("workspace_id")
+        if workspace_id is not None and (not isinstance(workspace_id, str) or not workspace_id.strip()):
+            raise WorkspaceError("workspace_id must be a non-empty persistent logical identifier")
         paths, obs = raw.get("paths", {}), raw.get("obsidian", {})
         root = path.parent.resolve()
         project = _contained(root / _required(paths, "project"), root, "project")
@@ -81,10 +85,12 @@ class WorkspaceConfig:
         if generated == vault or any(generated == item or generated in item.parents for item in (threads, concepts, review, vault / "收件箱")):
             raise WorkspaceError("generated path overlaps a protected Vault boundary")
         return cls(path, source, root, project, media, vault, generated, threads, concepts, review,
+                   workspace_id.strip() if isinstance(workspace_id, str) else None,
                    pyvideotrans_python, pyvideotrans_cli)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"ok": True, "schema_version": SCHEMA_VERSION, "config_source": self.source,
+        return {"ok": True, "schema_version": SCHEMA_VERSION, "workspace_id": self.workspace_id,
+                "config_source": self.source,
                 "config": str(self.config_path), "root": str(self.root), "project": str(self.project),
                 "media": str(self.media), "obsidian": str(self.obsidian), "generated": str(self.generated),
                 "threads": str(self.threads), "concepts": str(self.concepts), "review": str(self.review),
