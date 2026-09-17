@@ -109,10 +109,20 @@ def _contract_compatible(entry: Capability, implementation: Callable[..., Any] |
         return False
     input_annotation = annotations.get(first_parameter.name, first_parameter.annotation)
     output_annotation = annotations.get("return", signature.return_annotation)
-    return _mapping_annotation_compatible(input_annotation) and _mapping_annotation_compatible(output_annotation)
+    return _input_annotation_compatible(input_annotation) and _output_annotation_compatible(output_annotation)
 
 
-def _mapping_annotation_compatible(annotation: Any) -> bool:
+def _input_annotation_compatible(annotation: Any) -> bool:
+    if annotation in {inspect.Signature.empty, Any}:
+        return True
+    origin = typing.get_origin(annotation) or annotation
+    try:
+        return isinstance(origin, type) and issubclass(origin, Mapping) and issubclass(dict, origin)
+    except TypeError:
+        return False
+
+
+def _output_annotation_compatible(annotation: Any) -> bool:
     if annotation in {inspect.Signature.empty, Any}:
         return True
     if typing.is_typeddict(annotation):

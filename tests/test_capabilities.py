@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TypedDict
 from unittest.mock import patch
@@ -298,14 +299,11 @@ def test_typed_dict_output_annotation_is_compatible() -> None:
     assert result["result"]["capabilities"][0]["contract_state"] == "compatible"
 
 
-def test_mapping_subclass_annotations_are_compatible() -> None:
-    class RequestMap(dict[str, object]):
-        pass
-
+def test_mapping_protocol_input_and_mapping_subclass_output_are_compatible() -> None:
     class ResultMap(dict[str, object]):
         pass
 
-    def compatible(_request: RequestMap) -> ResultMap:
+    def compatible(_request: Mapping[str, object]) -> ResultMap:
         return ResultMap(status="complete")
 
     compatible.__capability_contract__ = {"input_type": "source-notes-request-v1",
@@ -318,6 +316,32 @@ def test_mapping_subclass_annotations_are_compatible() -> None:
 
     assert code == 0
     assert result["result"]["capabilities"][0]["contract_state"] == "compatible"
+
+
+def test_specific_request_mapping_subclass_is_rejected_without_execution() -> None:
+    executed = False
+
+    class RequestMap(dict[str, object]):
+        def specialized(self) -> str:
+            return "only-on-subclass"
+
+    def incompatible(request: RequestMap) -> dict:
+        nonlocal executed
+        executed = True
+        return {"status": request.specialized()}
+
+    incompatible.__capability_contract__ = {"input_type": "source-notes-request-v1",
+                                            "output_type": "command-response-v1"}
+    replacement = Capability(**{**CAPABILITIES["source.notes"].__dict__,
+                                "implementation": "video_extract.capabilities:specific_request_adapter"})
+    with patch.object(capability_module, "specific_request_adapter", incompatible, create=True), \
+            patch.dict(CAPABILITIES, {"source.notes": replacement}, clear=True):
+        code, result = run_cli("capability", "check", "source.notes")
+
+    assert code == 1
+    assert result["status"] == "unsupported"
+    assert result["result"]["capabilities"][0]["contract_state"] == "incompatible"
+    assert executed is False
 
 
 def test_run_incompatible_return_keeps_v1_envelope(tmp_path: Path) -> None:
