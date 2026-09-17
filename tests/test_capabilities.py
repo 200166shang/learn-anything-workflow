@@ -51,7 +51,7 @@ def test_list_declares_only_real_capability_contracts() -> None:
     assert code == 0
     assert result["api_version"] == 1
     assert result["status"] == "completed"
-    assert [item["id"] for item in result["result"]["capabilities"]] == ["media.acquire", "source.notes"]
+    assert [item["id"] for item in result["result"]["capabilities"]] == ["learning.learn", "media.acquire", "source.notes"]
     declared = next(item for item in result["result"]["capabilities"] if item["id"] == "source.notes")
     assert declared["contract_version"] == 1
     assert declared["input_type"] == "source-notes-request-v1"
@@ -63,6 +63,10 @@ def test_list_declares_only_real_capability_contracts() -> None:
     assert media["input_type"] == "media-acquire-request-v1"
     assert media["output_type"] == "command-response-v1"
     assert declared["implementation"] == "video_extract.capabilities:run_source_notes"
+
+    learning = next(item for item in result["result"]["capabilities"] if item["id"] == "learning.learn")
+    assert learning["input_type"] == "learning-request-v1"
+    assert learning["implementation"] == "video_extract.capabilities:run_learning"
 
 
 def test_check_reports_missing_entry_at_the_single_maintenance_mapping() -> None:
