@@ -71,4 +71,16 @@ video-extract install check --json
 
 `integrations/skills/`、`.codex/agents/` 和 Python 工具都只在本工程维护。`install apply` 在链接宿主入口前备份已有副本；`install check` 报告源码修订、内容指纹、依赖、安装漂移和确切维护位置。不要直接修改链接目标之外的安装副本。
 
+稳定能力入口由工程内唯一映射维护，调用方只保存能力 ID 和公开契约版本：
+
+~~~text
+video-extract capability list --json
+video-extract capability check source.notes --json
+video-extract capability run source.notes --request request.json --json
+~~~
+
+`source.notes` 的请求使用 `contract_version: 1`，包含 `action`（`prepare` 或 `finalize`）、`workspace`、`package` 和可选的 `source_version`。响应采用 `api_version: 1`；`completed` 退出 0，可继续但未完成的状态退出 3，其余失败状态退出非零。实现移动时只修改 `video_extract.capabilities:CAPABILITIES`；入口或版本不匹配会返回确切维护位置，不会猜测替代工具。
+
+`install apply` 在 Codex 安装根写入 `video-extract/install-receipt.json`，记录工程指纹和安装契约版本。`install check` 将源码、链接、依赖或收据漂移报告为 `recoverable_failure`。`workspace doctor` 同时汇总能力和安装诊断；可用 `--agents-root`、`--codex-root` 指向临时根完成隔离检查。
+
 移动工作区后更新 locator，并重新执行 editable 安装、`install check` 与 `workspace doctor`。不要在 skill 或 agent 中写入项目、Media、资料库或 Python 环境的机器路径。

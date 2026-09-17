@@ -41,6 +41,8 @@ class InstallationContractTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["api_version"], 1)
+        self.assertEqual(result["source"]["contract_version"], 2)
         self.assertRegex(result["source"]["revision"], r"^[0-9a-f]{40}$")
         self.assertRegex(result["source"]["content_fingerprint"], r"^[0-9a-f]{64}$")
         self.assertEqual(
@@ -59,6 +61,10 @@ class InstallationContractTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(result["status"], "completed")
+        receipt = self.codex_root / "video-extract/install-receipt.json"
+        self.assertTrue(receipt.is_file())
+        recorded = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(recorded["source"], result["source"])
         source = Path(result["source"]["path"])
         self.assertEqual(installed.resolve(), (source / "integrations/skills/source-notes").resolve())
         backup = Path(result["backup"])
@@ -81,7 +87,8 @@ class InstallationContractTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         item = next(entry for entry in result["entries"] if entry["id"] == "skill.extract-media")
         self.assertEqual(item["state"], "drifted")
-        self.assertEqual(result["status"], "installation_drift")
+        self.assertEqual(result["status"], "recoverable_failure")
+        self.assertIn("source_or_install_drift", result["diagnostics"][0])
         self.assertEqual(item["maintenance_path"], str(Path(result["source"]["path"]) / "integrations/skills/extract-media"))
 
     def test_apply_rolls_back_every_target_when_linking_is_interrupted(self):
@@ -107,6 +114,32 @@ class InstallationContractTests(unittest.TestCase):
         self.assertFalse(first.is_symlink())
         self.assertEqual(first.read_text(encoding="utf-8"), "manual agent\n")
         self.assertFalse((self.codex_root / "agents/source-notes-operator.toml").exists())
+
+    def test_check_reports_contract_drift_from_the_apply_receipt(self):
+        code, _ = self.run_cli("apply")
+        self.assertEqual(code, 0)
+        receipt = self.codex_root / "video-extract/install-receipt.json"
+        data = json.loads(receipt.read_text(encoding="utf-8"))
+        data["source"]["contract_version"] = 999
+        receipt.write_text(json.dumps(data), encoding="utf-8")
+
+        code, result = self.run_cli("check")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(result["status"], "recoverable_failure")
+        self.assertEqual(result["receipt"]["state"], "contract_drift")
+        self.assertIn("install plan", result["next_action"]["command"])
+
+    def test_check_requires_a_receipt_to_verify_installed_contract(self):
+        code, _ = self.run_cli("apply")
+        self.assertEqual(code, 0)
+        (self.codex_root / "video-extract/install-receipt.json").unlink()
+
+        code, result = self.run_cli("check")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(result["status"], "recoverable_failure")
+        self.assertEqual(result["receipt"]["state"], "missing")
 
 
 if __name__ == "__main__":

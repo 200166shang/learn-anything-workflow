@@ -16,7 +16,9 @@ from typing import Any
 
 
 PROJECT = Path(__file__).resolve().parent.parent
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
+API_VERSION = 1
+RECEIPT_PARTS = ("video-extract", "install-receipt.json")
 
 
 @dataclass(frozen=True)
@@ -140,22 +142,47 @@ def inspect(agents_root: Path, codex_root: Path) -> dict[str, Any]:
     entries_ok = all(item["state"] == "linked" for item in entries)
     dependencies_ok = all(dependencies.values())
     tool_ok = tool["matches_source"]
-    ok = entries_ok and dependencies_ok and tool_ok
+    receipt_path = codex_root.joinpath(*RECEIPT_PARTS)
+    receipt = None
+    if receipt_path.is_file():
+        try:
+            recorded = json.loads(receipt_path.read_text(encoding="utf-8"))
+            recorded_source = recorded.get("source", {})
+            if recorded_source.get("contract_version") != CONTRACT_VERSION:
+                state = "contract_drift"
+            elif recorded_source.get("content_fingerprint") != source_info()["content_fingerprint"]:
+                state = "source_drift"
+            else:
+                state = "matched"
+            receipt = {"path": str(receipt_path), "state": state, "recorded_source": recorded_source}
+        except (OSError, json.JSONDecodeError):
+            receipt = {"path": str(receipt_path), "state": "invalid"}
+    else:
+        receipt = {"path": str(receipt_path), "state": "missing"}
+    receipt_ok = receipt["state"] == "matched"
+    ok = entries_ok and dependencies_ok and tool_ok and receipt_ok
     status = "completed"
     diagnostics = []
     if not entries_ok or not tool_ok:
-        status = "installation_drift"
-        diagnostics.append("installed entries or the video-extract executable do not match the maintenance source")
+        status = "recoverable_failure"
+        diagnostics.append("source_or_install_drift: installed entries or the video-extract executable do not match the maintenance source")
+    elif not receipt_ok:
+        status = "recoverable_failure"
+        diagnostics.append(f"source_or_install_drift: install receipt is {receipt['state']}")
     elif not dependencies_ok:
         status = "missing_dependency"
         diagnostics.append("one or more required deterministic dependencies are unavailable")
     return {
+        "api_version": API_VERSION,
         "ok": ok,
         "status": status,
         "source": source_info(),
         "tool": tool,
         "dependencies": dependencies,
         "entries": entries,
+        "receipt": receipt,
+        "validation": {"entries": entries_ok, "dependencies": dependencies_ok, "tool": tool_ok, "receipt": receipt_ok},
+        "next_action": None if ok else {"command": "video-extract install plan --json", "maintenance_path": str(PROJECT / "video_extract/installation.py")},
         "diagnostics": diagnostics,
     }
 
@@ -164,6 +191,7 @@ def plan(agents_root: Path, codex_root: Path) -> dict[str, Any]:
     result = inspect(agents_root, codex_root)
     result["ok"] = True
     result["status"] = "completed"
+    result["next_action"] = {"command": "video-extract install apply --json"}
     result["changes"] = [
         {"id": item["id"], "action": "keep" if item["state"] == "linked" else "link", "target": item["target"]}
         for item in result["entries"]
@@ -214,6 +242,9 @@ def apply(agents_root: Path, codex_root: Path, backup_root: Path | None = None) 
             "diagnostics": [str(exc), *rollback_errors],
         })
         return result
+    from .manifest import atomic_write_json
+    receipt = codex_root.joinpath(*RECEIPT_PARTS)
+    atomic_write_json(receipt, {"api_version": API_VERSION, "source": source_info(), "entries": [entry.id for entry in ENTRIES]})
     result = inspect(agents_root, codex_root)
     result.update({"backup": str(backup), "backed_up": backed_up})
     return result
