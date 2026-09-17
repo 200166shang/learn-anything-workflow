@@ -187,13 +187,24 @@ def check_capabilities(capability_id: str | None = None) -> dict[str, Any]:
 
 
 def run_source_notes(request: dict[str, Any]) -> dict[str, Any]:
+    from .authoritative_notes import finalize_note, prepare_note
     from .notes_workflow import finalize, prepare
 
     workspace = discover_workspace(Path(request["workspace"]))
     if not workspace.workspace_id:
         raise WorkspaceError("workspace_id is required for stable public capability execution; add a persistent logical ID to workspace.toml")
-    package = Path(request["package"])
     action = request.get("action")
+    if workspace.schema_version == 2:
+        if action == "prepare":
+            prepared = prepare_note(workspace, request["source_id"], request.get("source_version"))
+            return {"status": "awaiting_ai", "action": "notes_write",
+                    "input": prepared["result"]["model_input"], "source_id": request["source_id"]}
+        if action == "finalize":
+            finalized = finalize_note(workspace, Path(request["request"]))
+            return {"status": "complete" if finalized["status"] == "completed" else finalized["status"],
+                    "output": (finalized.get("result") or {}).get("note"), "details": finalized}
+        return {"status": "needs_input", "error": "action must be prepare or finalize"}
+    package = Path(request["package"])
     if action == "prepare":
         return prepare(package, workspace)
     if action == "finalize":

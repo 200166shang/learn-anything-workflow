@@ -1,0 +1,425 @@
+"""Authoritative, source-version-pinned notes for workspace-v2.
+
+Source snapshots own source facts.  This store contains only note bodies, adopted
+attachments, citations, corrections and revision history, with source IDs as
+foreign keys.  A note commit becomes visible by replacing one current pointer.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .command_response import response
+from .manifest import atomic_write_json, read_json
+from .package_lock import package_lock
+from .source_registry import _load_snapshot
+from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
+
+SCHEMA_VERSION = 1
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _require_v2(config: WorkspaceConfig) -> tuple[Path, Path]:
+    if config.schema_version != PORTABLE_SCHEMA_VERSION or not config.results or not config.local:
+        raise WorkspaceError("workspace schema v2 is required for authoritative source notes")
+    return config.results.resolve(strict=False), config.local.resolve(strict=False)
+
+
+def _safe(root: Path, *parts: str) -> Path:
+    root = root.resolve(strict=False)
+    current = root
+    for part in parts:
+        current /= part
+        if current.is_symlink():
+            raise WorkspaceError(f"refusing symbolic link inside declared root: {current}")
+    resolved = current.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise WorkspaceError(f"path escapes declared root: {current}")
+    return current
+
+
+def _roots(config: WorkspaceConfig) -> tuple[Path, Path, Path, Path]:
+    results, _ = _require_v2(config)
+    root = _safe(results, "source-notes")
+    return (_safe(root, "objects"), _safe(root, "commits"),
+            _safe(root, "current.json"), _safe(root, "candidates"))
+
+
+def _sync_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _put(config: WorkspaceConfig, value: bytes) -> tuple[str, Path]:
+    objects, _, _, _ = _roots(config)
+    digest = _digest(value)
+    path = _safe(objects, digest[:2], digest)
+    if path.is_file():
+        if _digest(path.read_bytes()) != digest:
+            raise WorkspaceError(f"note object digest mismatch: {path}")
+        _sync_dir(path.parent)
+        return digest, path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("xb") as stream:
+        stream.write(value); stream.flush(); os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    _sync_dir(path.parent)
+    return digest, path
+
+
+def _load_current(config: WorkspaceConfig) -> dict[str, Any]:
+    _, commits, pointer, _ = _roots(config)
+    if not pointer.is_file():
+        return {"schema_version": 1, "revision": 0, "commit_id": None, "notes": {}, "objects": {}}
+    selected = read_json(pointer)
+    commit = commits / f"{selected.get('commit_id')}.json"
+    if not commit.is_file() or _digest(commit.read_bytes()) != selected.get("manifest_sha256"):
+        raise WorkspaceError("authoritative notes pointer does not resolve to a valid commit")
+    value = read_json(commit)
+    _validate_commit(config, value)
+    return value
+
+
+def _source_version(config: WorkspaceConfig, source_id: str, source_version: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot = _load_snapshot(config)
+    package = snapshot.get("sources", {}).get(source_id)
+    if not package:
+        raise ValueError(f"unknown source_id: {source_id}")
+    version_id = source_version or package["current_version"]
+    version = package["versions"].get(version_id)
+    if not version:
+        raise ValueError(f"unknown source_version for {source_id}: {version_id}")
+    return package, version
+
+
+def _source_text(config: WorkspaceConfig, version: dict[str, Any]) -> str:
+    if version.get("storage") != "object":
+        raise ValueError("source tree notes require an explicit textual scope; direct document notes only in T04")
+    assert config.results is not None
+    digest = version["object_sha256"]
+    path = _safe(config.results.resolve(strict=False), "objects", digest[:2], digest)
+    if not path.is_file() or _digest(path.read_bytes()) != digest:
+        raise WorkspaceError("registered source content object is missing or invalid")
+    return path.read_text(encoding="utf-8")
+
+
+def _paragraph_input(text: str) -> str:
+    blocks = [item.strip() for item in re.split(r"\n\s*\n", text) if item.strip()]
+    return "\n\n".join(f"[paragraph:{index}]\n{block}" for index, block in enumerate(blocks, 1))
+
+
+def _looks_like_srt(text: str) -> bool:
+    return bool(re.search(r"(?m)^\d+\s*\n\d\d:\d\d:\d\d[,\.]\d{3}\s+-->\s+", text))
+
+
+def prepare_note(config: WorkspaceConfig, source_id: str, source_version: str | None = None) -> dict[str, Any]:
+    _, local = _require_v2(config)
+    package, version = _source_version(config, source_id, source_version)
+    text = _source_text(config, version)
+    operation = "operation-" + _digest(f"notes.prepare:{config.workspace_id}:{source_id}:{version['source_version']}".encode())[:24]
+    directory = _safe(local, "note-operations", operation)
+    directory.mkdir(parents=True, exist_ok=True)
+    srt = _looks_like_srt(text)
+    locator_policy = ("Use only the real SRT cue ranges shown below. The transcript has "
+                      "unverified_video_association unless formal association evidence is supplied."
+                      if srt else
+                      "Use heading or paragraph:N locators shown below. Do not invent timestamps or visual evidence.")
+    model_input = directory / "notes-input.md"
+    model_input.write_text(
+        f"# Source-note model input\n\nsource_id: {source_id}\nsource_version: {version['source_version']}\n"
+        f"title: {package['title']}\nlocator_policy: {locator_policy}\n\n"
+        + (text if srt else _paragraph_input(text)), encoding="utf-8")
+    return response(
+        status="awaiting_model", workspace=str(config.config_path), operation_id=operation,
+        result={"source_id": source_id, "source_version": version["source_version"],
+                "model_input": str(model_input), "model_input_root": str(local)},
+        validation={"source": "passed", "source_version": "passed"},
+        provenance={"source_id": source_id, "source_version": version["source_version"]},
+        next_action={"type": "model", "action": "write source-grounded note",
+                     "request_schema": "source-note-finalize-request-v1"},
+        artifact_refs=[str(model_input)],
+    )
+
+
+def associate_sources(config: WorkspaceConfig, source_id: str, related_source_id: str,
+                      evidence: str | None) -> dict[str, Any]:
+    """Build a checked association record; finalize makes it authoritative with the note."""
+    _, source = _source_version(config, source_id, None)
+    _, related = _source_version(config, related_source_id, None)
+    verified = bool(evidence and evidence.strip())
+    association = {
+        "status": "verified" if verified else "insufficient_evidence",
+        "source_id": source_id, "source_version": source["source_version"],
+        "related_source_id": related_source_id,
+        "related_source_version": related["source_version"],
+        "evidence": evidence.strip() if verified else "No association evidence was supplied; do not infer matching media.",
+    }
+    if verified:
+        _, local = _require_v2(config)
+        association_id = "association-" + _digest(json.dumps(
+            association, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+        association["association_id"] = association_id
+        record = _safe(local, "source-associations", f"{association_id}.json")
+        atomic_write_json(record, association)
+    return response(status="completed", workspace=str(config.config_path), result={"association": association},
+                    validation={"sources": "passed", "association_evidence": "passed" if verified else "insufficient"},
+                    provenance={"source_id": source_id, "source_version": source["source_version"]})
+
+
+def _validate_request(config: WorkspaceConfig, value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ValueError("finalize request must be source-note-finalize-request-v1")
+    required = {"source_id", "source_version", "expected_revision", "markdown", "citations",
+                "corrections", "attachments", "association"}
+    if not required.issubset(value):
+        raise ValueError("finalize request is missing required note fields")
+    if not isinstance(value["markdown"], str) or not value["markdown"].strip():
+        raise ValueError("note markdown must be non-empty")
+    package, version = _source_version(config, value["source_id"], value["source_version"])
+    source_text = _source_text(config, version)
+    is_srt = _looks_like_srt(source_text)
+    allowed = {"timestamp"} if is_srt else {"paragraph", "heading"}
+    paragraphs = [item.strip() for item in re.split(r"\n\s*\n", source_text) if item.strip()]
+    if not value["citations"]:
+        raise ValueError("at least one source citation is required")
+    for citation in value["citations"]:
+        if citation.get("locator_type") not in allowed or not citation.get("locator") or not citation.get("claim"):
+            raise ValueError("citation locator is absent or unsupported for this source")
+        locator = citation["locator"]
+        if citation["locator_type"] == "timestamp" and locator not in source_text:
+            raise ValueError("timestamp citation does not match a real SRT cue")
+        if citation["locator_type"] == "paragraph":
+            match = re.fullmatch(r"paragraph:(\d+)", locator)
+            if not match or int(match.group(1)) > len(paragraphs):
+                raise ValueError("paragraph citation does not match the registered source")
+        if citation["locator_type"] == "heading" and locator.lstrip("# ") not in source_text:
+            raise ValueError("heading citation does not match the registered source")
+    for correction in value["corrections"]:
+        if not isinstance(correction, dict) or not all(correction.get(key) for key in ("original", "corrected", "evidence")):
+            raise ValueError("each correction must preserve the original wording, corrected wording, and evidence")
+    association = value["association"]
+    if not isinstance(association, dict) or association.get("status") not in {
+        "verified", "insufficient_evidence", "not_applicable"
+    }:
+        raise ValueError("association status is invalid")
+    if association["status"] == "verified":
+        required_association = {"association_id", "source_id", "source_version", "related_source_id",
+                                "related_source_version", "evidence"}
+        if not required_association.issubset(association) or not association["evidence"]:
+            raise ValueError("verified association requires a formal association record")
+        if association["source_id"] != value["source_id"] or association["source_version"] != value["source_version"]:
+            raise ValueError("association does not match the note source version")
+        _source_version(config, association["related_source_id"], association["related_source_version"])
+        canonical = {key: association[key] for key in association if key != "association_id"}
+        expected_id = "association-" + _digest(json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+        _, local = _require_v2(config)
+        record = _safe(local, "source-associations", f"{expected_id}.json")
+        if association["association_id"] != expected_id or not record.is_file() or read_json(record) != association:
+            raise ValueError("verified association was not produced by source associate")
+    return package, version
+
+
+def _validate_commit(config: WorkspaceConfig, commit: dict[str, Any]) -> None:
+    required = {"schema_version", "commit_id", "parent_commit_id", "revision", "created_at", "notes", "objects"}
+    if set(commit) != required or commit.get("schema_version") != 1 or not isinstance(commit.get("notes"), dict) or not isinstance(commit.get("objects"), dict):
+        raise WorkspaceError("invalid notes-snapshot-v1 commit")
+    identity_value = {key: value for key, value in commit.items() if key != "commit_id"}
+    expected_id = "note-commit-" + _digest(json.dumps(
+        identity_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+    if commit["commit_id"] != expected_id or not isinstance(commit["revision"], int) or commit["revision"] < 1:
+        raise WorkspaceError("notes commit identity or revision is invalid")
+    objects, _, _, _ = _roots(config)
+    source_snapshot = _load_snapshot(config)
+    for digest, metadata in commit["objects"].items():
+        path = _safe(objects, digest[:2], digest)
+        if not path.is_file() or _digest(path.read_bytes()) != digest or path.stat().st_size != metadata.get("size"):
+            raise WorkspaceError(f"invalid authoritative note object: {digest}")
+    for source_id, note in commit["notes"].items():
+        source = source_snapshot.get("sources", {}).get(source_id)
+        if not source or note.get("source_version") not in source.get("versions", {}):
+            raise WorkspaceError(f"note source foreign key is invalid: {source_id}")
+        refs = [note.get("body_object"), note.get("citations_object"), note.get("corrections_object"), *note.get("attachment_objects", [])]
+        if any(ref not in commit["objects"] for ref in refs):
+            raise WorkspaceError(f"note object reachability is incomplete: {source_id}")
+        if len(note.get("history", [])) != note.get("revision"):
+            raise WorkspaceError(f"note history is incomplete: {source_id}")
+        for expected_revision, entry in enumerate(note["history"], 1):
+            if entry.get("revision") != expected_revision or entry.get("body_object") not in commit["objects"]:
+                raise WorkspaceError(f"note history entry is invalid: {source_id}")
+            if entry.get("source_version") not in source["versions"] or not entry.get("created_at"):
+                raise WorkspaceError(f"note history source version is invalid: {source_id}")
+        association = note.get("association")
+        if not isinstance(association, dict) or association.get("status") not in {
+            "verified", "insufficient_evidence", "not_applicable"
+        }:
+            raise WorkspaceError(f"note association is invalid: {source_id}")
+        if association["status"] == "verified":
+            related = source_snapshot.get("sources", {}).get(association.get("related_source_id"))
+            if not related or association.get("related_source_version") not in related.get("versions", {}):
+                raise WorkspaceError(f"note association foreign key is invalid: {source_id}")
+
+
+def _publish(config: WorkspaceConfig, previous: dict[str, Any], notes: dict[str, Any], new_objects: dict[str, Any]) -> dict[str, Any]:
+    _, commits, pointer, _ = _roots(config)
+    manifest = {"schema_version": 1, "parent_commit_id": previous.get("commit_id"),
+                "revision": int(previous["revision"]) + 1, "created_at": _now(),
+                "notes": notes, "objects": {**previous.get("objects", {}), **new_objects}}
+    identity = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    manifest["commit_id"] = "note-commit-" + _digest(identity)
+    _validate_commit(config, manifest)
+    raw = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n"
+    commits.mkdir(parents=True, exist_ok=True)
+    path = commits / f"{manifest['commit_id']}.json"
+    if not path.exists():
+        with path.open("xb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+    elif path.read_bytes() != raw:
+        raise WorkspaceError(f"immutable note commit differs from published content: {manifest['commit_id']}")
+    _sync_dir(commits)
+    if os.environ.get("VIDEO_EXTRACT_NOTES_TEST_FAULT") == "before_publish":
+        raise OSError("injected failure before notes publish")
+    atomic_write_json(pointer, {"schema_version": 1, "commit_id": manifest["commit_id"],
+                                "manifest_sha256": _digest(raw)})
+    _sync_dir(pointer.parent)
+    if os.environ.get("VIDEO_EXTRACT_NOTES_TEST_FAULT") == "after_publish":
+        raise OSError("injected failure after notes publish")
+    return manifest
+
+
+def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
+    _require_v2(config)
+    value = read_json(request)
+    _, version = _validate_request(config, value)
+    source_id = value["source_id"]
+    _, _, _, candidates = _roots(config)
+    assert config.results is not None
+    try:
+        with package_lock(_safe(config.results.resolve(strict=False), "source-notes")):
+            previous = _load_current(config)
+            existing = previous["notes"].get(source_id)
+            note_revision = int(existing.get("revision", 0)) if existing else 0
+            if value["expected_revision"] != note_revision:
+                candidates.mkdir(parents=True, exist_ok=True)
+                candidate = candidates / f"candidate-{uuid.uuid4()}.json"
+                atomic_write_json(candidate, value)
+                return response(status="awaiting_user", workspace=str(config.config_path),
+                                result={"source_id": source_id, "candidate": str(candidate),
+                                        "observed_revision": note_revision},
+                                validation={"expected_revision": "conflict"},
+                                next_action={"type": "user", "reason": "resolve note revision conflict"})
+            prospective = {
+                "body_object": _digest(value["markdown"].encode()),
+                "citations_object": _digest(json.dumps(value["citations"], ensure_ascii=False, sort_keys=True).encode()),
+                "corrections_object": _digest(json.dumps(value["corrections"], ensure_ascii=False, sort_keys=True).encode()),
+                "attachment_objects": [_digest(Path(item).expanduser().resolve().read_bytes()) for item in value["attachments"]],
+            }
+            if existing and existing.get("source_version") == version["source_version"] and all(
+                existing.get(key) == expected for key, expected in prospective.items()
+            ) and existing.get("association") == value["association"]:
+                body_path = _safe(_roots(config)[0], prospective["body_object"][:2], prospective["body_object"])
+                return response(status="completed", workspace=str(config.config_path),
+                                result={"source_id": source_id, "source_version": version["source_version"],
+                                        "revision": note_revision, "commit_id": previous["commit_id"],
+                                        "history_length": len(existing["history"]), "note": str(body_path),
+                                        "action": "reused"},
+                                validation={"commit": "passed", "objects": "passed", "source": "passed"})
+            values: list[tuple[str, bytes, str]] = [
+                ("body", value["markdown"].encode(), "note_markdown"),
+                ("citations", json.dumps(value["citations"], ensure_ascii=False, sort_keys=True).encode(), "citations"),
+                ("corrections", json.dumps(value["corrections"], ensure_ascii=False, sort_keys=True).encode(), "corrections"),
+            ]
+            attachment_digests = []
+            new_objects: dict[str, Any] = {}
+            stored: dict[str, tuple[str, Path]] = {}
+            for label, body, kind in values:
+                digest, path = _put(config, body); stored[label] = (digest, path)
+                new_objects[digest] = {"kind": kind, "size": len(body)}
+            for raw_attachment in value["attachments"]:
+                attachment = Path(raw_attachment).expanduser().resolve()
+                body = attachment.read_bytes(); digest, _ = _put(config, body)
+                attachment_digests.append(digest); new_objects[digest] = {"kind": "adopted_attachment", "size": len(body)}
+            revision = note_revision + 1
+            history = [*(existing or {}).get("history", []), {"revision": revision, "body_object": stored["body"][0],
+                       "source_version": version["source_version"], "created_at": _now()}]
+            note = {"source_id": source_id, "source_version": version["source_version"], "revision": revision,
+                    "body_object": stored["body"][0], "citations_object": stored["citations"][0],
+                    "corrections_object": stored["corrections"][0], "attachment_objects": attachment_digests,
+                    "association": value["association"], "history": history}
+            published = _publish(config, previous, {**previous["notes"], source_id: note}, new_objects)
+            return response(status="completed", workspace=str(config.config_path),
+                            result={"source_id": source_id, "source_version": version["source_version"],
+                                    "revision": revision, "commit_id": published["commit_id"],
+                                    "history_length": len(history), "note": str(stored["body"][1]),
+                                    "action": "published"},
+                            validation={"commit": "passed", "objects": "passed", "source": "passed"},
+                            provenance={"source_id": source_id, "source_version": version["source_version"],
+                                        "note_commit_id": published["commit_id"]},
+                            artifact_refs=[str(stored["body"][1])])
+    except OSError as exc:
+        current = _load_current(config)
+        return response(status="recoverable_failure", workspace=str(config.config_path),
+                        result={"source_id": source_id, "visible_commit_id": current.get("commit_id")},
+                        validation={"commit": "uncertain", "durability": "unknown"}, diagnostics=[str(exc)],
+                        next_action={"type": "reconcile", "source_id": source_id})
+
+
+def audit_notes(config: WorkspaceConfig) -> dict[str, Any]:
+    _, commits, _, _ = _roots(config)
+    current = _load_current(config)
+    checked = 0
+    by_id: dict[str, dict[str, Any]] = {}
+    for path in sorted(commits.glob("note-commit-*.json")) if commits.exists() else []:
+        value = read_json(path)
+        _validate_commit(config, value)
+        if path.name != f"{value['commit_id']}.json":
+            raise WorkspaceError(f"notes commit filename/identity mismatch: {path.name}")
+        by_id[value["commit_id"]] = value
+        checked += 1
+    for value in by_id.values():
+        parent_id = value["parent_commit_id"]
+        if parent_id is None:
+            if value["revision"] != 1:
+                raise WorkspaceError("root notes commit revision is not 1")
+        else:
+            parent = by_id.get(parent_id)
+            if not parent or parent["revision"] + 1 != value["revision"]:
+                raise WorkspaceError(f"notes commit parent/revision chain is invalid: {value['commit_id']}")
+    if current.get("commit_id") and current["commit_id"] not in by_id:
+        raise WorkspaceError("current notes commit is absent from audit enumeration")
+    objects, _, _, _ = _roots(config)
+    notes = [{"source_id": source_id, "source_version": note["source_version"],
+              "revision": note["revision"], "note": str(_safe(objects, note["body_object"][:2], note["body_object"])),
+              "commit_id": current["commit_id"]} for source_id, note in sorted(current["notes"].items())]
+    return response(status="completed", workspace=str(config.config_path),
+                    result={"commit_count": checked, "notes": notes},
+                    validation={"commits": "passed", "objects": "passed", "sources": "passed"})
+
+
+def reconcile_notes(config: WorkspaceConfig) -> dict[str, Any]:
+    audited = audit_notes(config)
+    objects, commits, pointer, _ = _roots(config)
+    for path in (objects, commits, pointer.parent):
+        _sync_dir(path)
+    audited["result"]["durability"] = "confirmed"
+    audited["validation"]["durability"] = "passed"
+    return audited
