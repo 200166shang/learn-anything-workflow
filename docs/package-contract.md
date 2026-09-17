@@ -28,6 +28,11 @@ monotonic fencing counter and lease owner. Adapter results are accepted only
 while both still match the persisted lease, so an expired worker cannot publish
 over a newer attempt.
 
+A reconciliation transport failure is itself a persisted query attempt. It
+keeps the original idempotency token and query handle unchanged, remains
+`uncertain`, and offers only another `operation reconcile` command; it never
+falls through to acquisition resume.
+
 ## Current public workflows and retained validation goals
 
 - New acquisition uses `plan/ensure --media`; it never synthesizes a missing language track.

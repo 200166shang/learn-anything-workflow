@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -426,7 +427,23 @@ def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str,
         if not acquired:
             record = read_json(path); record["status"] = "busy"; return _public(config, record)
         record = read_json(path)
-        checked = _check_adapter_result(config, record)
+        try:
+            checked = _check_adapter_result(config, record)
+        except Exception as exc:
+            attempt = record.get("current_attempt", {})
+            record["status"] = "uncertain"
+            record.setdefault("reconciliation", []).append({
+                "state": "query_failed", "adapter_id": attempt.get("adapter_id"),
+                "query_handle": attempt.get("query_handle"), "queried_at": _now().isoformat(),
+                "diagnostic": str(exc),
+            })
+            record["diagnostics"] = [f"adapter result query failed: {exc}"]
+            command = (f"video-extract operation reconcile {shlex.quote(operation_id)} "
+                       f"--workspace {shlex.quote(str(config.config_path))} --json")
+            record["next_action"] = {"type": "reconcile", "command": command,
+                                     "reason": "retry the result query; do not resume acquisition"}
+            atomic_write_json(path, record)
+            return _public(config, record)
         state = checked.get("state")
         record.setdefault("reconciliation", []).append({key: value for key, value in checked.items()
                                                          if key != "artifacts"})

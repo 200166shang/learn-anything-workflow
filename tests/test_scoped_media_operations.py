@@ -247,6 +247,49 @@ def test_adapter_protocol_recovers_available_result_without_reacquiring(tmp_path
     assert adapter.counter == ["chapter-2"]
 
 
+def test_reconcile_query_failure_is_v1_uncertain_then_available_without_reacquire(tmp_path, capsys):
+    request_path, _ = request_fixture(tmp_path)
+
+    class QueryFailsOnce(FixtureAdapter):
+        def __init__(self):
+            super().__init__(reconcile_state="available")
+            self.queries = 0
+
+        def acquire(self, *args, **kwargs):
+            super().acquire(*args, **kwargs)
+            raise RuntimeError("response lost after completion")
+
+        def reconcile(self, attempt, target):
+            self.queries += 1
+            if self.queries == 1:
+                raise RuntimeError("query transport unavailable")
+            return super().reconcile(attempt, target)
+
+    adapter = use_adapter(QueryFailsOnce())
+    _, failed = invoke(capsys, "ensure", "--request", str(request_path))
+    operation_path = tmp_path / "local" / "operations" / f"{failed['operation_id']}.json"
+    before = json.loads(operation_path.read_text())
+
+    code, query_failed = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                                "--workspace", str(tmp_path / "workspace.toml"))
+    after_failure = json.loads(operation_path.read_text())
+    assert code == 3
+    assert query_failed["api_version"] == 1
+    assert query_failed["status"] == "uncertain"
+    assert query_failed["next_action"]["type"] == "reconcile"
+    assert "video-extract operation reconcile" in query_failed["next_action"]["command"]
+    assert "query transport unavailable" in query_failed["diagnostics"][0]
+    assert after_failure["current_attempt"] == before["current_attempt"]
+    assert after_failure["reconciliation"][-1]["state"] == "query_failed"
+
+    code, completed = invoke(capsys, "operation", "reconcile", failed["operation_id"],
+                             "--workspace", str(tmp_path / "workspace.toml"))
+    assert code == 0
+    assert completed["status"] == "completed"
+    assert adapter.counter == ["chapter-2"]
+    assert adapter.queries == 2
+
+
 def test_idempotency_token_is_stable_across_reconciled_resume(tmp_path, capsys):
     request_path, _ = request_fixture(tmp_path)
     adapter = use_adapter(FixtureAdapter(fail=True, reconcile_state="retry_safe"))
