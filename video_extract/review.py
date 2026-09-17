@@ -306,6 +306,20 @@ def show(config: WorkspaceConfig, question_id: str | None = None) -> dict[str, A
         validation={"review_record": "passed"})
 
 
+def suggestion_facts(config: WorkspaceConfig, on_date: str) -> dict[str, Any]:
+    """Project the latest Review fact per question up to one actual date."""
+    from datetime import date
+    as_of = date.fromisoformat(on_date)
+    snapshot = _load(config); latest: dict[str, dict[str, Any]] = {}
+    events = sorted(snapshot["record"]["events"].values(),
+                    key=lambda item: (item["created_at"], item["event_id"]))
+    for event in events:
+        review_day = date.fromisoformat(event.get("review_date") or event["created_at"][:10])
+        if review_day <= as_of:
+            latest[event["pin"]["question_id"]] = {**event, "review_day": review_day.isoformat()}
+    return {"commit_id": snapshot.get("commit_id"), "latest_by_question": latest}
+
+
 def backup_entries(config: WorkspaceConfig) -> dict[str, Any]:
     snapshot = _load(config)
     if snapshot["revision"] == 0:

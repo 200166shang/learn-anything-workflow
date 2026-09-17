@@ -222,6 +222,21 @@ def show(config: WorkspaceConfig, card_id: str | None = None) -> dict[str, Any]:
                     validation={"card_record": "passed", "history": "passed"})
 
 
+def suggestion_facts(config: WorkspaceConfig, on_date: str) -> dict[str, Any]:
+    """Project active card semantics and reconstructed schedules for suggestions."""
+    snapshot = _load(config); facts = []
+    for card in snapshot["record"]["cards"].values():
+        version = card["versions"][card["active_version_id"]]
+        facts.append({
+            "card_id": card["card_id"], "memory_target": card["memory_target"],
+            "conditions": card["conditions"], "question_ids": list(card["question_ids"]),
+            "version": version,
+            "schedule": schedule(config, card_version_id=version["card_version_id"],
+                                 on_date=on_date)["result"],
+        })
+    return {"commit_id": snapshot.get("commit_id"), "cards": facts}
+
+
 def revise(config: WorkspaceConfig, card_id: str, change_type: str, *, prompt: str | None,
            answer: str | None, conditions: str | None, effective_date: str) -> dict[str, Any]:
     chosen_date = date.fromisoformat(effective_date)
