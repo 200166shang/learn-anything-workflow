@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/netease-publish-request-v1.schema.json",
+  "title": "NetEase publish request v1",
+  "type": "object",
+  "required": ["contract_version", "workspace", "package", "audio_operation_id", "output_sha256", "account_ref"],
+  "properties": {
+    "contract_version": {"const": 1},
+    "workspace": {"type": "string", "minLength": 1},
+    "package": {"type": "string", "minLength": 1},
+    "audio_operation_id": {"type": "string", "pattern": "^operation-[0-9a-f]{24}$"},
+    "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "account_ref": {"type": "string", "minLength": 1},
+    "authorization_ref": {"type": "string", "minLength": 1},
+    "adapter": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

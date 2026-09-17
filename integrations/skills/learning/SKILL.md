@@ -13,6 +13,8 @@ Save the chosen root immediately with `learning thread create`. Save every actua
 
 Run `explanation prepare` for the selected question and follow its model action. Preserve the returned stable section marker. Distinguish course facts, current code, supplemental sources, and inference in the evidence JSON. Commit only via `explanation commit`; never overwrite result objects or learning snapshot files directly.
 
+Register public supplemental material with complete provenance and applicability, then add it with role `supplemental_source`. Treat `manual_review_required` as an external-fact review boundary. Before reuse, honor `learning module show` and `learning locate` source checks: keep historical explanation locations visible, revise only `needs_review` claims, and do not silently move a pinned reference to a new source version. Current-code locators use exactly `file::symbol`/`symbol` or `file:start-end`/`line_range` plus the file content digest; bare files are invalid. An inference never becomes a course or code fact.
+
 Choose the teaching profile that matches the material: `linear_transform`, `recognition_to_action`, or `frame_pipeline`. The final explanation must support the profile's causal and boundary checks, not merely contain a fixed summary template. If a required source version is unavailable, pause that question and leave unrelated questions usable.
 
 After a complete explanation, offer the user the understood/confused/parked choice conversationally. Feedback persistence and cross-root navigation are delivered by later learning slices; do not invent those records here.

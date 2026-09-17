@@ -118,6 +118,50 @@ def test_register_document_reuses_source_identity_and_versions_content(tmp_path:
     assert current["result"]["source_version"] == first_version
 
 
+def test_register_supplemental_source_preserves_public_provenance_and_unknown_is_explicit(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = tmp_path / "reference.md"
+    source.write_text("# Public explanation\nOnly applies to CPython 3.13.\n", encoding="utf-8")
+    provenance = tmp_path / "provenance.json"
+    provenance.write_text(json.dumps({
+        "origin": "https://example.org/reference",
+        "author_or_organization": "Example Institute",
+        "published_version_or_date": "2026-08-01",
+        "accessed_at": "2026-09-17T09:00:00+08:00",
+        "summary": "Explains the public API behavior.",
+        "locator": "Section 2, API boundary",
+        "applicability": "CPython 3.13 only",
+        "verification": "manual_review_required",
+    }), encoding="utf-8")
+
+    code, registered = cli("source", "register", source, "--provenance", provenance,
+                           "--workspace", config, "--json")
+    assert code == 0
+    code, verified = cli("source", "verify", registered["result"]["source_id"],
+                         "--workspace", config, "--json")
+    assert code == 0
+    assert verified["result"]["provenance_status"] == "recorded"
+    assert verified["result"]["provenance"] == json.loads(provenance.read_text())
+
+    _, module = cli("learning", "module", "create", "--goal", "check applicability", "--scope", "API",
+                    "--source-id", registered["result"]["source_id"],
+                    "--source-version", registered["result"]["source_version"],
+                    "--source-role", "supplemental_source", "--workspace", config, "--json")
+    _, rooted = cli("learning", "thread", "create", "--module-id", module["result"]["module"]["module_id"],
+                    "--root-question", "When does it apply?", "--workspace", config, "--json")
+    _, prepared = cli("explanation", "prepare", "--question-id", rooted["result"]["question"]["question_id"],
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    assert prepared["result"]["source_context"][0]["provenance"]["applicability"] == "CPython 3.13 only"
+    assert prepared["result"]["source_context"][0]["provenance"]["verification"] == "manual_review_required"
+
+    plain = tmp_path / "plain.md"; plain.write_text("legacy-style source\n", encoding="utf-8")
+    _, unannotated = cli("source", "register", plain, "--workspace", config, "--json")
+    _, checked = cli("source", "verify", unannotated["result"]["source_id"],
+                     "--workspace", config, "--json")
+    assert checked["result"]["provenance_status"] == "unknown"
+    assert checked["result"]["provenance"] is None
+
+
 def test_import_alias_and_doctor_validate_the_published_store(tmp_path: Path) -> None:
     config = write_workspace(tmp_path / "workspace")
     source = tmp_path / "fixture.txt"
@@ -161,10 +205,13 @@ def test_register_code_directory_records_git_and_dirty_content(tmp_path: Path) -
     subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
     subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
     (repo / "main.py").write_text("answer = 1\n", encoding="utf-8")
-    subprocess.run(["git", "-C", repo, "add", "main.py"], check=True)
+    (repo / "removed.py").write_text("remove = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repo, "add", "main.py", "removed.py"], check=True)
     subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
     commit = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
     (repo / "main.py").write_text("answer = 2\n", encoding="utf-8")
+    (repo / "added.py").write_text("added = True\n", encoding="utf-8")
+    (repo / "removed.py").unlink()
 
     code, result = cli("source", "register", repo, "--workspace", config, "--json")
 
@@ -174,7 +221,99 @@ def test_register_code_directory_records_git_and_dirty_content(tmp_path: Path) -
     assert basis["git_commit"] == commit
     assert basis["working_tree_dirty"] is True
     assert basis["content_sha256"]
+    assert basis["dirty_files"] == {"modified": ["main.py"], "added": ["added.py"], "deleted": ["removed.py"]}
     assert result["result"]["storage"] == "reference"
+    _, verified = cli("source", "verify", result["result"]["source_id"],
+                      "--workspace", config, "--json")
+    assert verified["result"]["observed_version_basis"] == basis
+
+
+def test_git_provenance_is_scoped_to_registered_monorepo_directory_and_expands_rename(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "monorepo"; scope = repo / "packages" / "learn"; outside = repo / "packages" / "other"
+    scope.mkdir(parents=True); outside.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    (scope / "old.py").write_text("value = 1\n"); (outside / "outside.py").write_text("outside = 1\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+
+    (outside / "outside.py").write_text("outside = 2\n")
+    clean_scope = register(WorkspaceConfig.load(config), scope)
+    assert clean_scope["result"]["version_basis"]["working_tree_dirty"] is False
+    assert clean_scope["result"]["version_basis"]["dirty_files"] == {
+        "modified": [], "added": [], "deleted": []}
+
+    subprocess.run(["git", "-C", repo, "mv", "packages/learn/old.py", "packages/learn/new.py"], check=True)
+    renamed = register(WorkspaceConfig.load(config), scope)
+    assert renamed["result"]["version_basis"]["dirty_files"] == {
+        "modified": [], "added": ["new.py"], "deleted": ["old.py"]}
+    assert all(".." not in path for paths in renamed["result"]["version_basis"]["dirty_files"].values()
+               for path in paths)
+
+
+def test_git_provenance_cross_scope_renames_record_only_the_in_scope_side(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "monorepo"; scope = repo / "scope"; outside = repo / "outside"
+    scope.mkdir(parents=True); outside.mkdir()
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    (scope / "moves-out.py").write_text("out = 1\n")
+    (outside / "moves-in.py").write_text("inside = 1\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+
+    subprocess.run(["git", "-C", repo, "mv", "scope/moves-out.py", "outside/moves-out.py"], check=True)
+    subprocess.run(["git", "-C", repo, "mv", "outside/moves-in.py", "scope/moves-in.py"], check=True)
+    registered = register(WorkspaceConfig.load(config), scope)
+
+    assert registered["result"]["version_basis"]["dirty_files"] == {
+        "modified": [], "added": ["moves-in.py"], "deleted": ["moves-out.py"]}
+
+
+def test_git_provenance_uses_literal_pathspec_for_special_registered_directory(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "monorepo"; scope = repo / "pkg[*]"; sibling = repo / "pkga"
+    scope.mkdir(parents=True); sibling.mkdir()
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    (scope / "inside.py").write_text("inside = 1\n"); (sibling / "outside.py").write_text("outside = 1\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+    (scope / "inside.py").write_text("inside = 2\n")
+    (sibling / "outside.py").write_text("outside = 2\n")
+
+    registered = register(WorkspaceConfig.load(config), scope)
+
+    assert registered["result"]["version_basis"]["dirty_files"] == {
+        "modified": ["inside.py"], "added": [], "deleted": []}
+
+
+def test_git_copy_status_records_only_destination_as_added(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "repo"; scope = repo / "scope"; scope.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "status.renames", "copies"], check=True)
+    original = "\n".join(f"shared_{index} = 'copy me'" for index in range(20)) + "\n"
+    (scope / "source.py").write_text(original)
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+    (scope / "copied.py").write_text(original)
+    (scope / "source.py").write_text(original + "source_changed = True\n")
+    subprocess.run(["git", "-C", repo, "add", "scope/copied.py", "scope/source.py"], check=True)
+
+    raw = subprocess.check_output(
+        ["git", "--literal-pathspecs", "-C", repo, "status", "--porcelain=v1", "-z", "--", "scope"])
+    assert b"C  scope/copied.py\x00scope/source.py\x00" in raw, raw
+    registered = register(WorkspaceConfig.load(config), scope)
+
+    assert registered["result"]["version_basis"]["dirty_files"] == {
+        "modified": ["source.py"], "added": ["copied.py"], "deleted": []}
 
 
 def test_relocate_finds_same_version_and_does_not_accept_different_content(tmp_path: Path) -> None:
@@ -469,6 +608,36 @@ def test_pre_publish_retry_replays_source_id_title_and_operation_identity(tmp_pa
     _, verified = cli("source", "verify", retried["result"]["source_id"],
                       "--workspace", config_path, "--json")
     assert verified["result"]["title"] == title
+
+
+def test_pre_publish_retry_replays_immutable_provenance(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    workspace = WorkspaceConfig.load(config_path)
+    source = tmp_path / "source with spaces.txt"; source.write_text("one\n")
+    provenance = {"origin": "https://example.org/a b", "author_or_organization": "Example Org",
+                  "published_version_or_date": "2026-09-01", "accessed_at": "2026-09-17T09:00:00+08:00",
+                  "summary": "public fact", "locator": "section 1", "applicability": "version 1",
+                  "verification": "manual_review_required"}
+    real_sync = __import__("video_extract.source_registry", fromlist=["_sync_directory"])._sync_directory
+    failed_once = False
+
+    def fail_first_hash_dir(path: Path) -> None:
+        nonlocal failed_once
+        if Path(path).parent.name == "objects" and not failed_once:
+            failed_once = True
+            raise OSError("first hash directory sync failed")
+        real_sync(path)
+
+    with patch("video_extract.source_registry._sync_directory", side_effect=fail_first_hash_dir):
+        failed = register(workspace, source, expected_revision=0, provenance=provenance)
+    assert failed["status"] == "recoverable_failure"
+    assert "--provenance" in failed["next_action"]["command"]
+    completed = run_recovery_command(failed["next_action"]["command"])
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    retried = json.loads(completed.stdout)
+    _, verified = cli("source", "verify", retried["result"]["source_id"],
+                      "--workspace", config_path, "--json")
+    assert verified["result"]["provenance"] == provenance
 
 
 def test_committed_source_id_cannot_be_recovered_to_unmapped_different_source(tmp_path: Path) -> None:

@@ -51,7 +51,9 @@ def test_list_declares_only_real_capability_contracts() -> None:
     assert code == 0
     assert result["api_version"] == 1
     assert result["status"] == "completed"
-    assert [item["id"] for item in result["result"]["capabilities"]] == ["learning.learn", "media.acquire", "source.notes"]
+    assert [item["id"] for item in result["result"]["capabilities"]] == [
+        "audio.mandarin", "learning.learn", "media.acquire", "publish.netease", "source.notes"
+    ]
     declared = next(item for item in result["result"]["capabilities"] if item["id"] == "source.notes")
     assert declared["contract_version"] == 1
     assert declared["input_type"] == "source-notes-request-v1"
