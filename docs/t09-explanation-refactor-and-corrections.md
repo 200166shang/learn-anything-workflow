@@ -13,9 +13,13 @@ JSON inputs make a same-root refactor explicit:
   their applicability boundary, source-grounded evidence, and affected conclusions. Confirmed corrections
   live on the explanation, independently of an individual prose revision.
 
-Every later commit must retain each corrected claim and its structured
-applicability text, and must not reintroduce the original claim. A violating
-candidate pauses for user revision without publication.
+The tool writes one authoritative `correction-id` block for each confirmed
+correction. Every later commit must retain that unique block with the exact
+corrected claim and structured applicability text. Outside those blocks, an
+independent paragraph/sentence or explicit claim marker must not reintroduce
+the original assertion. This permits a narrowed correction to quote the old
+wording inside its corrected claim without a substring false positive. A
+violating candidate pauses for user revision without publication.
 
 The publication updates Markdown, locators, revision history, and correction
 facts in one learning snapshot. A stale `--expected-revision` preserves the

@@ -688,16 +688,50 @@ def _store_learning_object(config: WorkspaceConfig, body: bytes) -> tuple[str, P
     return digest, path
 
 
+_CORRECTION_BLOCK = re.compile(
+    r"<!-- correction-id: (correction-[0-9a-f-]{36}) -->\n(.*?)\n<!-- /correction-id: \1 -->",
+    re.DOTALL,
+)
+
+
+def _correction_block(correction: dict[str, Any]) -> str:
+    return (f"<!-- correction-id: {correction['correction_id']} -->\n"
+            f"纠正说法：{correction['corrected_claim']}\n"
+            f"适用边界：{correction['applicability']}\n"
+            f"<!-- /correction-id: {correction['correction_id']} -->")
+
+
+def _independent_claims(text: str) -> set[str]:
+    without_blocks = _CORRECTION_BLOCK.sub("", text)
+    explicit = re.findall(r"<!--\s*claim:\s*(.*?)\s*-->", without_blocks)
+    sentences = re.split(r"\n\s*\n|(?<=[。！？!?])\s*", without_blocks)
+    normalized = {re.sub(r"^(?:#+|[-*>])\s*", "", item.strip()).rstrip("。！？!?")
+                  for item in [*explicit, *sentences] if item.strip()}
+    return normalized
+
+
+def _replace_independent_claim(text: str, original: str, corrected: str) -> str:
+    paragraph = re.compile(rf"(?m)^(\s*){re.escape(original.rstrip('。！？!?'))}[。！？!?]?\s*$")
+    text = paragraph.sub(lambda match: f"{match.group(1)}{corrected}", text)
+    claim_marker = re.compile(rf"<!--\s*claim:\s*{re.escape(original)}\s*-->")
+    return claim_marker.sub(f"<!-- claim: {corrected} -->", text)
+
+
 def _confirmed_correction_errors(text: str, corrections: list[dict[str, Any]]) -> list[str]:
     errors: list[str] = []
+    blocks: dict[str, list[str]] = {}
+    for correction_id, content in _CORRECTION_BLOCK.findall(text):
+        blocks.setdefault(correction_id, []).append(content)
+    independent_claims = _independent_claims(text)
     for correction in corrections:
-        if correction["original_claim"] in text:
+        correction_blocks = blocks.get(correction["correction_id"], [])
+        if len(correction_blocks) != 1:
+            errors.append(f"confirmed correction block must occur exactly once: {correction['correction_id']}")
+        elif (f"纠正说法：{correction['corrected_claim']}" not in correction_blocks[0]
+              or f"适用边界：{correction.get('applicability', '')}" not in correction_blocks[0]):
+            errors.append(f"confirmed correction block content is incomplete: {correction['correction_id']}")
+        if correction["original_claim"].rstrip("。！？!?") in independent_claims:
             errors.append(f"confirmed correction would reintroduce original claim: {correction['correction_id']}")
-        if correction["corrected_claim"] not in text:
-            errors.append(f"confirmed corrected claim is missing: {correction['correction_id']}")
-        applicability = correction.get("applicability")
-        if applicability and applicability not in text:
-            errors.append(f"confirmed correction applicability is missing: {correction['correction_id']}")
     return errors
 
 
@@ -852,20 +886,24 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
                 return response(status="failed", workspace=str(config.config_path),
                                 validation={"corrections": "failed"},
                                 diagnostics=["correction evidence is outside the selected root's confirmed source scope"])
-            if (correction["original_claim"] in text or correction["corrected_claim"] not in text
-                    or correction["applicability"] not in text):
-                return response(status="failed", workspace=str(config.config_path),
-                                validation={"corrections": "failed"},
-                                diagnostics=["current draft must remove the original claim and contain the corrected claim and applicability"])
             correction_id = "correction-" + str(uuid.uuid4())
-            confirmed_corrections.append({"correction_id": correction_id,
-                                          "original_claim": correction["original_claim"],
-                                          "corrected_claim": correction["corrected_claim"],
-                                          "applicability": correction["applicability"],
-                                          "evidence_refs": correction["evidence_refs"],
-                                          "affected_conclusions": correction["affected_conclusions"],
-                                          "confirmed_at": _now(), "introduced_revision": revision})
+            confirmed = {"correction_id": correction_id,
+                         "original_claim": correction["original_claim"],
+                         "corrected_claim": correction["corrected_claim"],
+                         "applicability": correction["applicability"],
+                         "evidence_refs": correction["evidence_refs"],
+                         "affected_conclusions": correction["affected_conclusions"],
+                         "confirmed_at": _now(), "introduced_revision": revision}
+            confirmed_corrections.append(confirmed)
             introduced_correction_ids.append(correction_id)
+            text = text.rstrip() + "\n\n" + _correction_block(confirmed) + "\n"
+        correction_regressions = _confirmed_correction_errors(text, confirmed_corrections)
+        if correction_regressions:
+            return response(status="awaiting_user", workspace=str(config.config_path),
+                            validation={"confirmed_corrections": "conflict"},
+                            diagnostics=correction_regressions,
+                            next_action={"type": "user", "reason": "revise the candidate without undoing confirmed corrections"})
+        body = text.encode(); digest = hashlib.sha256(body).hexdigest()
         digest, object_path = _store_learning_object(config, body)
         logical_path = _logical_object_path(digest)
         revision_kind = (replay_payload["revision_kind"] if replay_payload is not None else
@@ -962,18 +1000,11 @@ def restore_explanation(config: WorkspaceConfig, question_id: str, source_revisi
                                 "restored expression predates current historical question locations: "
                                 + ", ".join(sorted(missing_current_questions))])
         text = _object_path(config, source["object_sha256"]).read_text(encoding="utf-8")
+        text = _CORRECTION_BLOCK.sub("", text).rstrip()
         corrections = list(explanation.get("confirmed_corrections", []))
         for correction in corrections:
-            if correction["original_claim"] in text:
-                text = text.replace(correction["original_claim"], correction["corrected_claim"])
-            elif correction["corrected_claim"] not in text:
-                return response(status="failed", workspace=str(config.config_path),
-                                validation={"corrections": "failed"},
-                                diagnostics=[f"cannot safely overlay confirmed correction {correction['correction_id']}"])
-            applicability = correction.get("applicability")
-            if applicability and applicability not in text:
-                text += (f"\n\n<!-- correction-id: {correction['correction_id']} -->\n"
-                         f"纠错适用边界：{applicability}\n")
+            text = _replace_independent_claim(text, correction["original_claim"], correction["corrected_claim"])
+            text += "\n\n" + _correction_block(correction)
         correction_errors = _confirmed_correction_errors(text, corrections)
         if correction_errors:
             return response(status="failed", workspace=str(config.config_path),

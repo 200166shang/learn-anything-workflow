@@ -687,7 +687,7 @@ def test_restore_old_expression_overlays_confirmed_correction_without_moving_pro
     _, prepared = cli("explanation", "prepare", "--question-id", root_id,
                       "--profile", "linear_transform", "--workspace", config, "--json")
     draft, evidence, review = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
-    draft.write_text(draft.read_text().replace("基向量决定矩阵列", "矩阵行是基向量的像"))
+    draft.write_text(draft.read_text() + "\n\n矩阵行是基向量的像。\n")
     code, first = cli("explanation", "commit", "--question-id", root_id, "--draft", draft,
                       "--evidence", evidence, "--teaching-review", review, "--profile", "linear_transform",
                       "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
@@ -702,28 +702,36 @@ def test_restore_old_expression_overlays_confirmed_correction_without_moving_pro
         tmp_path, source, correction_prepare["result"]["required_marker"])
     corrections = tmp_path / "corrections.json"
     corrections.write_text(json.dumps([{
-        "original_claim": "矩阵行是基向量的像", "corrected_claim": "矩阵列是基向量的像",
+        "original_claim": "矩阵行是基向量的像",
+        "corrected_claim": "“矩阵行是基向量的像”不成立；矩阵列才是基向量的像",
         "applicability": "在线性映射采用列向量坐标约定时",
         "evidence_refs": json.loads(correction_evidence.read_text()),
         "affected_conclusions": ["列向量与基向量像的对应关系"]}]))
-    corrected.write_text(corrected.read_text().replace(
-        "基向量决定矩阵列", "矩阵列是基向量的像；在线性映射采用列向量坐标约定时"))
     code, revised = cli("explanation", "commit", "--question-id", root_id, "--draft", corrected,
                         "--evidence", correction_evidence, "--teaching-review", correction_review,
                         "--profile", "linear_transform", "--preparation-id", correction_prepare["result"]["preparation_id"],
                         "--corrections", corrections, "--workspace", config, "--json")
     assert code == 0
+    correction_id = revised["result"]["explanation"]["introduced_correction_ids"][0]
+    corrected_text = Path(revised["result"]["explanation"]["document_path"]).read_text()
+    assert corrected_text.count(f"<!-- correction-id: {correction_id} -->") == 1
+    assert "纠正说法：“矩阵行是基向量的像”不成立；矩阵列才是基向量的像" in corrected_text
+    assert "适用边界：在线性映射采用列向量坐标约定时" in corrected_text
 
     _, rollback_prepare = cli("explanation", "prepare", "--question-id", root_id,
                               "--profile", "linear_transform", "--workspace", config, "--json")
     rollback, rollback_evidence, rollback_review = _linear_inputs(
         tmp_path, source, rollback_prepare["result"]["required_marker"])
+    prior_marker = correction_prepare["result"]["required_marker"]
+    rollback.write_text(corrected_text.replace(prior_marker, rollback_prepare["result"]["required_marker"])
+                        + "\n\n矩阵行是基向量的像。\n")
     code, rejected = cli("explanation", "commit", "--question-id", root_id, "--draft", rollback,
                          "--evidence", rollback_evidence, "--teaching-review", rollback_review,
                          "--profile", "linear_transform", "--preparation-id", rollback_prepare["result"]["preparation_id"],
                          "--workspace", config, "--json")
     assert code == 3 and rejected["status"] == "awaiting_user"
     assert rejected["validation"]["confirmed_corrections"] == "conflict"
+    assert any("reintroduce original claim" in item for item in rejected["diagnostics"])
 
     code, restored = cli("explanation", "restore", "--question-id", root_id,
                          "--revision", first["result"]["explanation"]["revision"],
@@ -734,8 +742,9 @@ def test_restore_old_expression_overlays_confirmed_correction_without_moving_pro
     assert restored_explanation["revision_kind"] == "restore"
     assert restored_explanation["restored_from_revision"] == 1
     restored_text = Path(restored_explanation["document_path"]).read_text()
-    assert "矩阵列是基向量的像" in restored_text
-    assert "矩阵行是基向量的像" not in restored_text
+    assert restored_text.count(f"<!-- correction-id: {correction_id} -->") == 1
+    assert "纠正说法：“矩阵行是基向量的像”不成立；矩阵列才是基向量的像" in restored_text
+    assert "适用边界：在线性映射采用列向量坐标约定时" in restored_text
     assert restored_explanation["confirmed_corrections"][0]["original_claim"] == "矩阵行是基向量的像"
     _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
     assert shown["result"]["thread"]["current_question_id"] == current_question_id
