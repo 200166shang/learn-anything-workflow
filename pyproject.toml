@@ -60,6 +60,7 @@ include = [
 "schemas/practice-event-v1.schema.json" = "schemas/practice-event-v1.schema.json"
 "schemas/learning-candidate-v2.schema.json" = "schemas/learning-candidate-v2.schema.json"
 "schemas/learning-view-generation-v1.schema.json" = "schemas/learning-view-generation-v1.schema.json"
+"schemas/learning-view-generation-v2.schema.json" = "schemas/learning-view-generation-v2.schema.json"
 "schemas/review-record-v1.schema.json" = "schemas/review-record-v1.schema.json"
 "schemas/review-snapshot-v1.schema.json" = "schemas/review-snapshot-v1.schema.json"
 "schemas/review-current-pointer-v1.schema.json" = "schemas/review-current-pointer-v1.schema.json"

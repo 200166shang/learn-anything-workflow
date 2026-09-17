@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-09-17T22:06:00+08:00",
+  "carrier": "Obsidian 1.13.7",
+  "plugin_version": "0.2.0",
+  "fixture_kind": "synthetic-two-root-isolated-vault",
+  "production_data_used": false,
+  "visual_capture": {
+    "retained_in": "Codex implementation task image output",
+    "mime_type": "image/jpeg",
+    "byte_length": 116805,
+    "sha256": "78a624b33e9bf67aaf6f0e29fa61b5328e45d446e64cb1c09014227ce9ce2f90"
+  },
+  "observed_interactions": {
+    "three_view_switch": "passed",
+    "two_root_overview": "passed",
+    "solid_pursuit_edges": "passed",
+    "catalog_search_robot_rows": 2,
+    "complete_explanation_section_navigation": "passed",
+    "old_generation_readable_with_version_warning": "passed",
+    "reopen_loads_new_generation_atomically": "passed",
+    "manifest_and_view_hash_validation_after_plugin_reload": "passed"
+  },
+  "fixed_prototype": {
+    "commit": "44a5fb1",
+    "comparison": "passed",
+    "pixel_identity_required": false
+  }
+}

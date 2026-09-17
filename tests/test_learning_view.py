@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -53,6 +54,8 @@ def test_builds_rebuildable_generation_with_position_route_feedback_and_pending_
     assert built["status"] == "completed"
     generation = Path(built["result"]["generation_path"])
     manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
+    pointer = json.loads(Path(built["result"]["pointer_path"]).read_text(encoding="utf-8"))
+    assert pointer["manifest_sha256"] == hashlib.sha256((generation / "manifest.json").read_bytes()).hexdigest()
     assert manifest["learning_commit_id"].startswith("learning-commit-")
     assert manifest["root_digest"]
     assert manifest["module_id"] == module_id
@@ -97,8 +100,12 @@ def test_local_map_contains_only_the_last_active_thread(tmp_path: Path) -> None:
     built = build_view(config, module_id)
     manifest = json.loads(Path(built["result"]["manifest_path"]).read_text(encoding="utf-8"))
 
-    assert current_id in manifest["nodes"]
-    assert other["question_id"] not in manifest["nodes"]
+    assert current_id in manifest["local_node_ids"]
+    assert other["question_id"] not in manifest["local_node_ids"]
+    assert other["question_id"] in manifest["nodes"]
+    generation = Path(built["result"]["generation_path"])
+    assert other["title"] in (generation / "模块全景图.html").read_text(encoding="utf-8")
+    assert other["title"] in (generation / "问题目录.html").read_text(encoding="utf-8")
 
 
 def test_failed_build_keeps_previous_generation_and_reports_unsynced(tmp_path: Path, monkeypatch) -> None:
@@ -164,6 +171,44 @@ def test_status_reports_unsynced_for_a_schema_invalid_generation_manifest(tmp_pa
 
     assert state["status"] == "completed"
     assert state["result"]["sync_state"] == "unsynced"
+
+
+def test_status_and_locate_report_unsynced_for_a_malformed_current_pointer(tmp_path: Path) -> None:
+    config, module_id, root_id, _ = navigation_fixture(tmp_path)
+    built = build_view(config, module_id)
+    Path(built["result"]["pointer_path"]).write_text('{"schema_version": 2}\n', encoding="utf-8")
+
+    state = status_view(config, module_id)
+    located = locate_view(config, root_id)
+
+    assert state["result"]["sync_state"] == "unsynced"
+    assert located["status"] == "recoverable_failure"
+    assert located["result"]["content_state"] == "unsynced"
+
+
+def test_status_and_locate_reject_a_traversal_shaped_generation_pointer(tmp_path: Path) -> None:
+    config, module_id, root_id, _ = navigation_fixture(tmp_path)
+    built = build_view(config, module_id)
+    pointer_path = Path(built["result"]["pointer_path"])
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["generation_id"] = "view-generation-../../outside"
+    pointer_path.write_text(json.dumps(pointer) + "\n", encoding="utf-8")
+
+    assert status_view(config, module_id)["result"]["sync_state"] == "unsynced"
+    located = locate_view(config, root_id)
+    assert located["status"] == "recoverable_failure"
+    assert located["diagnostics"] == ["served view pointer is invalid"]
+
+
+def test_status_rejects_a_schema_valid_manifest_modified_after_publication(tmp_path: Path) -> None:
+    config, module_id, _, _ = navigation_fixture(tmp_path)
+    built = build_view(config, module_id)
+    manifest_path = Path(built["result"]["manifest_path"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["root_digest"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    assert status_view(config, module_id)["result"]["sync_state"] == "unsynced"
 
 
 def test_click_target_is_complete_explanation_at_exact_stable_section(tmp_path: Path) -> None:
@@ -265,6 +310,11 @@ def test_project_ships_unloadable_read_only_obsidian_plugin() -> None:
     assert "frame.srcdoc" in main
     assert "getResourcePath(graphPath)" not in main
     assert "learning-views/status" in main
+    assert "manifest_sha256" in main and "crypto.subtle.digest" in main
+    assert "projection_sha256" in main and "完整讲解或稳定定位已被修改" in main
+    assert "存在多个学习模块" in main and "renderPointer" in main
+    assert "最新重建未同步" in main
+    assert 'classList.remove("unsynced")' in main
     assert "file-open" not in main
     assert "onunload" in main
     assert ".modify(" not in main and ".create(" not in main

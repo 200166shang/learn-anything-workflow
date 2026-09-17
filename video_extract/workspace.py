@@ -279,8 +279,10 @@ def rebuild(config: WorkspaceConfig, apply: bool) -> dict[str, Any]:
     from .playlists import build_playback_views, verify_playback
     preflight = audit_library_packages(config.media)
     card_schedules: list[dict[str, Any]] = []
+    learning_view_modules: list[str] = []
     if config.schema_version == PORTABLE_SCHEMA_VERSION:
         from .cards import _load as load_cards, schedule as card_schedule
+        from .learning import _load as load_learning
         from .review import _load as load_review
         card_snapshot = load_cards(config)
         review_events = load_review(config)["record"]["events"].values()
@@ -292,12 +294,14 @@ def rebuild(config: WorkspaceConfig, apply: bool) -> dict[str, Any]:
                 as_of = max(event_dates) if event_dates else card["versions"][version_id]["effective_date"]
                 card_schedules.append(card_schedule(config, card_version_id=version_id,
                                                     on_date=as_of)["result"])
+        learning_view_modules = sorted(load_learning(config)["record"]["modules"])
     plan = {"sqlite": str(config.media / "catalog/library.sqlite"), "obsidian": str(config.generated),
-            "playback": str(config.media / "playback"), "card_schedules": "derive from card/review facts"}
+            "playback": str(config.media / "playback"), "card_schedules": "derive from card/review facts",
+            "learning_views": {"derive_from": "learning-record-v2", "module_ids": learning_view_modules}}
     if not apply:
         return {"ok": preflight.get("counts", {}).get("migration_regression", 0) == 0, "dry_run": True,
                 "written": False, "plan": plan, "packages": preflight.get("counts", {}),
-                "card_schedules": card_schedules}
+                "card_schedules": card_schedules, "learning_views": learning_view_modules}
     config.generated.parent.mkdir(parents=True, exist_ok=True)
     protected_hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for base in (config.threads, config.concepts) if base.exists() for p in base.rglob("*") if p.is_file()}
     if config.review.is_file(): protected_hashes[str(config.review)] = hashlib.sha256(config.review.read_bytes()).hexdigest()
@@ -346,8 +350,14 @@ def rebuild(config: WorkspaceConfig, apply: bool) -> dict[str, Any]:
     staged_before = staged_playback.stat(); journal_event({"event": "planned", "kind": "playback-activate", "source": str(staged_playback), "target": str(playback_live), "dev": staged_before.st_dev, "inode": staged_before.st_ino, "mtime_ns": staged_before.st_mtime_ns})
     os.rename(staged_playback, playback_live)
     staged_after = playback_live.stat(); journal_event({"event": "completed", "kind": "playback-activate", "source": str(staged_playback), "target": str(playback_live), "dev": staged_after.st_dev, "inode": staged_after.st_ino, "mtime_ns": staged_after.st_mtime_ns})
+    learning_views = []
+    if config.schema_version == PORTABLE_SCHEMA_VERSION:
+        from .learning_view import build_view
+        learning_views = [build_view(config, module_id) for module_id in learning_view_modules]
+        if any(item["status"] != "completed" for item in learning_views):
+            raise WorkspaceError("one or more learning view generations failed to rebuild")
     final = doctor(config)
-    return {"ok": bool(exported.get("ok")) and all(item.get("ok") for item in playlists) and final["ok"], "dry_run": False, "written": True, "library": library, "export": exported, "normalized_exports": normalized_exports, "playlists": playlists, "card_schedules": card_schedules, "doctor": final}
+    return {"ok": bool(exported.get("ok")) and all(item.get("ok") for item in playlists) and final["ok"], "dry_run": False, "written": True, "library": library, "export": exported, "normalized_exports": normalized_exports, "playlists": playlists, "card_schedules": card_schedules, "learning_views": learning_views, "doctor": final}
 
 
 def prepare_migration(config: WorkspaceConfig, full_hash: bool = False) -> dict[str, Any]:
