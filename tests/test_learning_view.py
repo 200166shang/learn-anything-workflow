@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from video_extract.learning import (commit_explanation, create_module, create_thread,
-                                    prepare_explanation, pursue, record_feedback, show_module)
+                                    prepare_explanation, pursue, record_feedback, resume, show_module)
 from video_extract.learning_view import build_view, locate_view, status_view
 from video_extract.source_registry import register
 from video_extract.workspace import WorkspaceConfig
@@ -64,6 +64,11 @@ def test_builds_rebuildable_generation_with_position_route_feedback_and_pending_
     html = (generation / "局部问题图.html").read_text(encoding="utf-8")
     assert "续学位置" in html and "本次返回路线" in html and "暂放" in html
     assert "跨根引用" in html and "点击仅查看，不改学习状态" in html
+    assert '<svg class="relations"' in html
+    assert 'class="edge deepens"' in html
+    assert f'href="#{current_id}"' in html
+    assert built["result"]["generation_id"] in html
+    assert manifest["learning_commit_id"] in html
 
     state = status_view(config, module_id)
     assert state["result"]["sync_state"] == "current"
@@ -79,6 +84,21 @@ def test_builds_rebuildable_generation_with_position_route_feedback_and_pending_
     rebuilt = build_view(config, module_id)
     assert rebuilt["status"] == "completed"
     assert json.loads(Path(rebuilt["result"]["manifest_path"]).read_text())["learning_commit_id"] == learning_commit
+
+
+def test_local_map_contains_only_the_last_active_thread(tmp_path: Path) -> None:
+    config, module_id, _, current_id = navigation_fixture(tmp_path)
+    original_thread_id = show_module(config, module_id)["result"]["module"]["last_active_thread_id"]
+    other = create_thread(config, module_id, "另一个根问题")["result"]["question"]
+    # Resume the original thread so it is the local-map context.
+    resumed = resume(config, original_thread_id, current_id)
+    assert resumed["status"] == "completed"
+
+    built = build_view(config, module_id)
+    manifest = json.loads(Path(built["result"]["manifest_path"]).read_text(encoding="utf-8"))
+
+    assert current_id in manifest["nodes"]
+    assert other["question_id"] not in manifest["nodes"]
 
 
 def test_failed_build_keeps_previous_generation_and_reports_unsynced(tmp_path: Path, monkeypatch) -> None:
@@ -238,8 +258,11 @@ def test_project_ships_unloadable_read_only_obsidian_plugin() -> None:
     main = (plugin / "main.js").read_text(encoding="utf-8")
     assert manifest["id"] == "video-extract-learning-map"
     assert "registerView" in main
-    assert "registerEvent" in main
     assert "openLinkText" in main
+    assert "graphPath" in main
+    assert 'openLinkText(href, graphPath' in main
+    assert "learning-views/status" in main
+    assert "file-open" not in main
     assert "onunload" in main
     assert ".modify(" not in main and ".create(" not in main
 

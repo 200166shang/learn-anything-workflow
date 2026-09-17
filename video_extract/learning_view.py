@@ -80,10 +80,15 @@ def _document(config: WorkspaceConfig, refs: list[dict[str, Any]], target: Path)
 
 
 def _render_html(module: dict[str, Any], thread: dict[str, Any] | None,
-                 nodes: dict[str, Any], edges: list[dict[str, Any]]) -> str:
+                 nodes: dict[str, Any], edges: list[dict[str, Any]], generation_id: str,
+                 learning_commit_id: str) -> str:
     current = nodes.get(thread["current_question_id"]) if thread else None
     route = " → ".join(nodes.get(frame["question_id"], {}).get("title", "跨模块")
                        for frame in (thread or {}).get("return_route", []))
+    parked = [node for node in nodes.values() if node["feedback"] == "parked"]
+    parked_links = " · ".join(
+        f'<a href="#{html.escape(node["question_id"])}">{html.escape(node["title"])}</a>'
+        for node in parked) or "无"
     cards = []
     for node in nodes.values():
         classes = "node current" if node["is_current"] else "node"
@@ -92,35 +97,46 @@ def _render_html(module: dict[str, Any], thread: dict[str, Any] | None,
         link = (f'<a href="{html.escape(node["href"])}">{html.escape(node["title"])}</a>'
                 if node.get("href") else f'<span>{html.escape(node["title"])}</span>')
         boundary = " · 跨根引用" if node.get("cross_root") else ""
-        cards.append(f'<article class="{classes}" data-question="{node["question_id"]}">{link}'
+        cards.append(f'<article id="{html.escape(node["question_id"])}" class="{classes}" data-question="{html.escape(node["question_id"])}">{link}'
                      f'<small>{state} · {content}{boundary}</small></article>')
-    edge_lines = "".join(f'<li class="{e["kind"]}">{html.escape(nodes[e["from_question_id"]]["title"])} '
-                         f'→ {html.escape(nodes[e["to_question_id"]]["title"])}</li>' for e in edges)
+    edge_lines = []
+    for index, edge in enumerate(edges):
+        y = 24 + index * 34
+        dash = ' stroke-dasharray="8 6"' if edge["cross_root"] else ""
+        label = (f'{nodes[edge["from_question_id"]]["title"]} → '
+                 f'{nodes[edge["to_question_id"]]["title"]}')
+        edge_lines.append(f'<g class="edge {edge["kind"]}"><line x1="16" y1="{y}" x2="72" y2="{y}"{dash}/>'
+                          f'<text x="84" y="{y + 5}">{html.escape(label)}</text></g>')
+    svg_height = max(58, 42 + len(edges) * 34)
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>{html.escape(module["goal"])} · 局部问题图</title><style>
-:root{{--bg:#f7f8fa;--paper:#fff;--ink:#20242b;--muted:#697386;--blue:#3485ff;--line:#cbd3df}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif}}header{{padding:20px 24px 12px}}h1{{margin:0 0 8px;font-size:22px}}.route{{color:var(--muted)}}.graph{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px;padding:20px 24px}}.node{{border:1px solid var(--line);border-radius:14px;background:var(--paper);padding:16px;box-shadow:0 4px 18px #172b4d12}}.node.current{{outline:3px solid #3485ff55;border-color:var(--blue)}}a{{color:var(--ink);font-weight:700;text-decoration:none}}small{{display:block;color:var(--muted);margin-top:8px}}.legend,ul{{margin:0 24px 20px;padding:14px 20px;background:var(--paper);border-radius:12px}}li.reference{{border-left:3px dashed #a25ad6;padding-left:8px}}@media(max-width:520px){{header,.graph{{padding-left:12px;padding-right:12px}}}}
-</style></head><body><header><h1>{html.escape(module["goal"])}</h1><div>续学位置：<strong>{html.escape(current["title"] if current else "尚未开始")}</strong> · {"暂放" if current and current["feedback"] == "parked" else "进行中"}</div><div class="route">本次返回路线：{html.escape(route or "当前线程")}</div></header><main class="graph">{''.join(cards)}</main><ul>{edge_lines}</ul><p class="legend">实线：实际追问 · 虚线：跨根引用 · 点击仅查看，不改学习状态 · 跨根引用保持边界 · 顶部暂放入口随反馈显示</p></body></html>'''
+:root{{--bg:#f7f8fa;--paper:#fff;--ink:#20242b;--muted:#697386;--blue:#3485ff;--line:#cbd3df}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif}}header{{padding:20px 24px 12px}}h1{{margin:0 0 8px;font-size:22px}}.route,.generation{{color:var(--muted)}}.parked{{margin-top:6px}}.graph{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px;padding:20px 24px}}.node{{border:1px solid var(--line);border-radius:14px;background:var(--paper);padding:16px;box-shadow:0 4px 18px #172b4d12;scroll-margin-top:16px}}.node.current{{outline:3px solid #3485ff55;border-color:var(--blue)}}a{{color:var(--ink);font-weight:700;text-decoration:none}}small{{display:block;color:var(--muted);margin-top:8px}}.relations,.legend{{display:block;width:calc(100% - 48px);margin:0 24px 20px;padding:14px;background:var(--paper);border-radius:12px}}.relations line{{stroke:#60718a;stroke-width:3}}.relations .reference line{{stroke:#a25ad6}}.relations text{{fill:var(--ink);font-size:13px}}@media(max-width:520px){{header,.graph{{padding-left:12px;padding-right:12px}}.relations,.legend{{width:calc(100% - 24px);margin-left:12px;margin-right:12px}}}}
+</style></head><body><header><h1>{html.escape(module["goal"])} · 局部问题图</h1><div>续学位置：<strong>{html.escape(current["title"] if current else "尚未开始")}</strong> · {"暂放" if current and current["feedback"] == "parked" else "进行中"}</div><div class="route">本次返回路线：{html.escape(route or "当前线程")}</div><div class="parked">暂放入口：{parked_links}</div><div class="generation">视图代：{generation_id} · 学习修订：{learning_commit_id}</div></header><main class="graph">{''.join(cards)}</main><svg class="relations" viewBox="0 0 900 {svg_height}" role="img" aria-label="实际追问与跨根引用关系">{''.join(edge_lines)}</svg><p class="legend">实线：实际追问 · 虚线：跨根引用 · 点击仅查看，不改学习状态 · 跨根引用保持边界</p></body></html>'''
 
 
-def _generation_valid(generation: Path, module_id: str) -> bool:
+def _validated_manifest(generation: Path, module_id: str) -> dict[str, Any] | None:
     try:
         manifest = read_json(generation / "manifest.json")
         Draft202012Validator(SCHEMA).validate(manifest)
         if manifest["module_id"] != module_id or manifest["generation_id"] != generation.name:
-            return False
+            return None
         graph = generation / "局部问题图.html"
         if (not graph.is_file()
                 or hashlib.sha256(graph.read_bytes()).hexdigest() != manifest["view_sha256"]):
-            return False
+            return None
         for document in manifest["documents"].values():
             path = generation / document["logical_path"]
             if (not path.is_file()
                     or hashlib.sha256(path.read_bytes()).hexdigest() != document["projection_sha256"]
                     or f'^{document["section_id"]}' not in path.read_text(encoding="utf-8")):
-                return False
-        return True
+                return None
+        return manifest
     except (OSError, KeyError, TypeError, ValueError, ValidationError):
-        return False
+        return None
+
+
+def _generation_valid(generation: Path, module_id: str) -> bool:
+    return _validated_manifest(generation, module_id) is not None
 
 
 def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
@@ -129,18 +145,22 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
     module = record["modules"].get(module_id)
     if module is None:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown module_id: {module_id}"])
-    threads = [record["threads"][item] for item in module["thread_ids"]]
+    thread = record["threads"].get(module.get("last_active_thread_id") or "")
+    threads = [thread] if thread else []
     owned = {question_id: question for question_id, question in record["questions"].items()
-             if question["thread_id"] in module["thread_ids"]}
+             if thread and question["thread_id"] == thread["thread_id"]}
     visible = dict(owned)
     for relationship in record["relationships"].values():
         if relationship["type"] == "reference" and relationship["from_question_id"] in owned:
             target = record["questions"].get(relationship["to_question_id"])
             if target is not None:
                 visible[target["question_id"]] = target
-    thread = record["threads"].get(module.get("last_active_thread_id") or "")
+    relevant_relationships = {key: value for key, value in record["relationships"].items()
+                              if value["from_question_id"] in visible or value["to_question_id"] in visible}
+    relevant_feedbacks = {key: value for key, value in record["feedbacks"].items()
+                          if value["question_id"] in visible}
     root_digest = _digest({"module": module, "threads": threads, "questions": owned,
-                           "relationships": record["relationships"], "feedbacks": record["feedbacks"]})
+                           "relationships": relevant_relationships, "feedbacks": relevant_feedbacks})
     generation_seed = {"learning_commit_id": snapshot["commit_id"], "module_id": module_id,
                        "root_digest": root_digest}
     generation_id = "view-generation-" + _digest(generation_seed)
@@ -185,7 +205,8 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
                  for item in record["relationships"].values()
                  if item["from_question_id"] in nodes and item["to_question_id"] in nodes]
         graph = temp / "局部问题图.html"
-        graph.write_text(_render_html(module, thread, nodes, edges), encoding="utf-8")
+        graph.write_text(_render_html(module, thread, nodes, edges, generation_id,
+                                      snapshot["commit_id"]), encoding="utf-8")
         manifest = {"schema_version": 1, "generation_id": generation_id, "module_id": module_id,
                     "learning_commit_id": snapshot["commit_id"], "root_digest": root_digest,
                     "view_sha256": hashlib.sha256(graph.read_bytes()).hexdigest(),
@@ -247,11 +268,12 @@ def locate_view(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
     if not pointer.is_file():
         return response(status="recoverable_failure", workspace=str(config.config_path), result={"content_state": "unsynced"}, diagnostics=["view has not been built"])
     selected = read_json(pointer); generation = generations / selected["generation_id"]
-    if not _generation_valid(generation, module_id):
+    manifest = _validated_manifest(generation, module_id)
+    if manifest is None:
         return response(status="recoverable_failure", workspace=str(config.config_path),
                         result={"question_id": question_id, "content_state": "unsynced"},
                         diagnostics=["served view generation is missing, modified, or corrupt"])
-    manifest = read_json(generation / "manifest.json"); node = manifest["nodes"].get(question_id)
+    node = manifest["nodes"].get(question_id)
     if node is None:
         return response(status="recoverable_failure", workspace=str(config.config_path), result={"content_state": "unsynced"}, diagnostics=["question is absent from served generation"])
     if node["content_state"] == "pending":
@@ -259,8 +281,6 @@ def locate_view(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
     if node["content_state"] != "available" or not node.get("href"):
         return response(status="recoverable_failure", workspace=str(config.config_path), result={"question_id": question_id, "content_state": "broken"}, diagnostics=["explanation locator is invalid; refusing to open document start"])
     document = manifest["documents"][question_id]; path = generation / document["logical_path"]
-    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != document["projection_sha256"]:
-        return response(status="recoverable_failure", workspace=str(config.config_path), result={"question_id": question_id, "content_state": "broken"}, diagnostics=["projected explanation is missing or corrupt"])
     return response(status="completed", workspace=str(config.config_path), result={"question_id": question_id,
                     "content_state": "available", "generation_id": selected["generation_id"],
                     "document_path": str(path), "section_id": document["section_id"], "obsidian_href": node["href"]})
