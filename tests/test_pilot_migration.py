@@ -211,3 +211,6 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
                                       "--workspace", config, "--json")
     assert blocked_code != 0
     assert "owned by the legacy store" in blocked_write["diagnostics"][0]
+    unrelated_receipt = receipts / "unrelated-after-rollback.json"
+    unrelated_receipt.write_text('{"status":"new operation"}', encoding="utf-8")
+    assert unrelated_receipt.is_file()

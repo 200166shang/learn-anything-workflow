@@ -375,14 +375,25 @@ def _restore_legacy_modes(package: Path, thread_path: Path, modes: dict[str, Any
         if path.exists() and not path.is_symlink(): path.chmod(mode)
 
 
-def _freeze_directory(root: Path) -> dict[str, int]:
+def _directory_modes(root: Path) -> dict[str, int]:
     modes: dict[str, int] = {}
     for path in sorted((root, *root.rglob("*"))):
         if path.is_symlink(): continue
         relative = "." if path == root else path.relative_to(root).as_posix()
-        mode = path.stat().st_mode & 0o777; modes[relative] = mode
-        path.chmod(mode & ~0o222)
+        modes[relative] = path.stat().st_mode & 0o777
     return modes
+
+
+def _set_directory_read_only(root: Path, modes: dict[str, int]) -> None:
+    for relative, mode in modes.items():
+        path = root if relative == "." else root / relative
+        if path.exists() and not path.is_symlink(): path.chmod(int(mode) & ~0o222)
+
+
+def _restore_directory_modes(root: Path, modes: dict[str, int]) -> None:
+    for relative, mode in sorted(modes.items(), key=lambda item: item[0].count("/"), reverse=True):
+        path = root if relative == "." else root / relative
+        if path.exists() and not path.is_symlink(): path.chmod(int(mode))
 
 
 def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> dict[str, Any]:
@@ -495,15 +506,28 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
 def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     results, local = _require_workspace(config); root, value = _state(config, batch)
     owners = _ownership(config); owner = owners["batches"].get(batch)
-    if value["status"] != "cutover" or not owner or owner["owner"] not in {"new", "rolling_back"}:
+    if not owner:
+        raise ValueError("only a cut-over batch owned by the new store can be rolled back")
+    receipt_root = results / "operation-receipts"
+    if owner["owner"] == "legacy" and not owner.get("receipt_modes_restored", True):
+        _restore_directory_modes(receipt_root, owner["receipt_modes_before_rollback"])
+        owner["receipt_modes_restored"] = True
+        atomic_write_json(_ownership_path(config), owners)
+        return response(status="completed", workspace=str(config.config_path), result={
+            "batch": batch, "reconciled": True, "receipt_modes_restored": True},
+            validation={"rollback_recovery": "passed"})
+    if value["status"] != "cutover" or owner["owner"] not in {"new", "rolling_back"}:
         raise ValueError("only a cut-over batch owned by the new store can be rolled back")
     target = Path(owner["migrated_course"]); baseline = {item["path"]: item for item in owner["cutover_baseline"]}
-    owner["owner"] = "rolling_back"
-    owner.setdefault("new_modes_before_rollback", _freeze_directory(target))
-    receipt_root = results / "operation-receipts"
     receipt_root.mkdir(parents=True, exist_ok=True)
-    owner.setdefault("receipt_modes_before_rollback", _freeze_directory(receipt_root))
-    atomic_write_json(_ownership_path(config), owners)
+    if owner["owner"] == "new":
+        owner["owner"] = "rolling_back"
+        owner["new_modes_before_rollback"] = _directory_modes(target)
+        owner["receipt_modes_before_rollback"] = _directory_modes(receipt_root)
+        owner["receipt_modes_restored"] = False
+        atomic_write_json(_ownership_path(config), owners)
+    _set_directory_read_only(target, owner["new_modes_before_rollback"])
+    _set_directory_read_only(receipt_root, owner["receipt_modes_before_rollback"])
     if os.environ.get("VIDEO_EXTRACT_MIGRATION_TEST_FAULT") == "after_rollback_frozen":
         raise OSError("injected failure after rollback write freeze")
     current = {item["path"]: item for item in _tree(target)}
@@ -542,6 +566,9 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     owner.update(owner="legacy", legacy_read_only=False, new_read_only=True,
                  replay_required=bool(changed or deleted or receipts or learning_changed), rollback_at=_now(),
                  preserved_increment=str(preserved))
+    atomic_write_json(_ownership_path(config), owners)
+    _restore_directory_modes(receipt_root, owner["receipt_modes_before_rollback"])
+    owner["receipt_modes_restored"] = True
     atomic_write_json(_ownership_path(config), owners)
     value.update(status="rolled_back", rollback_at=_now(), preserved_increment=str(preserved))
     value["events"].append(_event("migration rollback", "passed",
