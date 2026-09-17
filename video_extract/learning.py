@@ -466,6 +466,10 @@ def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relat
            text: str | None, expected_revision: int | None = None,
            existing_question_id: str | None = None, independent: bool = False,
            actual_question: str | None = None) -> dict[str, Any]:
+    if existing_question_id and not (actual_question or "").strip():
+        return response(status="missing_input", workspace=str(config.config_path),
+                        validation={"actual_question": "failed"},
+                        diagnostics=["existing question reentry requires the user's non-empty actual question"])
     if not existing_question_id and not (text or "").strip():
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=["actual question must be non-empty"])
@@ -475,9 +479,6 @@ def pursue(config: WorkspaceConfig, thread_id: str, from_question_id: str, relat
     with package_lock(_roots(config)[2].parent):
         snapshot = _load(config); record = snapshot["record"]
         normalized_actual = (actual_question or text or "").strip()
-        if existing_question_id and not normalized_actual:
-            existing = record["questions"].get(existing_question_id)
-            normalized_actual = existing["original_question"] if existing else ""
         target_effect = existing_question_id or "new_question"
         intent = {"thread_id": thread_id, "from_question_id": from_question_id,
                   "existing_question_id": existing_question_id, "question": text.strip() if text else None,

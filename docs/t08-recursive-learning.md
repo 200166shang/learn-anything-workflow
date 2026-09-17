@@ -6,7 +6,9 @@ The public seams are `learning pursue/feedback/resume/back/show/locate` plus con
 persisted before an explanation. A caller explicitly re-enters an existing opaque question identity;
 matching wording is only an ambiguity signal and never an automatic merge. Each entry records the
 user's actual wording and actual source question separately from the historical relationship, without
-overwriting the question's first wording.
+overwriting the question's first wording. Every new existing-identity entry requires non-empty actual
+wording; historical wording is never substituted for a missing utterance. The entry field remains
+optional in the schema solely so snapshots written before this rule remain readable.
 
 Explicit understanding feedback has three states: `understood`, `confused`, and `parked`. The latest
 value is a projection over an immutable feedback history. Confusions remain question facts. Silence,

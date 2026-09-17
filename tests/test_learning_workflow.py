@@ -552,7 +552,8 @@ def test_reenter_existing_question_preserves_identity_and_records_actual_entry_r
     branch_id = branch["result"]["question"]["question_id"]
 
     code, entered = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", branch_id,
-                        "--existing-question-id", projection_id, "--relation", "related",
+                        "--existing-question-id", projection_id, "--actual-question", "投影换条路径怎么理解？",
+                        "--relation", "related",
                         "--workspace", config, "--json")
 
     assert code == 0
@@ -561,6 +562,32 @@ def test_reenter_existing_question_preserves_identity_and_records_actual_entry_r
     _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
     assert len([q for q in shown["result"]["questions"] if q["question_id"] == projection_id]) == 1
     assert shown["result"]["thread"]["return_route"][-1]["question_id"] == branch_id
+
+
+def test_existing_question_requires_nonempty_actual_words_at_core_cli_and_capability(tmp_path: Path) -> None:
+    from video_extract.learning import pursue
+    from video_extract.workspace import discover_workspace
+
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    _, known = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                   "--relation", "deepens", "--question", "原问题", "--workspace", config, "--json")
+    known_id = known["result"]["question"]["question_id"]
+
+    core = pursue(discover_workspace(config), thread_id, root_id, "related", None,
+                  existing_question_id=known_id, actual_question="   ")
+    assert core["status"] == "missing_input" and core["validation"]["actual_question"] == "failed"
+
+    code, command = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", root_id,
+                        "--existing-question-id", known_id, "--relation", "related",
+                        "--workspace", config, "--json")
+    assert code == 3 and command["validation"]["actual_question"] == "failed"
+
+    request = tmp_path / "missing-actual.json"; request.write_text(json.dumps({
+        "contract_version": 1, "action": "pursue", "workspace": str(config), "thread_id": thread_id,
+        "from_question_id": root_id, "existing_question_id": known_id, "relation": "related"}))
+    code, capability = cli("capability", "run", "learning.learn", "--request", request, "--json")
+    assert code == 3 and capability["validation"]["actual_question"] == "failed"
 
 
 def test_feedback_keeps_latest_history_and_confusions_without_inferring_silence(tmp_path: Path) -> None:

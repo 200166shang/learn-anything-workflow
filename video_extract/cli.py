@@ -231,9 +231,14 @@ def cmd_learning(args: argparse.Namespace) -> int:
         elif args.learning_entity == "thread" and args.learning_action == "show":
             result = show_thread(workspace, args.thread_id)
         elif args.learning_entity == "pursue":
-            result = pursue(workspace, args.thread_id, args.from_question_id, args.relation, args.question,
-                             args.expected_revision, args.existing_question_id, args.independent,
-                             args.actual_question)
+            if args.existing_question_id and not (args.actual_question or "").strip():
+                result = response(status="missing_input", workspace=str(workspace.config_path),
+                                  validation={"actual_question": "failed"},
+                                  diagnostics=["--actual-question is required with --existing-question-id"])
+            else:
+                result = pursue(workspace, args.thread_id, args.from_question_id, args.relation, args.question,
+                                 args.expected_revision, args.existing_question_id, args.independent,
+                                 args.actual_question)
         elif args.learning_entity == "replay":
             result = replay_candidate(workspace, args.candidate)
         elif args.learning_entity == "feedback":

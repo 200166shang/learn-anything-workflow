@@ -281,6 +281,10 @@ def run_learning(request: dict[str, Any]) -> dict[str, Any]:
                                  request.get("expected_revision"))
         if action == "thread.show": return show_thread(workspace, request["thread_id"])
         if action == "pursue":
+            if request.get("existing_question_id") and not str(request.get("actual_question") or "").strip():
+                return response(status="missing_input", workspace=str(workspace.config_path),
+                                validation={"actual_question": "failed"},
+                                diagnostics=["actual_question is required with existing_question_id"])
             return pursue(workspace, request["thread_id"], request["from_question_id"], request["relation"],
                           request.get("question"), request.get("expected_revision"),
                           request.get("existing_question_id"), bool(request.get("independent", False)),
