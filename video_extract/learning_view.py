@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 
 from .command_response import response
 from .learning import _load as load_learning
@@ -36,23 +37,46 @@ def _digest(value: Any) -> str:
                                      separators=(",", ":")).encode()).hexdigest()
 
 
+def _sync_path(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_generation(path: Path) -> None:
+    for file_path in sorted(item for item in path.rglob("*") if item.is_file()):
+        with file_path.open("rb") as stream:
+            os.fsync(stream.fileno())
+    for directory in sorted((item for item in path.rglob("*") if item.is_dir()), reverse=True):
+        _sync_path(directory)
+    _sync_path(path)
+
+
 def _latest_feedback(record: dict[str, Any], question_id: str) -> str | None:
     values = [item for item in record["feedbacks"].values() if item["question_id"] == question_id]
     return max(values, key=lambda item: item["created_at"])["state"] if values else None
 
 
-def _document(config: WorkspaceConfig, ref: dict[str, Any], target: Path) -> dict[str, Any]:
+def _document(config: WorkspaceConfig, refs: list[dict[str, Any]], target: Path) -> dict[str, Any]:
+    ref = refs[0]
+    if any(item["logical_path"] != ref["logical_path"] or item["object_sha256"] != ref["object_sha256"]
+           for item in refs):
+        raise WorkspaceError(f"explanation revision has inconsistent objects: {target.name}")
     source = config.results / ref["logical_path"]
     if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != ref["object_sha256"]:
         raise WorkspaceError(f"explanation object missing or corrupt: {ref['object_sha256']}")
-    marker = f"<!-- section-id: {ref['section_id']} -->"
     text = source.read_text(encoding="utf-8")
-    if marker not in text:
-        raise WorkspaceError(f"explanation locator is invalid: {ref['section_id']}")
-    rendered = text.replace(marker, marker + f"\n^{ref['section_id']}", 1)
+    rendered = text
+    for section_id in dict.fromkeys(item["section_id"] for item in refs):
+        marker = f"<!-- section-id: {section_id} -->"
+        if marker not in rendered:
+            raise WorkspaceError(f"explanation locator is invalid: {section_id}")
+        rendered = rendered.replace(marker, marker + f"\n^{section_id}", 1)
     target.write_text(rendered, encoding="utf-8")
     return {"logical_path": str(target), "object_sha256": ref["object_sha256"],
-            "section_id": ref["section_id"], "projection_sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
+            "projection_sha256": hashlib.sha256(target.read_bytes()).hexdigest()}
 
 
 def _render_html(module: dict[str, Any], thread: dict[str, Any] | None,
@@ -84,7 +108,9 @@ def _generation_valid(generation: Path, module_id: str) -> bool:
         Draft202012Validator(SCHEMA).validate(manifest)
         if manifest["module_id"] != module_id or manifest["generation_id"] != generation.name:
             return False
-        if not (generation / "局部问题图.html").is_file():
+        graph = generation / "局部问题图.html"
+        if (not graph.is_file()
+                or hashlib.sha256(graph.read_bytes()).hexdigest() != manifest["view_sha256"]):
             return False
         for document in manifest["documents"].values():
             path = generation / document["logical_path"]
@@ -93,7 +119,7 @@ def _generation_valid(generation: Path, module_id: str) -> bool:
                     or f'^{document["section_id"]}' not in path.read_text(encoding="utf-8")):
                 return False
         return True
-    except (OSError, KeyError, ValueError):
+    except (OSError, KeyError, TypeError, ValueError, ValidationError):
         return False
 
 
@@ -123,17 +149,30 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
     try:
         docs = temp / "完整讲解"; docs.mkdir()
         nodes: dict[str, Any] = {}; documents: dict[str, Any] = {}
+        latest_refs = {question_id: question["explanation_refs"][-1]
+                       for question_id, question in visible.items() if question["explanation_refs"]}
+        grouped_refs: dict[str, list[dict[str, Any]]] = {}
+        for ref in latest_refs.values():
+            filename = f'{ref["explanation_id"]}-r{ref["explanation_revision"]}.md'
+            grouped_refs.setdefault(filename, []).append(ref)
+        projected: dict[str, dict[str, Any] | None] = {}
+        for filename, refs in grouped_refs.items():
+            try:
+                projected[filename] = _document(config, refs, docs / filename)
+            except WorkspaceError:
+                projected[filename] = None
         for question_id, question in visible.items():
             refs = question["explanation_refs"]
             content_state, href = "pending", None
             if refs:
                 ref = refs[-1]; filename = f'{ref["explanation_id"]}-r{ref["explanation_revision"]}.md'
-                try:
-                    locator = _document(config, ref, docs / filename)
+                locator = projected[filename]
+                if locator is not None:
                     content_state = "available"
                     href = f'完整讲解/{filename}#^{ref["section_id"]}'
-                    documents[question_id] = {**locator, "logical_path": f"完整讲解/{filename}"}
-                except WorkspaceError:
+                    documents[question_id] = {**locator, "section_id": ref["section_id"],
+                                              "logical_path": f"完整讲解/{filename}"}
+                else:
                     content_state = "broken"
             nodes[question_id] = {"question_id": question_id, "title": question["title"],
                                   "feedback": _latest_feedback(record, question_id),
@@ -145,16 +184,24 @@ def build_view(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
                   "kind": item["type"], "cross_root": item["type"] == "reference"}
                  for item in record["relationships"].values()
                  if item["from_question_id"] in nodes and item["to_question_id"] in nodes]
+        graph = temp / "局部问题图.html"
+        graph.write_text(_render_html(module, thread, nodes, edges), encoding="utf-8")
         manifest = {"schema_version": 1, "generation_id": generation_id, "module_id": module_id,
                     "learning_commit_id": snapshot["commit_id"], "root_digest": root_digest,
+                    "view_sha256": hashlib.sha256(graph.read_bytes()).hexdigest(),
                     "current_question_id": thread["current_question_id"] if thread else None,
                     "nodes": nodes, "edges": edges, "documents": documents}
         Draft202012Validator(SCHEMA).validate(manifest)
-        (temp / "局部问题图.html").write_text(_render_html(module, thread, nodes, edges), encoding="utf-8")
         (temp / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _sync_generation(temp)
         destination = generations / generation_id
-        if destination.exists(): shutil.rmtree(temp)
-        else: os.replace(temp, destination)
+        if destination.exists():
+            shutil.rmtree(temp)
+            if not _generation_valid(destination, module_id):
+                raise WorkspaceError("existing immutable view generation was modified or corrupted; preserving it for inspection")
+        else:
+            os.replace(temp, destination)
+            _sync_path(generations)
         if os.environ.get("VIDEO_EXTRACT_VIEW_TEST_FAULT") == "before_publish":
             raise OSError("injected failure before view publish")
         current_root.mkdir(exist_ok=True)
@@ -200,6 +247,10 @@ def locate_view(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
     if not pointer.is_file():
         return response(status="recoverable_failure", workspace=str(config.config_path), result={"content_state": "unsynced"}, diagnostics=["view has not been built"])
     selected = read_json(pointer); generation = generations / selected["generation_id"]
+    if not _generation_valid(generation, module_id):
+        return response(status="recoverable_failure", workspace=str(config.config_path),
+                        result={"question_id": question_id, "content_state": "unsynced"},
+                        diagnostics=["served view generation is missing, modified, or corrupt"])
     manifest = read_json(generation / "manifest.json"); node = manifest["nodes"].get(question_id)
     if node is None:
         return response(status="recoverable_failure", workspace=str(config.config_path), result={"content_state": "unsynced"}, diagnostics=["question is absent from served generation"])
