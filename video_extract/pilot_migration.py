@@ -375,6 +375,16 @@ def _restore_legacy_modes(package: Path, thread_path: Path, modes: dict[str, Any
         if path.exists() and not path.is_symlink(): path.chmod(mode)
 
 
+def _freeze_directory(root: Path) -> dict[str, int]:
+    modes: dict[str, int] = {}
+    for path in sorted((root, *root.rglob("*"))):
+        if path.is_symlink(): continue
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        mode = path.stat().st_mode & 0o777; modes[relative] = mode
+        path.chmod(mode & ~0o222)
+    return modes
+
+
 def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> dict[str, Any]:
     from . import learning
     from .source_registry import register
@@ -464,6 +474,9 @@ def cutover(config: WorkspaceConfig, batch: str, authorization_path: Path) -> di
         "source_id": converted["source_id"], "source_version": actual_version,
         "learning_commit_id": published["commit_id"], "cutover_at": _now(), "cutover_baseline": baseline,
         "legacy_modes": legacy_modes, "locators": converted["legacy_locators"],
+        "learning_ids": {key: sorted(record[key]) for key in
+                         ("modules", "threads", "questions", "relationships", "feedbacks",
+                          "preparations", "explanations")},
         "authorization_sha256": authorization_sha256}
     atomic_write_json(_ownership_path(config), owners)
     value.update(status="cutover", cutover_at=_now(), migrated_course=str(target),
@@ -485,11 +498,14 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
     if value["status"] != "cutover" or not owner or owner["owner"] != "new":
         raise ValueError("only a cut-over batch owned by the new store can be rolled back")
     target = Path(owner["migrated_course"]); baseline = {item["path"]: item for item in owner["cutover_baseline"]}
+    owner["new_modes_before_rollback"] = _freeze_directory(target)
+    atomic_write_json(_ownership_path(config), owners)
     current = {item["path"]: item for item in _tree(target)}
     changed = sorted(path for path, fact in current.items() if baseline.get(path) != fact)
     deleted = sorted(set(baseline) - set(current))
     receipt_root = results / "operation-receipts"
     cutover_ns = int(datetime.fromisoformat(owner["cutover_at"]).timestamp() * 1_000_000_000)
+    receipt_snapshot = _tree(receipt_root) if receipt_root.is_dir() else []
     receipts = [path for path in receipt_root.rglob("*") if path.is_file() and path.stat().st_mtime_ns >= cutover_ns] if receipt_root.is_dir() else []
     stamp = str(time.time_ns()); preserved = local / "migration-preserved" / batch / stamp
     for relative in changed:
@@ -500,11 +516,17 @@ def rollback(config: WorkspaceConfig, batch: str) -> dict[str, Any]:
         destination.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(receipt, destination)
     learning_changed = False
     learning_pointer = results / "learning/current.json"
-    if learning_pointer.is_file():
-        current_learning = read_json(learning_pointer).get("commit_id")
-        learning_changed = current_learning != owner["learning_commit_id"]
-        if learning_changed:
-            shutil.copytree(results / "learning", preserved / "learning")
+    from .package_lock import package_lock
+    with package_lock(results / "learning"):
+        if learning_pointer.is_file():
+            current_learning = read_json(learning_pointer).get("commit_id")
+            learning_changed = current_learning != owner["learning_commit_id"]
+            if learning_changed:
+                shutil.copytree(results / "learning", preserved / "learning")
+    if _tree(target) != list(current.values()):
+        raise RuntimeError("migrated course changed while rollback was preserving it")
+    if receipt_root.is_dir() and _tree(receipt_root) != receipt_snapshot:
+        raise RuntimeError("operation receipts changed while rollback was preserving them")
     preserved.mkdir(parents=True, exist_ok=True)
     atomic_write_json(preserved / "rollback-manifest.json", {"schema_version": 1, "batch": batch,
         "created_at": _now(), "changed_course_files": changed, "deleted_course_files": deleted,
@@ -543,3 +565,30 @@ def locate_migrated_question(config: WorkspaceConfig, question_id: str) -> dict[
         return {"batch": batch, "document_path": str(document),
                 "heading": locator.get("heading"), "kind": "legacy_migrated_locator"}
     return None
+
+
+def assert_learning_write_owned(config: WorkspaceConfig, previous: dict[str, Any],
+                                proposed: dict[str, Any]) -> None:
+    changed: dict[str, set[str]] = {}
+    for key in ("modules", "threads", "questions", "relationships", "feedbacks",
+                "preparations", "explanations"):
+        identities = set(previous[key]) | set(proposed[key])
+        changed[key] = {identity for identity in identities
+                        if previous[key].get(identity) != proposed[key].get(identity)}
+    for batch, owner in _ownership(config)["batches"].items():
+        if owner.get("owner") == "new": continue
+        protected = owner.get("learning_ids", {})
+        protected_questions = set(protected.get("questions", []))
+        protected_threads = set(protected.get("threads", []))
+        protected_modules = set(protected.get("modules", []))
+        linked = any(
+            (key == "feedbacks" and item.get("question_id") in protected_questions)
+            or (key == "preparations" and item.get("question_id") in protected_questions)
+            or (key == "explanations" and item.get("root_question_id") in protected_questions)
+            or (key in {"questions", "relationships"} and item.get("thread_id") in protected_threads)
+            or (key == "threads" and item.get("module_id") in protected_modules)
+            for key, identities in changed.items() for identity in identities
+            for item in [proposed[key].get(identity) or previous[key].get(identity) or {}]
+        )
+        if linked or any(changed[key] & set(protected.get(key, [])) for key in changed):
+            raise WorkspaceError(f"migration batch {batch} is owned by the legacy store; new learning location is read-only")

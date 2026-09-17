@@ -191,5 +191,11 @@ def test_cutover_single_ownership_and_rollback_preserves_increment(tmp_path: Pat
     assert ownership["batches"][batch]["owner"] == "legacy"
     assert ownership["batches"][batch]["replay_required"] is True
     assert increment.is_file()
+    assert increment.stat().st_mode & 0o222 == 0
     assert (legacy / "course/manifest.json").stat().st_mode & 0o200
     assert (legacy / "thread.json").stat().st_mode & 0o200
+    blocked_code, blocked_write = cli("learning", "feedback", "--question-id", root_question,
+                                      "--state", "understood", "--text", "不应写入新位置",
+                                      "--workspace", config, "--json")
+    assert blocked_code != 0
+    assert "owned by the legacy store" in blocked_write["diagnostics"][0]

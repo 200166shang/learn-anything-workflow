@@ -242,6 +242,8 @@ def _sync_directory(path: Path) -> None:
 
 def _publish(config: WorkspaceConfig, previous: dict[str, Any], record: dict[str, Any],
              objects: dict[str, Any] | None = None) -> dict[str, Any]:
+    from .pilot_migration import assert_learning_write_owned
+    assert_learning_write_owned(config, previous["record"], record)
     object_root, commits, pointer, _ = _roots(config)
     value = {"schema_version": 2, "parent_commit_id": previous.get("commit_id"),
              "revision": previous["revision"] + 1, "created_at": _now(), "record": record,
