@@ -174,9 +174,15 @@ def _deep_validate(value: dict[str, Any]) -> None:
             source_question = questions.get(source["question_id"])
             source_thread = threads.get(source["thread_id"])
             explanation = explanations.get(source["explanation_id"])
+            source_module = modules.get(source["module_id"])
+            target_absent = all(item is None for item in
+                                (source_question, source_thread, explanation, source_module))
+            if target_absent:
+                continue
             revision = explanation and explanation["revisions"].get(str(source["explanation_revision"]))
             if (source_question is None or source_question["thread_id"] != source["thread_id"]
-                    or source_thread is None or source_thread["module_id"] != source["module_id"]
+                    or source_thread is None or source_module is None
+                    or source_thread["module_id"] != source["module_id"]
                     or source["module_id"] == local_thread["module_id"] or revision is None
                     or source["section_id"] not in revision["section_map"].get(source["question_id"], [])
                     or source["object_sha256"] != revision["object_sha256"]):
@@ -834,7 +840,6 @@ def locate(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
         evidence_refs.extend(revision["evidence_refs"])
     source_checks = _evidence_source_checks(config, evidence_refs)
     explanation_state = ("needs_review" if any(item["status"] != "current" for item in source_checks)
-                         or any(item["status"] != "current" for item in cross_root_references)
                          else "available")
     return response(status="completed", workspace=str(config.config_path), result={
         "question": question, "explanation_state": explanation_state, "locations": locations,
@@ -914,7 +919,8 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str,
             "coordinate_assumptions": reuse_review["coordinate_assumptions"],
             "applicability_conditions": reuse_review["applicability_conditions"],
             "citation_intent": reuse_review["citation_intent"], "local_context": reuse_review["local_context"],
-            "checked_source_versions": checked_versions, "checked_at": _now()}
+            "checked_source_versions": checked_versions, "checked_at": _now(),
+            "prepared_record_revision": snapshot["revision"]}
     trusted_evidence_refs: list[dict[str, Any]] | None = None
     if question["explanation_refs"]:
         evidence_refs: list[dict[str, Any]] = []
@@ -954,6 +960,29 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str,
         current_question = record["questions"].get(question_id)
         if current_question is None:
             return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
+        if cross_root_reference is not None:
+            source_pin = cross_root_reference["source"]
+            latest_explanation = record["explanations"].get(source_pin["explanation_id"])
+            latest_revision = (latest_explanation or {}).get("current_revision")
+            latest = ((latest_explanation or {}).get("revisions") or {}).get(str(latest_revision))
+            latest_sections = (latest or {}).get("section_map", {}).get(source_pin["question_id"], [])
+            target_changed = (latest_revision != source_pin["explanation_revision"]
+                              or source_pin["section_id"] not in latest_sections
+                              or (latest or {}).get("object_sha256") != source_pin["object_sha256"])
+            latest_checks = _evidence_source_checks(config, (latest or {}).get("evidence_refs", []))
+            if target_changed or not latest_checks or any(item["status"] != "current" for item in latest_checks):
+                expected_record_revision = cross_root_reference.get("prepared_record_revision", 0)
+                if expected_record_revision == snapshot["revision"]:
+                    expected_record_revision = max(0, snapshot["revision"] - 1)
+                conflict = _revision_conflict(config, snapshot, expected_record_revision,
+                                              "explanation.prepare.cross_root", {
+                                                  "question_id": question_id,
+                                                  "reuse_review": reuse_review,
+                                                  "expected_target": source_pin})
+                conflict["validation"] = {"cross_root_target": "conflict"}
+                conflict["diagnostics"] = ["cross-root target changed during applicability review; no stale reference was published"]
+                return conflict
+            cross_root_reference.pop("prepared_record_revision", None)
         preparation = {"preparation_id": preparation_id, "question_id": question_id, "profile": profile,
                        "section_id": section_id, "prepared_revision": snapshot["revision"] + 1,
                        "source_refs": module["source_refs"], "source_scope_sha256": source_scope,
