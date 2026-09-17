@@ -250,6 +250,12 @@ def _validate_request(config: WorkspaceConfig, value: Any) -> tuple[dict[str, An
     for correction in value["corrections"]:
         if not isinstance(correction, dict) or not all(correction.get(key) for key in ("original", "corrected", "evidence")):
             raise ValueError("each correction must preserve the original wording, corrected wording, and evidence")
+    for raw_attachment in value["attachments"]:
+        attachment = Path(raw_attachment).expanduser().resolve()
+        if not attachment.is_file():
+            raise ValueError(f"adopted attachment is missing: {attachment}")
+        if attachment.name not in value["markdown"]:
+            raise ValueError(f"adopted attachment is not used by the note body: {attachment.name}")
     association = value["association"]
     if not isinstance(association, dict) or association.get("status") not in {
         "verified", "unverified", "not_applicable"
@@ -443,6 +449,7 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                 ("corrections", json.dumps(value["corrections"], ensure_ascii=False, sort_keys=True).encode(), "corrections"),
             ]
             attachment_digests = []
+            attachment_paths: list[Path] = []
             new_objects: dict[str, Any] = {}
             stored: dict[str, tuple[str, Path]] = {}
             for label, body, kind in values:
@@ -450,8 +457,9 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                 new_objects[digest] = {"kind": kind, "size": len(body)}
             for raw_attachment in value["attachments"]:
                 attachment = Path(raw_attachment).expanduser().resolve()
-                body = attachment.read_bytes(); digest, _ = _put(config, body)
-                attachment_digests.append(digest); new_objects[digest] = {"kind": "adopted_attachment", "size": len(body)}
+                body = attachment.read_bytes(); digest, stored_attachment = _put(config, body)
+                attachment_digests.append(digest); attachment_paths.append(stored_attachment)
+                new_objects[digest] = {"kind": "adopted_attachment", "size": len(body)}
             revision = note_revision + 1
             history_entry = {"revision": revision, "body_object": stored["body"][0],
                              "citations_object": stored["citations"][0],
@@ -473,7 +481,7 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                             validation={"commit": "passed", "objects": "passed", "source": "passed"},
                             provenance={"source_id": source_id, "source_version": version["source_version"],
                                         "note_commit_id": published["commit_id"]},
-                            artifact_refs=[str(stored["body"][1])])
+                            artifact_refs=[str(stored["body"][1]), *map(str, attachment_paths)])
     except OSError as exc:
         current = _load_current(config)
         target_commit = exc.commit_id if isinstance(exc, NotesPublishInterrupted) else None

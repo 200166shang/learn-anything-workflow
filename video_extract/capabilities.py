@@ -206,6 +206,16 @@ def run_source_notes(request: dict[str, Any]) -> dict[str, Any]:
     action = request.get("action")
     if workspace.schema_version == 2:
         if action == "prepare":
+            if request.get("media_operation_id"):
+                from .media_note_operations import prepare_media_note
+                return prepare_media_note(
+                    workspace, request["media_operation_id"], request["item_id"],
+                    transcript_adapter=request.get("transcript_adapter"),
+                    frame_adapter=request.get("frame_adapter"),
+                    require_visuals=bool(request.get("require_visuals", False)),
+                    selection=Path(request["selection"]) if request.get("selection") else None,
+                    human_reviewed=bool(request.get("human_reviewed", False)),
+                )
             prepared = prepare_note(workspace, request["source_id"], request.get("source_version"))
             return {"status": "awaiting_ai", "action": "notes_write",
                     "input": prepared["result"]["model_input"], "source_id": request["source_id"]}

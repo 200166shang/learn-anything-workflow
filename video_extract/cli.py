@@ -188,7 +188,16 @@ def cmd_notes(args: argparse.Namespace) -> int:
     if workspace.schema_version == PORTABLE_SCHEMA_VERSION:
         try:
             if args.notes_action == "prepare":
-                result = prepare_note(workspace, args.target, args.source_version)
+                if args.media_operation:
+                    from .media_note_operations import prepare_media_note
+                    result = prepare_media_note(
+                        workspace, args.media_operation, args.target,
+                        transcript_adapter=args.transcript_adapter, frame_adapter=args.frame_adapter,
+                        require_visuals=args.require_visuals, selection=args.selection,
+                        human_reviewed=args.human_reviewed,
+                    )
+                else:
+                    result = prepare_note(workspace, args.target, args.source_version)
             elif args.notes_action == "finalize":
                 if args.request is None:
                     result = response(status="missing_input", workspace=str(workspace.config_path),
@@ -567,6 +576,12 @@ def parser() -> argparse.ArgumentParser:
     for action in ("prepare", "finalize"):
         p = notes_actions.add_parser(action); p.add_argument("target")
         p.add_argument("--source-version"); p.add_argument("--request", type=Path)
+        p.add_argument("--media-operation", help="verified scoped media operation ID")
+        p.add_argument("--selection", type=Path, help="visual candidate decision JSON")
+        p.add_argument("--human-reviewed", action="store_true", help="selection was explicitly reviewed by the user")
+        p.add_argument("--require-visuals", action="store_true")
+        p.add_argument("--transcript-adapter", help=argparse.SUPPRESS)
+        p.add_argument("--frame-adapter", help=argparse.SUPPRESS)
         p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_notes)
     notes_audit = notes_actions.add_parser("audit", help="enumerate and deeply validate authoritative notes")
     notes_audit.add_argument("--workspace", type=Path); notes_audit.add_argument("--json", action="store_true")
