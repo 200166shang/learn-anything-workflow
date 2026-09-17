@@ -281,6 +281,30 @@ def cmd_explanation(args: argparse.Namespace) -> int:
     emit(result, args.json); return exit_code(result)
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .package_lock import PackageBusyError
+    from .review import prepare, record, show
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.review_action == "prepare":
+            result = prepare(workspace, args.question_id, args.preparation_id)
+        elif args.review_action == "record":
+            result = record(workspace, args.preparation_id, args.event_id, answer=args.answer,
+                            answer_summary=args.answer_summary, hints=args.hint,
+                            model_evaluation=args.model_evaluation, correction=args.correction,
+                            corrected_evaluation=args.corrected_evaluation)
+        else:
+            result = show(workspace, args.question_id)
+    except PackageBusyError as exc:
+        result = response(status="busy", workspace=str(workspace.config_path), diagnostics=[str(exc)],
+                          next_action={"type": "retry", "reason": "another Review write is in progress"})
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json); return exit_code(result)
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     from .command_response import exit_code
     from .installation import apply, inspect, plan
@@ -667,6 +691,11 @@ def parser() -> argparse.ArgumentParser:
     explanation_actions = explanation.add_subparsers(dest="explanation_action", required=True)
     explanation_prepare = explanation_actions.add_parser("prepare"); explanation_prepare.add_argument("--question-id", required=True); explanation_prepare.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_prepare.add_argument("--workspace", type=Path); explanation_prepare.add_argument("--json", action="store_true"); explanation_prepare.set_defaults(func=cmd_explanation)
     explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--preparation-id", required=True); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
+    review = commands.add_parser("review", help="prepare active recall before revealing and record independent Review facts")
+    review_actions = review.add_subparsers(dest="review_action", required=True)
+    review_prepare = review_actions.add_parser("prepare"); review_prepare.add_argument("--question-id", required=True); review_prepare.add_argument("--preparation-id", help="stable retry identity beginning review-preparation-"); review_prepare.add_argument("--workspace", type=Path); review_prepare.add_argument("--json", action="store_true"); review_prepare.set_defaults(func=cmd_review)
+    review_record = review_actions.add_parser("record"); review_record.add_argument("--preparation-id", required=True); review_record.add_argument("--event-id", required=True); review_record.add_argument("--answer"); review_record.add_argument("--answer-summary"); review_record.add_argument("--hint", action="append", default=[]); review_record.add_argument("--model-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored"), required=True); review_record.add_argument("--correction"); review_record.add_argument("--corrected-evaluation", choices=("recalled", "prompted", "not_recalled", "not_scored")); review_record.add_argument("--workspace", type=Path); review_record.add_argument("--json", action="store_true"); review_record.set_defaults(func=cmd_review)
+    review_show = review_actions.add_parser("show"); review_show.add_argument("--question-id"); review_show.add_argument("--workspace", type=Path); review_show.add_argument("--json", action="store_true"); review_show.set_defaults(func=cmd_review)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):

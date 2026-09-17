@@ -49,7 +49,7 @@ class InstallationContractTests(unittest.TestCase):
         self.assertRegex(details["source"]["content_fingerprint"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             [item["id"] for item in details["entries"]],
-            ["agent.mandarin-netease", "agent.source-notes", "skill.extract-media", "skill.mandarin-audio", "skill.source-notes"],
+            ["agent.mandarin-netease", "agent.source-notes", "skill.extract-media", "skill.mandarin-audio", "skill.source-notes", "skill.review"],
         )
         self.assertFalse(self.agents_root.exists())
         self.assertFalse(self.codex_root.exists())
