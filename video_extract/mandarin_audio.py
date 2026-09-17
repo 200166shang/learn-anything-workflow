@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import subprocess
-from array import array
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -51,19 +49,35 @@ class PyVideoTransAdapter:
             raise FileNotFoundError("pyVideoTrans public adapter is not configured")
         output_dir = target.parent
         output_dir.mkdir(parents=True, exist_ok=True)
+        probe = subprocess.run([str(python), str(cli), "--help"], text=True, capture_output=True)
+        required = ("--task", "--name", "--output-dir", "--podcast-profile", "--report", "--resume")
+        if probe.returncode or not all(flag in probe.stdout for flag in required):
+            raise AdapterInvocationError("pyVideoTrans CLI contract is incompatible", submitted=False)
         command = [str(python), str(cli), "--task", "podcast", "--name", str(source),
                    "--output-dir", str(output_dir), "--podcast-profile", profile,
-                   "--idempotency-token", idempotency_token]
+                   "--report", str(output_dir / "production-report.json")]
         completed = subprocess.run(command, text=True, capture_output=True)
         if completed.returncode:
-            raise RuntimeError("pyVideoTrans submission outcome is uncertain; reconcile the original operation")
+            parser_failure = "usage:" in completed.stderr.casefold() and "error:" in completed.stderr.casefold()
+            raise AdapterInvocationError(
+                "pyVideoTrans rejected the public invocation" if parser_failure else
+                "pyVideoTrans submission outcome is uncertain; reconcile the original operation",
+                submitted=not parser_failure,
+            )
         return {"artifact": target, "query_handle": idempotency_token}
 
     def reconcile(self, attempt: dict[str, Any], target: Path) -> dict[str, Any]:
-        if audio_info(target)["valid"]:
+        report = target.parent / "production-report.json"
+        if audio_info(target)["valid"] and report.is_file():
             return {"state": "available", "artifact": target,
                     "query_handle": attempt.get("query_handle")}
         return {"state": "unsupported", "query_handle": attempt.get("query_handle")}
+
+
+class AdapterInvocationError(RuntimeError):
+    def __init__(self, message: str, *, submitted: bool):
+        super().__init__(message)
+        self.submitted = submitted
 
 
 MANDARIN_ADAPTERS: dict[str, MandarinAdapter] = {}
@@ -105,51 +119,24 @@ def audio_info(path: Path) -> dict[str, Any]:
     return value
 
 
-def _transcript(package: Path, manifest: dict[str, Any]) -> tuple[Path | None, str]:
-    for key in ("source_transcript", "source_subtitle"):
-        raw = manifest.get("artifacts", {}).get(key)
-        if isinstance(raw, str):
-            path = (package / raw).resolve()
-            try: path.relative_to(package)
-            except ValueError: continue
-            if path.is_file():
-                text = path.read_text(encoding="utf-8", errors="replace")
-                text = re.sub(r"\d{1,2}:\d{2}(?::\d{2})?[,.]\d+\s*-->.*", " ", text)
-                text = re.sub(r"<[^>]+>|\d+\s*\n", " ", text)
-                return path, " ".join(text.split())
-    return None, ""
-
-
-def listening_quality(path: Path, package: Path, manifest: dict[str, Any]) -> dict[str, Any]:
-    info = audio_info(path)
-    transcript_path, text = _transcript(package, manifest)
-    if not info.get("valid") or not transcript_path or not text:
-        return {"valid": False, "non_empty_audible": False, "transcript_alignment": "missing"}
-    decoded = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-ac", "1", "-ar", "8000",
-                              "-f", "s16le", "-"], capture_output=True)
-    samples = array("h"); samples.frombytes(decoded.stdout)
-    if not samples:
-        return {"valid": False, "non_empty_audible": False, "transcript_alignment": "failed"}
-    peak = max(abs(value) for value in samples) or 1
-    non_silent_ratio = sum(abs(value) > peak * .03 for value in samples) / len(samples)
-    crossings = [index for index in range(1, len(samples)) if (samples[index - 1] < 0) != (samples[index] < 0)]
-    intervals = [b - a for a, b in zip(crossings, crossings[1:])]
-    variability = 0.0
-    if intervals:
-        mean = sum(intervals) / len(intervals)
-        variability = math.sqrt(sum((value - mean) ** 2 for value in intervals) / len(intervals)) / max(mean, 1)
-    tokens = re.findall(r"[A-Za-z0-9']+|[\u3400-\u9fff]", text)
-    wpm = len(tokens) / info["duration"] * 60
-    source_raw = manifest.get("artifacts", {}).get("source_audio")
-    source_info = audio_info(package / source_raw) if isinstance(source_raw, str) else {"duration": 0}
-    duration_ratio = info["duration"] / max(float(source_info.get("duration") or 0), .001)
-    natural_proxy = non_silent_ratio >= .15 and variability >= .08 and 20 <= wpm <= 500 and .5 <= duration_ratio <= 2.5
-    return {"valid": natural_proxy, "non_empty_audible": non_silent_ratio >= .15,
-            "non_silent_ratio": round(non_silent_ratio, 4), "voicing_variability": round(variability, 4),
-            "units_per_minute": round(wpm, 2), "duration_ratio_to_source": round(duration_ratio, 4),
-            "transcript_alignment": "duration_and_rate_checked",
-            "transcript_sha256": _sha256(transcript_path),
-            "listening_review": {"model": "pending", "human": "pending"}}
+def _localized_verification(value: Any, output: Path) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"valid": False, "reason": "independent localized verification is missing"}
+    required_strings = ("verifier_identity", "transcript_sha256", "output_sha256", "detected_language")
+    if any(not isinstance(value.get(key), str) or not value[key] for key in required_strings):
+        return {"valid": False, "reason": "localized verification fields are incomplete"}
+    language = value["detected_language"].casefold().replace("_", "-").split("-", 1)[0]
+    digest_ok = value["output_sha256"] == _sha256(output)
+    transcript_ok = bool(re.fullmatch(r"[0-9a-f]{64}", value["transcript_sha256"]))
+    speech = value.get("speech_confidence")
+    alignment = value.get("alignment_confidence")
+    content = value.get("content_match_confidence")
+    scores_ok = all(isinstance(score, (int, float)) and not isinstance(score, bool) and score >= .8
+                    for score in (speech, alignment, content))
+    safe = {key: value.get(key) for key in (*required_strings, "speech_confidence", "alignment_confidence",
+                                             "content_match_confidence")}
+    safe["valid"] = digest_ok and transcript_ok and language == "zh" and scores_ok
+    return safe
 
 
 def _normalized(request: dict[str, Any]) -> dict[str, Any]:
@@ -251,28 +238,35 @@ def _language_primary(language: str) -> str | None:
 
 
 def _finish(config: WorkspaceConfig, path: Path, record: dict[str, Any], source: Path,
-            output: Path, mode: str, receipt: dict[str, Any] | None = None) -> dict[str, Any]:
+            output: Path, mode: str, receipt: dict[str, Any] | None = None,
+            verification: dict[str, Any] | None = None) -> dict[str, Any]:
     spec = audio_info(output)
-    package = Path(record["intent"]["package"])
-    quality = listening_quality(output, package, read_json(package / "manifest.json"))
-    if not spec["valid"] or not quality["valid"]:
+    localized = mode == "localized"
+    verified = _localized_verification(verification, output) if localized and spec["valid"] else None
+    if not spec["valid"] or (localized and not verified["valid"]):
         uncertain = mode == "localized"
-        record.update(status="uncertain" if uncertain else "recoverable_failure",
+        record.update(status="awaiting_user" if localized and spec["valid"] else ("uncertain" if uncertain else "recoverable_failure"),
                       validation={"source": "passed", "audio_spec": "passed" if spec["valid"] else "failed",
-                                  "listening_quality": "passed" if quality["valid"] else "failed"},
-                      diagnostics=["Mandarin MP3 did not satisfy the 48 kHz mono approximately 64 kbps contract"],
-                      next_action={"type": "reconcile" if uncertain else "resume",
-                                   "operation_id": record["operation_id"]})
+                                  "localized_content": "failed" if localized else "not_required"},
+                      diagnostics=[verified.get("reason", "localized speech/language/content verification failed")
+                                   if localized and spec["valid"] else
+                                   "Mandarin MP3 did not satisfy the 48 kHz mono approximately 64 kbps contract"],
+                      next_action={"type": "user" if localized and spec["valid"] else ("reconcile" if uncertain else "resume"),
+                                   "operation_id": record["operation_id"],
+                                   **({"reason": "provide an independent structured Mandarin ASR/alignment verification report"}
+                                      if localized and spec["valid"] else {})})
         atomic_write_json(path, record)
         return _public(config, record)
     output_digest = _sha256(output)
     if isinstance(record.get("current_attempt"), dict):
         record.setdefault("attempts", []).append({**record.pop("current_attempt"), "result": "verified_output"})
     record.update(status="completed", validation={"source": "passed", "audio_spec": "passed",
-                                                   "listening_quality": "passed", "output_digest": "passed"},
+                                                   "localized_content": "passed" if localized else "not_required",
+                                                   "output_digest": "passed"},
                   artifact_refs=[str(output)], artifact_facts={"source": {"sha256": _sha256(source)},
                   "output": {"sha256": output_digest, "size": output.stat().st_size,
-                             "validation": "ffprobe-48khz-mono-approx64kbps", "quality": quality}},
+                             "validation": "ffprobe-48khz-mono-approx64kbps",
+                             **({"localized_verification": verified} if verified else {})}},
                   provenance={"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
                               "source_id": record["intent"]["source_id"],
                               "source_version": record["intent"]["source_version"], "mode": mode},
@@ -285,7 +279,10 @@ def _finish(config: WorkspaceConfig, path: Path, record: dict[str, Any], source:
               "source_sha256": record["artifact_facts"]["source"]["sha256"],
               "effective_parameters": record["intent"]["effective_parameters"],
               "output": "podcast.zh-CN.mp3", "output_sha256": output_digest, "spec": spec,
-              "capability_contract_version": CONTRACT_VERSION, "listening_quality": quality}
+              "capability_contract_version": CONTRACT_VERSION,
+              "verification_basis": "verified_native_zh_provenance" if not localized else "independent_asr_alignment",
+              **({"localized_verification": verified} if verified else {}),
+              "listening_review": {"model": "pending", "human": "pending"}}
     atomic_write_json(output.parent / "production-report.json", report)
     _complete_authority(path, record)
     _receipt(config, record)
@@ -304,14 +301,21 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
     existing = read_json(path) if path.is_file() else None
     source_digest = _sha256(source)
     if normalized.get("check_only"):
-        quality = listening_quality(output, package, manifest)
-        valid = audio_info(output).get("valid") and quality.get("valid")
+        spec_valid = bool(audio_info(output).get("valid"))
+        primary = _language_primary(language)
+        report_path = output.parent / "production-report.json"
+        report = read_json(report_path) if report_path.is_file() else {}
+        verification = _localized_verification(report.get("localized_verification"), output) if spec_valid and primary != "zh" else None
+        valid = spec_valid and (primary == "zh" or bool(verification and verification.get("valid")))
         return response(status="completed" if valid else "recoverable_failure",
                         workspace=str(config.config_path), operation_id=operation_id,
-                        result={"package": str(package), "audio": str(output), "listening_quality": quality},
+                        result={"package": str(package), "audio": str(output),
+                                "verification_basis": "verified_native_zh_provenance" if primary == "zh" else "independent_asr_alignment",
+                                **({"localized_verification": verification} if verification else {})},
                         artifact_refs=[str(output)] if output.is_file() else [],
-                        validation={"source": "passed", "audio_spec": "passed" if audio_info(output).get("valid") else "failed",
-                                    "listening_quality": "passed" if quality.get("valid") else "failed"},
+                        validation={"source": "passed", "audio_spec": "passed" if spec_valid else "failed",
+                                    "localized_content": "not_required" if primary == "zh" else
+                                                         ("passed" if verification and verification.get("valid") else "failed")},
                         provenance={"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
                                     "source_id": normalized["source_id"], "source_version": normalized["source_version"]},
                         next_action=None if valid else {"type": "resume", "operation_id": operation_id})
@@ -328,7 +332,8 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
                                 next_action={"type": "maintenance"})
                 return _public(config, existing)
             facts = existing.get("artifact_facts", {}).get("output", {})
-            if audio_info(output)["valid"] and facts.get("sha256") == _sha256(output) and facts.get("quality", {}).get("valid"):
+            content_state = existing.get("validation", {}).get("localized_content")
+            if audio_info(output)["valid"] and facts.get("sha256") == _sha256(output) and content_state in {"passed", "not_required"}:
                 return _public(config, existing, "verified_operation")
         if existing.get("status") == "running":
             from .media_operations import _lease_active
@@ -339,8 +344,15 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
             return _public(config, existing)
         if existing.get("status") == "uncertain":
             return _public(config, existing)
+        if existing.get("status") == "awaiting_user" and isinstance(existing.get("current_attempt"), dict):
+            verification_path = normalized.get("verification_report")
+            if not isinstance(verification_path, str):
+                return _public(config, existing)
+            verification = read_json(Path(verification_path).expanduser().resolve())
+            existing.pop("lease", None)
+            return _finish(config, path, existing, source, output, "localized", verification=verification)
     primary = _language_primary(language)
-    native = primary == "zh" and manifest.get("provenance", {}).get("source_audio", {}).get("kind") == "native_chinese_track"
+    native = primary == "zh"
     base_intent = {"capability_id": "audio.mandarin", "capability_contract_version": CONTRACT_VERSION,
                    "source_id": normalized["source_id"], "source_version": normalized["source_version"],
                    "source_sha256": source_digest, "package": str(package), "package_identity": manifest["identity"],
@@ -409,6 +421,14 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
     atomic_write_json(path, record)
     try:
         result = adapter.localize(source, output, profile=normalized["profile"], idempotency_token=token)
+    except AdapterInvocationError as exc:
+        record.update(status="uncertain" if exc.submitted else "missing_dependency", diagnostics=[str(exc)],
+                      next_action={"type": "reconcile" if exc.submitted else "maintenance", "operation_id": operation_id})
+        record.pop("lease", None)
+        if not exc.submitted:
+            record.setdefault("attempts", []).append({**record.pop("current_attempt"), "result": "not_submitted"})
+        atomic_write_json(path, record)
+        return _public(config, record)
     except Exception as exc:
         record.update(status="uncertain", diagnostics=[str(exc)],
                       next_action={"type": "reconcile", "operation_id": operation_id})
@@ -424,7 +444,7 @@ def _run_mandarin_audio_unlocked(request: dict[str, Any]) -> dict[str, Any]:
         return _public(config, latest)
     attempt["query_handle"] = result.get("query_handle", token)
     record.pop("lease", None)
-    return _finish(config, path, record, source, output, "localized", result.get("receipt"))
+    return _finish(config, path, record, source, output, "localized", result.get("receipt"), result.get("verification"))
 
 
 def run_mandarin_audio(request: dict[str, Any]) -> dict[str, Any]:
@@ -521,7 +541,8 @@ def _reconcile_operation_unlocked(config: WorkspaceConfig, operation_id: str) ->
         return _public(config, record)
     record.setdefault("attempts", []).append({**record.pop("current_attempt"), "result": "reconciled_available"})
     record.pop("lease", None)
-    return _finish(config, path, record, package / source_raw, output, "localized", checked.get("receipt"))
+    return _finish(config, path, record, package / source_raw, output, "localized", checked.get("receipt"),
+                   checked.get("verification"))
 
 
 def reconcile_operation(config: WorkspaceConfig, operation_id: str) -> dict[str, Any]:

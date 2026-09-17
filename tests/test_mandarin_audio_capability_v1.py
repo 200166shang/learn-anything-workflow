@@ -3,6 +3,10 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
+from array import array
+import hashlib
+import math
+from difflib import SequenceMatcher
 
 from video_extract.cli import parser
 from video_extract.mandarin_audio import MandarinAdapter, register_mandarin_adapter
@@ -57,12 +61,31 @@ class FakePaidAdapter(MandarinAdapter):
         target.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
                         "-ar", "48000", "-ac", "1", "-b:a", "64k", str(target)], check=True)
-        return {"query_handle": idempotency_token, "artifact": target,
+        return {"query_handle": idempotency_token, "artifact": target, "verification": fixture_verification(target),
                 "receipt": {"receipt_id": "fixture-receipt"}}
 
     def reconcile(self, attempt, target):
         return {"state": "available", "query_handle": attempt["query_handle"], "artifact": target,
+                "verification": fixture_verification(target),
                 "receipt": {"receipt_id": "fixture-receipt"}}
+
+
+def fixture_verification(target: Path, recognized_text: str | None = None) -> dict:
+    decoded = subprocess.run(["ffmpeg", "-v", "error", "-i", str(target), "-ac", "1", "-ar", "8000", "-f", "s16le", "-"], capture_output=True, check=True)
+    samples = array("h"); samples.frombytes(decoded.stdout)
+    crossings = [i for i in range(1, len(samples)) if (samples[i - 1] < 0) != (samples[i] < 0)]
+    intervals = [b - a for a, b in zip(crossings, crossings[1:])]
+    mean = sum(intervals) / max(len(intervals), 1)
+    variability = math.sqrt(sum((x - mean) ** 2 for x in intervals) / max(len(intervals), 1)) / max(mean, 1)
+    transcript = target.parents[2] / "media/transcript.txt"
+    expected_text = transcript.read_text()
+    recognized_text = expected_text if recognized_text is None else recognized_text
+    confidence = .95 if variability >= .08 else .1
+    content_confidence = SequenceMatcher(None, expected_text.casefold(), recognized_text.casefold()).ratio()
+    return {"verifier_identity": "fixture-waveform-asr-v1", "transcript_sha256": hashlib.sha256(transcript.read_bytes()).hexdigest(),
+            "output_sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "detected_language": "zh-CN",
+            "speech_confidence": confidence, "alignment_confidence": confidence,
+            "content_match_confidence": content_confidence}
 
 
 class InterruptedAdapter(FakePaidAdapter):
@@ -93,6 +116,7 @@ class RecoverableInterruptedAdapter(InterruptedAdapter):
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
                         "-ar", "48000", "-ac", "1", "-b:a", "64k", str(target)], check=True)
         return {"state": "available", "query_handle": attempt["query_handle"], "artifact": target,
+                "verification": fixture_verification(target),
                 "receipt": {"receipt_id": "recovered-receipt"}}
 
 
@@ -103,6 +127,22 @@ class CrashAdapter(FakePaidAdapter):
         raise SystemExit("simulated process death")
     def reconcile(self, attempt, target):
         return {"state": "committed", "query_handle": attempt["query_handle"]}
+
+
+class UnverifiedAdapter(FakePaidAdapter):
+    adapter_identity = "fixture.mandarin-unverified-v1"
+    def localize(self, source, target, *, profile, idempotency_token):
+        self.calls.append(idempotency_token); target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(source), "-ar", "48000", "-ac", "1", "-b:a", "64k", str(target)], check=True)
+        return {"query_handle": idempotency_token, "artifact": target}
+
+
+class UnrelatedContentAdapter(FakePaidAdapter):
+    adapter_identity = "fixture.mandarin-unrelated-v1"
+    def localize(self, source, target, *, profile, idempotency_token):
+        result = super().localize(source, target, profile=profile, idempotency_token=idempotency_token)
+        result["verification"] = fixture_verification(target, "Completely unrelated weather forecast and sports scores.")
+        return result
 
 
 def test_native_chinese_normalizes_locally_and_reuses_only_verified_fingerprint(tmp_path, capsys):
@@ -116,7 +156,7 @@ def test_native_chinese_normalizes_locally_and_reuses_only_verified_fingerprint(
     assert code == code2 == 0
     assert adapter.calls == []
     assert reused["result"]["reuse"] == "verified_operation"
-    assert reused["validation"]["listening_quality"] == "passed"
+    assert reused["validation"]["localized_content"] == "not_required"
     output = package / "listening/zh-CN/podcast.zh-CN.mp3"
     assert output.is_file()
     report = json.loads((output.parent / "production-report.json").read_text())
@@ -241,16 +281,30 @@ def test_package_identity_prevents_cross_package_operation_collision(tmp_path, c
     assert first["operation_id"] != second["operation_id"]
 
 
-def test_pure_sine_is_not_accepted_as_natural_listening_audio(tmp_path, capsys):
+def test_native_chinese_without_transcript_uses_verified_provenance_and_never_tts(tmp_path, capsys):
     _, package, request = fixture(tmp_path, "zh-CN")
+    (package / "media/transcript.txt").unlink()
+    manifest = json.loads((package / "manifest.json").read_text()); manifest["artifacts"].pop("source_transcript")
+    manifest["provenance"]["source_audio"]["kind"] = "source_track"
+    (package / "manifest.json").write_text(json.dumps(manifest))
+    code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 0 and result["status"] == "completed"
+    assert result["validation"]["localized_content"] == "not_required"
+
+
+def test_localized_dual_tone_fails_structured_speech_and_alignment_verification(tmp_path, capsys):
+    _, package, request = fixture(tmp_path, "en")
     source = package / "media/audio.source.m4a"
     source.unlink()
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
                     "sine=frequency=440:duration=2.5", "-c:a", "aac", str(source)], check=True)
+    adapter = FakePaidAdapter(); register_mandarin_adapter("tone", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="tone", authorization_ref="approved-tone")
+    request.write_text(json.dumps(data))
     code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
-    assert code == 1
-    assert result["status"] == "recoverable_failure"
-    assert result["validation"]["listening_quality"] == "failed"
+    assert code == 3
+    assert result["status"] == "awaiting_user"
+    assert result["validation"]["localized_content"] == "failed"
 
 
 def test_crashed_paid_worker_never_submits_again_before_reconcile(tmp_path, capsys):
@@ -271,3 +325,50 @@ def test_crashed_paid_worker_never_submits_again_before_reconcile(tmp_path, caps
     assert uncertain["status"] == resumed["status"] == "uncertain"
     assert len(adapter.calls) == 1
     assert uncertain["next_action"]["type"] == "reconcile"
+
+
+def test_localized_format_without_independent_verification_never_completes(tmp_path, capsys):
+    _, package, request = fixture(tmp_path, "en")
+    adapter = UnverifiedAdapter(); register_mandarin_adapter("unverified", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="unverified", authorization_ref="approved-unverified")
+    request.write_text(json.dumps(data))
+    code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 3 and result["status"] == "awaiting_user"
+    assert result["validation"]["localized_content"] == "failed"
+    _, repeated = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert repeated["status"] == "awaiting_user" and len(adapter.calls) == 1
+    verification = tmp_path / "verification.json"
+    verification.write_text(json.dumps(fixture_verification(package / "listening/zh-CN/podcast.zh-CN.mp3")))
+    data["verification_report"] = str(verification); request.write_text(json.dumps(data))
+    final_code, completed = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert final_code == 0 and completed["status"] == "completed" and len(adapter.calls) == 1
+
+
+def test_structured_verifier_rejects_unrelated_recognized_content(tmp_path, capsys):
+    _, _, request = fixture(tmp_path, "en")
+    adapter = UnrelatedContentAdapter(); register_mandarin_adapter("unrelated", adapter)
+    data = json.loads(request.read_text()); data.update(adapter="unrelated", authorization_ref="approved-unrelated")
+    request.write_text(json.dumps(data))
+    code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 3 and result["status"] == "awaiting_user"
+    assert result["validation"]["localized_content"] == "failed"
+
+
+def test_pyvideotrans_argparse_rejection_is_definitely_not_submitted(tmp_path, capsys):
+    workspace, _, request = fixture(tmp_path, "en")
+    cli = tmp_path / "fake-pyvideotrans.py"
+    cli.write_text('''import sys
+if "--help" in sys.argv:
+    print("--task --name --output-dir --podcast-profile --report --resume")
+    raise SystemExit(0)
+sys.stderr.write("usage: cli.py [-h]\\ncli.py: error: invalid arguments\\n")
+raise SystemExit(2)
+''')
+    with workspace.open("a") as stream:
+        stream.write(f'\n[tools.pyvideotrans]\npython = "{__import__("sys").executable}"\ncli = "{cli}"\n')
+    data = json.loads(request.read_text()); data["authorization_ref"] = "approved-parser"
+    request.write_text(json.dumps(data))
+    code, result = invoke(capsys, "capability", "run", "audio.mandarin", "--request", str(request))
+    assert code == 3 and result["status"] == "missing_dependency"
+    record = json.loads(next((tmp_path / "local/operations").glob("operation-*.json")).read_text())
+    assert record["attempts"][-1]["result"] == "not_submitted"

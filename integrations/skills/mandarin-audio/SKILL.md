@@ -15,6 +15,8 @@ Use `--check` for a read-only dependency and artifact check. The canonical resul
 
 Prefer an extracted native Chinese track. It is normalized without cloud work or paid authorization. Otherwise continue only when provenance confirms English source audio and the user supplied a non-sensitive `authorization_ref`; pass it with `--authorization-ref`. The configured profile is the external compatibility literal `alibaba-podcast-tts-throughput`. For interrupted work, use the returned `operation_id` with `video-extract operation show/resume/reconcile`; never automatically retry an uncertain paid submission.
 
+Localized English output is not complete merely because it is an MP3. Completion also requires an independent structured verification report tied to the output digest, with detected Mandarin and passing speech, transcript-alignment, and content-match confidence. Pass that public report with `--verification-report`; otherwise the operation remains `awaiting_user`. Native Chinese needs no translation-alignment report because its verified language provenance and source digest establish that it is the original track, though model and human listening review remain explicitly pending.
+
 Completion requires an ffprobe-readable MP3 with positive duration, 48 kHz, mono, and approximately 64 kbps. Treat missing or unknown source language as unsupported before a cloud call.
 
 Never read or expose `run.private.json`, provider credentials, cookies, tokens, signed URLs, or private intermediates. This skill does not acquire media, produce study notes, or publish to a remote service.

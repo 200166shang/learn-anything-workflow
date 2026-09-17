@@ -17,6 +17,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("package", type=Path)
     parser.add_argument("--workspace", type=Path, required=True); parser.add_argument("--authorization-ref")
     parser.add_argument("--adapter"); parser.add_argument("--check", action="store_true"); parser.add_argument("--json", action="store_true")
+    parser.add_argument("--verification-report", type=Path)
     args = parser.parse_args()
     package = args.package.expanduser().resolve()
     manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
@@ -31,6 +32,7 @@ def main() -> int:
     else:
         if args.authorization_ref: request["authorization_ref"] = args.authorization_ref
         if args.adapter: request["adapter"] = args.adapter
+        if args.verification_report: request["verification_report"] = str(args.verification_report.expanduser().resolve())
     temporary = tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False)
     try:
         json.dump(request, temporary); temporary.close()

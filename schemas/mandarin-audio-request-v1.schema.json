@@ -16,7 +16,8 @@
     "bitrate_kbps": {"type": "integer", "minimum": 56, "maximum": 72},
     "adapter": {"type": "string", "minLength": 1},
     "authorization_ref": {"type": "string", "minLength": 1},
-    "check_only": {"type": "boolean"}
+    "check_only": {"type": "boolean"},
+    "verification_report": {"type": "string", "minLength": 1}
   },
   "additionalProperties": false
 }
