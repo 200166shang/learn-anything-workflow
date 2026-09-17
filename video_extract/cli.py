@@ -118,7 +118,7 @@ def cmd_source(args: argparse.Namespace) -> int:
         emit(result, args.json); return exit_code(result)
     try:
         if args.source_action == "register":
-            result = register(workspace, args.input, args.title, args.expected_revision)
+            result = register(workspace, args.input, args.title, args.expected_revision, args.source_id)
         elif args.source_action == "verify":
             result = verify(workspace, args.source_id, args.source_version)
         elif args.source_action == "relocate":
@@ -126,7 +126,8 @@ def cmd_source(args: argparse.Namespace) -> int:
         elif args.source_action == "reconcile":
             result = reconcile(workspace, args.source_id, args.source_version)
         elif args.source_action == "import" and workspace.schema_version == PORTABLE_SCHEMA_VERSION:
-            result = register(workspace, args.input, args.title, getattr(args, "expected_revision", None))
+            result = register(workspace, args.input, args.title, getattr(args, "expected_revision", None),
+                              getattr(args, "source_id", None))
         else:
             result = import_source(args.input, workspace, args.package, args.title)
     except (OSError, ValueError, WorkspaceError) as exc:
@@ -471,9 +472,9 @@ def parser() -> argparse.ArgumentParser:
     ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
     source = commands.add_parser("source", help="import local source material into a managed package")
     source_actions = source.add_subparsers(dest="source_action", required=True)
-    source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--expected-revision", type=int); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
+    source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--source-id"); source_import.add_argument("--expected-revision", type=int); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)
     source_register = source_actions.add_parser("register", help="register a document or in-place source tree")
-    source_register.add_argument("input", type=Path); source_register.add_argument("--title")
+    source_register.add_argument("input", type=Path); source_register.add_argument("--title"); source_register.add_argument("--source-id")
     source_register.add_argument("--expected-revision", type=int); source_register.add_argument("--workspace", type=Path)
     source_register.add_argument("--json", action="store_true"); source_register.set_defaults(func=cmd_source)
     source_verify = source_actions.add_parser("verify", help="verify a registered source version")

@@ -226,6 +226,21 @@ def _operation(action: str, config: WorkspaceConfig, source_id: str, source_vers
     return "operation-" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
+def _recovery_source_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value.startswith("source-"):
+        raise ValueError("recovery source_id must use the source-<UUIDv4> identity form")
+    try:
+        parsed = uuid.UUID(value.removeprefix("source-"))
+    except ValueError as exc:
+        raise ValueError("recovery source_id must contain a valid UUIDv4") from exc
+    canonical = "source-" + str(parsed)
+    if parsed.version != 4 or value != canonical:
+        raise ValueError("recovery source_id must be a canonical lowercase UUIDv4 identity")
+    return canonical
+
+
 def _candidate(config: WorkspaceConfig, value: dict[str, Any]) -> Path:
     _, _, _, candidates = _store_roots(config)
     path = _safe_path(candidates.parent, "candidates", f"candidate-{uuid.uuid4()}.json")
@@ -285,18 +300,25 @@ def _capture(path: Path) -> tuple[str, str, bytes | None, dict[str, Any], list[d
 
 
 def register(config: WorkspaceConfig, path: Path, title: str | None = None,
-             expected_revision: int | None = None) -> dict[str, Any]:
+             expected_revision: int | None = None, explicit_source_id: str | None = None) -> dict[str, Any]:
     _require_v2(config)
     path = path.expanduser().resolve()
     kind, digest, body, basis, entries = _capture(path)
     source_version = "source-version-" + digest
+    recovery_source_id = _recovery_source_id(explicit_source_id)
     source_id = "unresolved"
     assert config.results is not None
     try:
         with package_lock(config.results):
             snapshot = _load_snapshot(config)
             locations = _locations(config)
-            source_id = _source_at_location(snapshot, locations, path) or "source-" + str(uuid.uuid4())
+            located_source_id = _source_at_location(snapshot, locations, path)
+            if recovery_source_id and located_source_id and recovery_source_id != located_source_id:
+                raise ValueError("recovery source_id conflicts with the source already registered at this location")
+            if (recovery_source_id in snapshot["sources"] and locations.get(recovery_source_id)
+                    and locations[recovery_source_id] != str(path)):
+                raise ValueError("recovery source_id belongs to another location; use source relocate")
+            source_id = located_source_id or recovery_source_id or "source-" + str(uuid.uuid4())
             current = snapshot["sources"].get(source_id)
             proposed = {"source_version": source_version, "content_sha256": digest, "kind": kind,
                         "captured_at": _now(), "version_basis": basis, "entries": entries,
@@ -359,7 +381,10 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
         else:
             revision_argument = f" --expected-revision {recovery_revision}" if recovery_revision is not None else ""
             recovery_command = (f"video-extract source register {shlex.quote(str(path))}"
-                                f"{revision_argument} --workspace "
+                                f" --source-id {shlex.quote(source_id)}")
+            if title is not None:
+                recovery_command += f" --title {shlex.quote(title)}"
+            recovery_command += (f"{revision_argument} --workspace "
                                 f"{shlex.quote(str(config.config_path))} --json")
             recovery_type = "retry"
         return response(status="recoverable_failure", workspace=str(config.config_path),
@@ -532,8 +557,9 @@ def relocate(config: WorkspaceConfig, source_id: str, path: Path, expected_revis
 
 def _result(config: WorkspaceConfig, snapshot: dict[str, Any], source_id: str,
             version: dict[str, Any], path: Path, action: str) -> dict[str, Any]:
+    package = snapshot["sources"][source_id]
     result = {"source_id": source_id, "source_version": version["source_version"],
-              "kind": version["kind"], "version_basis": version["version_basis"],
+              "title": package["title"], "kind": version["kind"], "version_basis": version["version_basis"],
               "storage": version["storage"], "location": str(path), "action": action,
               "revision": snapshot["revision"], "commit_id": snapshot["commit_id"],
               "package_schema_version": PACKAGE_SCHEMA_VERSION,

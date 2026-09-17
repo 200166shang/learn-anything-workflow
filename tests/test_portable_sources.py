@@ -428,6 +428,43 @@ def test_retry_resyncs_existing_commit_directories_after_first_barrier_failure(t
     assert workspace.results in synced
 
 
+def test_pre_publish_retry_replays_source_id_title_and_operation_identity(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    workspace = WorkspaceConfig.load(config_path)
+    source = tmp_path / "source with spaces.txt"
+    source.write_text("one\n", encoding="utf-8")
+    title = "A title with spaces and 'single' plus \"double\" quotes"
+    real_sync = __import__("video_extract.source_registry", fromlist=["_sync_directory"])._sync_directory
+    failed_once = False
+
+    def fail_first_hash_dir(path: Path) -> None:
+        nonlocal failed_once
+        if Path(path).parent.name == "objects" and not failed_once:
+            failed_once = True
+            raise OSError("first hash directory sync failed")
+        real_sync(path)
+
+    with patch("video_extract.source_registry._sync_directory", side_effect=fail_first_hash_dir):
+        failed = register(workspace, source, title=title, expected_revision=0)
+
+    assert failed["status"] == "recoverable_failure"
+    command = failed["next_action"]["command"]
+    assert "--source-id" in command
+    assert "--title" in command
+    completed = subprocess.run(shlex.split(command), cwd=Path(__file__).parents[1],
+                               capture_output=True, text=True)
+    retried = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert retried["status"] == "completed"
+    assert retried["result"]["source_id"] == failed["result"]["source_id"]
+    assert retried["result"]["title"] == title
+    assert retried["operation_id"] == failed["operation_id"]
+    _, verified = cli("source", "verify", retried["result"]["source_id"],
+                      "--workspace", config_path, "--json")
+    assert verified["result"]["title"] == title
+
+
 def test_new_source_commands_reject_unconverted_workspace_v1(tmp_path: Path) -> None:
     config = tmp_path / "workspace.toml"
     config.write_text('''schema_version = 1
