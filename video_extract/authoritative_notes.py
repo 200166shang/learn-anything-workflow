@@ -25,6 +25,8 @@ from .manifest import atomic_write_json, read_json
 from .package_lock import package_lock
 from .source_registry import _load_snapshot
 from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
+from .timed_cues import cue_ranges
+from .visual_approval import validate_approval, validate_published_review
 
 SCHEMA_VERSION = 1
 SCHEMA = json.loads((Path(__file__).resolve().parent.parent / "schemas/notes-snapshot-v1.schema.json").read_text())
@@ -237,18 +239,18 @@ def associate_sources(config: WorkspaceConfig, source_id: str, related_source_id
 def _validate_request(config: WorkspaceConfig, value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     _schema_validate(value, "finalizeRequest")
     package, version = _source_version(config, value["source_id"], value["source_version"])
+    validate_approval(config, value)
     source_text = _source_text(config, version)
     is_srt = _looks_like_srt(source_text)
     allowed = {"timestamp"} if is_srt else {"paragraph", "heading"}
     paragraphs = [item.strip() for item in re.split(r"\n\s*\n", source_text) if item.strip()]
     headings = {match.group(0).strip() for match in re.finditer(r"(?m)^#{1,6}\s+[^\n]+$", source_text)}
-    cue_ranges = {match.group(0) for match in re.finditer(
-        r"(?m)^\d\d:\d\d:\d\d,\d{3} --> \d\d:\d\d:\d\d,\d{3}$", source_text)}
+    source_cues = set(cue_ranges(source_text))
     for citation in value["citations"]:
         if citation.get("locator_type") not in allowed or not citation.get("locator") or not citation.get("claim"):
             raise ValueError("citation locator is absent or unsupported for this source")
         locator = citation["locator"]
-        if citation["locator_type"] == "timestamp" and locator not in cue_ranges:
+        if citation["locator_type"] == "timestamp" and locator not in source_cues:
             raise ValueError("timestamp citation does not match a real SRT cue")
         if citation["locator_type"] == "paragraph":
             match = re.fullmatch(r"paragraph:([1-9]\d*)", locator)
@@ -259,6 +261,12 @@ def _validate_request(config: WorkspaceConfig, value: Any) -> tuple[dict[str, An
     for correction in value["corrections"]:
         if not isinstance(correction, dict) or not all(correction.get(key) for key in ("original", "corrected", "evidence")):
             raise ValueError("each correction must preserve the original wording, corrected wording, and evidence")
+    for raw_attachment in value["attachments"]:
+        attachment = Path(raw_attachment).expanduser().resolve()
+        if not attachment.is_file():
+            raise ValueError(f"adopted attachment is missing: {attachment}")
+        if attachment.name not in value["markdown"]:
+            raise ValueError(f"adopted attachment is not used by the note body: {attachment.name}")
     association = value["association"]
     if not isinstance(association, dict) or association.get("status") not in {
         "verified", "unverified", "not_applicable"
@@ -325,7 +333,10 @@ def _validate_commit(config: WorkspaceConfig, commit: dict[str, Any]) -> None:
             if any(commit["objects"][digest]["kind"] != kind for digest, kind in expected_kinds.items()):
                 raise WorkspaceError(f"note history object kind is invalid: {source_id}")
             _validate_published_association(source_snapshot, source_id, entry["source_version"], entry["association"])
+            validate_published_review(entry.get("visual_review"), entry["attachment_objects"])
         latest = note["history"][-1]
+        if note.get("visual_review") != latest.get("visual_review"):
+            raise WorkspaceError("current visual approval does not match latest history")
         for key in ("source_version", "body_object", "citations_object", "corrections_object",
                     "attachment_objects", "association"):
             if note[key] != latest[key]:
@@ -418,6 +429,7 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
     assert config.results is not None
     try:
         with package_lock(_safe(config.results.resolve(strict=False), "source-notes")):
+            validate_approval(config, value)
             previous = _load_current(config)
             existing = previous["notes"].get(source_id)
             note_revision = int(existing.get("revision", 0)) if existing else 0
@@ -438,7 +450,7 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
             }
             if existing and existing.get("source_version") == version["source_version"] and all(
                 existing.get(key) == expected for key, expected in prospective.items()
-            ) and existing.get("association") == value["association"]:
+            ) and existing.get("association") == value["association"] and existing.get("visual_review") == value.get("visual_review"):
                 body_path = _safe(_roots(config)[0], prospective["body_object"][:2], prospective["body_object"])
                 return response(status="completed", workspace=str(config.config_path),
                                 result={"source_id": source_id, "source_version": version["source_version"],
@@ -452,6 +464,7 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                 ("corrections", json.dumps(value["corrections"], ensure_ascii=False, sort_keys=True).encode(), "corrections"),
             ]
             attachment_digests = []
+            attachment_paths: list[Path] = []
             new_objects: dict[str, Any] = {}
             stored: dict[str, tuple[str, Path]] = {}
             for label, body, kind in values:
@@ -459,8 +472,10 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                 new_objects[digest] = {"kind": kind, "size": len(body)}
             for raw_attachment in value["attachments"]:
                 attachment = Path(raw_attachment).expanduser().resolve()
-                body = attachment.read_bytes(); digest, _ = _put(config, body)
-                attachment_digests.append(digest); new_objects[digest] = {"kind": "adopted_attachment", "size": len(body)}
+                body = attachment.read_bytes(); digest, stored_attachment = _put(config, body)
+                attachment_digests.append(digest); attachment_paths.append(stored_attachment)
+                new_objects[digest] = {"kind": "adopted_attachment", "size": len(body)}
+            validate_published_review(value.get("visual_review"), attachment_digests)
             revision = note_revision + 1
             history_entry = {"revision": revision, "body_object": stored["body"][0],
                              "citations_object": stored["citations"][0],
@@ -469,10 +484,14 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                              "association": value["association"],
                              "source_version": version["source_version"], "created_at": _now()}
             history = [*(existing or {}).get("history", []), history_entry]
+            if "visual_review" in value:
+                history_entry["visual_review"] = value["visual_review"]
             note = {"source_id": source_id, "source_version": version["source_version"], "revision": revision,
                     "body_object": stored["body"][0], "citations_object": stored["citations"][0],
                     "corrections_object": stored["corrections"][0], "attachment_objects": attachment_digests,
                     "association": value["association"], "history": history}
+            if "visual_review" in value:
+                note["visual_review"] = value["visual_review"]
             published = _publish(config, previous, {**previous["notes"], source_id: note}, new_objects)
             return response(status="completed", workspace=str(config.config_path),
                             result={"source_id": source_id, "source_version": version["source_version"],
@@ -481,8 +500,9 @@ def finalize_note(config: WorkspaceConfig, request: Path) -> dict[str, Any]:
                                     "action": "published"},
                             validation={"commit": "passed", "objects": "passed", "source": "passed"},
                             provenance={"source_id": source_id, "source_version": version["source_version"],
+                                        "visual_review": value.get("visual_review"),
                                         "note_commit_id": published["commit_id"]},
-                            artifact_refs=[str(stored["body"][1])])
+                            artifact_refs=[str(stored["body"][1]), *map(str, attachment_paths)])
     except OSError as exc:
         current = _load_current(config)
         target_commit = exc.commit_id if isinstance(exc, NotesPublishInterrupted) else None

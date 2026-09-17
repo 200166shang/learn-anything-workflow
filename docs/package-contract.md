@@ -14,6 +14,17 @@ turns a missing language track into localization work.
 
 The stable operation key includes the logical workspace ID, source identity and
 version, explicit scope, effective parameters, and capability contract version.
+
+`notes prepare ITEM_ID --media-operation OPERATION_ID` consumes only verified
+artifacts from that scoped operation. It reuses valid formal subtitles before
+calling ASR, registers the resulting immutable transcript as the note source,
+and extracts candidates only from a verified video artifact. Candidate records
+pin the source-video and image digests plus the real cue timestamp. Candidate
+selection is separate: model selection is `model_only`; `human` requires the
+explicit `--human-reviewed` boundary. Missing video pauses only requested visual
+evidence and never fabricates a frame. Adopted frames enter the authoritative
+note object store during `notes finalize`, and every adopted attachment must be
+referenced by the Markdown body.
 Operation state lives below the workspace's local role; artifacts live below
 the results role and are reusable only while their recorded size and SHA-256
 facts still match. `operation show` is read-only and `operation resume`

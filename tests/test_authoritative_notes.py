@@ -126,6 +126,19 @@ def test_finalize_publishes_body_citations_and_history_as_one_deeply_valid_commi
     assert config.results in note.parents
 
 
+def test_finalize_rejects_adopted_attachment_not_explicitly_referenced_by_body(tmp_path: Path) -> None:
+    config = workspace(tmp_path / "ws")
+    source = tmp_path / "fixture.md"; source.write_text("One\n\nTwo\n", encoding="utf-8")
+    registered = register(config, source); prepared = prepare_note(config, registered["result"]["source_id"])
+    request = draft(tmp_path / "draft.json", prepared, "# Note\n\nTwo\n")
+    attachment = tmp_path / "frame.png"; attachment.write_bytes(b"image")
+    value = json.loads(request.read_text()); value["attachments"] = [str(attachment)]
+    request.write_text(json.dumps(value))
+
+    with pytest.raises(ValueError, match="not used by the note body"):
+        finalize_note(config, request)
+
+
 def test_revision_conflict_preserves_candidate_without_changing_current(tmp_path: Path) -> None:
     config = workspace(tmp_path / "ws")
     source = tmp_path / "fixture.md"; source.write_text("One\n\nTwo\n", encoding="utf-8")
