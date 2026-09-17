@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://video-extract.local/schemas/learning-view-generation-v2.schema.json",
+  "title": "Learning view generation v2",
+  "type": "object",
+  "required": ["schema_version", "generation_id", "module_id", "learning_commit_id", "root_digest", "view_sha256", "views", "current_question_id", "local_node_ids", "root_groups", "nodes", "edges", "documents"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "generation_id": {"type": "string", "pattern": "^view-generation-[0-9a-f]{64}$"},
+    "module_id": {"type": "string", "pattern": "^module-"},
+    "learning_commit_id": {"type": "string", "pattern": "^learning-commit-[0-9a-f]{64}$"},
+    "root_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "view_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "views": {
+      "type": "object",
+      "required": ["局部问题图.html", "模块全景图.html", "问题目录.html"],
+      "additionalProperties": false,
+      "properties": {
+        "局部问题图.html": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "模块全景图.html": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "问题目录.html": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "current_question_id": {"type": ["string", "null"]},
+    "local_node_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "root_groups": {"type": "array", "items": {"type": "object", "required": ["thread_id", "root_title", "question_ids"], "properties": {"thread_id": {"type": "string", "pattern": "^thread-"}, "root_title": {"type": "string", "minLength": 1}, "question_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^question-"}}}, "additionalProperties": false}},
+    "nodes": {"type": "object", "additionalProperties": {"type": "object", "required": ["question_id", "title", "feedback", "content_state", "href", "is_current", "cross_root", "source_root_title", "root_title", "module_id", "unresolved_confusions"], "properties": {"question_id": {"type": "string", "pattern": "^question-"}, "title": {"type": "string", "minLength": 1}, "feedback": {"enum": ["understood", "confused", "parked", null]}, "content_state": {"enum": ["available", "pending", "broken"]}, "href": {"type": ["string", "null"]}, "is_current": {"type": "boolean"}, "cross_root": {"type": "boolean"}, "source_root_title": {"type": ["string", "null"]}, "root_title": {"type": "string", "minLength": 1}, "module_id": {"type": "string", "pattern": "^module-"}, "unresolved_confusions": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false}},
+    "edges": {"type": "array", "items": {"type": "object", "required": ["from_question_id", "to_question_id", "kind", "cross_root"], "properties": {"from_question_id": {"type": "string", "pattern": "^question-"}, "to_question_id": {"type": "string", "pattern": "^question-"}, "kind": {"type": "string", "minLength": 1}, "cross_root": {"type": "boolean"}, "reference_id": {"type": "string"}}, "additionalProperties": false}},
+    "documents": {"type": "object", "additionalProperties": {"type": "object", "required": ["logical_path", "object_sha256", "projection_sha256", "section_id"], "properties": {"logical_path": {"type": "string", "minLength": 1}, "object_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "projection_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "section_id": {"type": "string", "minLength": 1}}, "additionalProperties": false}}
+  },
+  "additionalProperties": false
+}
