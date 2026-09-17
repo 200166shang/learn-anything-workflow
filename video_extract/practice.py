@@ -226,48 +226,98 @@ def _derive_completion(practice:dict[str,Any])->str:
     if not passed:return "in_progress"
     return "with_hint" if any(item["kind"]=="hint" for item in events) else "independent"
 
+def _capture_task(root: Path, pid: str) -> tuple[bytes, list[tuple[str, bytes]]]:
+    task_fd = _open_task(root, pid)
+    try:
+        initial_root = os.fstat(task_fd)
+        before = _inventory(task_fd)
+        if not before or any(item[0] not in {"file", "dir"} for item in before.values()):
+            raise WorkspaceError("editable paths must be regular files or directories")
+        file_names = sorted(name for name, item in before.items() if item[0] == "file")
+        if not file_names:
+            raise WorkspaceError("editable task contains no regular files")
+        first = [(name, _read_regular(task_fd, name)) for name in file_names]
+        fresh_fd = _open_task(root, pid)
+        try:
+            fresh_root = os.fstat(fresh_fd)
+            if (initial_root.st_dev, initial_root.st_ino) != (fresh_root.st_dev, fresh_root.st_ino):
+                raise WorkspaceError("editable task root changed during checkpoint")
+            after = _inventory(fresh_fd)
+        finally:
+            os.close(fresh_fd)
+        if before != after:
+            raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
+        second = [(name, _read_regular(task_fd, name)) for name in file_names]
+        if first != second:
+            raise WorkspaceError("editable file content changed during checkpoint")
+        final_fd = _open_task(root, pid)
+        try:
+            final_root = os.fstat(final_fd)
+            if (initial_root.st_dev, initial_root.st_ino) != (final_root.st_dev, final_root.st_ino):
+                raise WorkspaceError("editable task root changed during checkpoint")
+            final = _inventory(final_fd)
+        finally:
+            os.close(final_fd)
+        if after != final:
+            raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
+        payload = json.dumps({name: body.decode("utf-8") for name, body in first},
+                             ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        return payload, first
+    finally:
+        os.close(task_fd)
+
+
 def checkpoint(config:WorkspaceConfig,pid:str,expected_revision:int)->dict[str,Any]:
     root=_root(config)
     with package_lock(root):
         snapshot=_load(config); practice=_get(snapshot,pid); conflict=_conflict(config,snapshot,expected_revision,"checkpoint",{"practice_id":pid})
         if conflict:return conflict
-        workspace=root/"workspaces"/pid; task=workspace/"task"; task_fd=None
         try:
-            task_fd=_open_task(root,pid); initial_root=os.fstat(task_fd)
-            before=_inventory(task_fd)
-            if not before or any(item[0] not in {"file","dir"} for item in before.values()): raise WorkspaceError("editable paths must be regular files or directories")
-            file_names=sorted(name for name,item in before.items() if item[0]=="file")
-            if not file_names:raise WorkspaceError("editable task contains no regular files")
-            first=[(name,_read_regular(task_fd,name)) for name in file_names]
-            fresh_fd=_open_task(root,pid)
-            try:
-                fresh_root=os.fstat(fresh_fd)
-                if (initial_root.st_dev,initial_root.st_ino)!=(fresh_root.st_dev,fresh_root.st_ino):raise WorkspaceError("editable task root changed during checkpoint")
-                after=_inventory(fresh_fd)
-            finally:os.close(fresh_fd)
-            if before!=after: raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
-            second=[(name,_read_regular(task_fd,name)) for name in file_names]
-            if first!=second: raise WorkspaceError("editable file content changed during checkpoint")
-            final_fd=_open_task(root,pid)
-            try:
-                final_root=os.fstat(final_fd)
-                if (initial_root.st_dev,initial_root.st_ino)!=(final_root.st_dev,final_root.st_ino):raise WorkspaceError("editable task root changed during checkpoint")
-                final=_inventory(final_fd)
-            finally:os.close(final_fd)
-            if after!=final: raise WorkspaceError("editable file set, type, or metadata changed during checkpoint")
-            payload=json.dumps({name:body.decode("utf-8") for name,body in first},ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()
+            payload, first = _capture_task(root, pid)
         except (OSError,WorkspaceError) as exc:
             return _unstable(config,snapshot,pid,str(exc))
         except UnicodeError as exc:
             return _unstable(config,snapshot,pid,f"editable task is not UTF-8 text: {exc}")
-        finally:
-            if task_fd is not None:os.close(task_fd)
         digest,size=_put(root,payload)
         item={"checkpoint_id":"checkpoint-"+str(uuid.uuid4()),"created_at":_now(),"object_sha256":digest,"files":[{"path":name,"sha256":hashlib.sha256(body).hexdigest(),"size":len(body)} for name,body in first]}
         updated={**practice,"checkpoints":[*practice["checkpoints"],item],"next_step":"run isolated tests"}
         updated["completion"]=_derive_completion(updated)
         published=_publish(config,snapshot,{**snapshot["practices"],pid:updated},{digest:{"kind":"code_checkpoint","size":size}})
         return _result(config,published,updated,checkpoint=item)
+
+
+def _live_workspaces(root: Path, snapshot: dict[str, Any]) -> list[str]:
+    return sorted(pid for pid in snapshot["practices"]
+                  if (root / "workspaces" / pid).exists() or (root / "workspaces" / pid).is_symlink())
+
+
+def prepare_backup_capture(config: WorkspaceConfig) -> dict[str, Any]:
+    """Capture saved editable code before the backup acquires the store locks."""
+    root = _root(config)
+    snapshot = _load(config)
+    live = _live_workspaces(root, snapshot)
+    for pid in live:
+        payload, _ = _capture_task(root, pid)
+        checkpoints = snapshot["practices"][pid]["checkpoints"]
+        if not checkpoints or hashlib.sha256(payload).hexdigest() != checkpoints[-1]["object_sha256"]:
+            captured = checkpoint(config, pid, snapshot["revision"])
+            if captured["status"] != "completed":
+                raise WorkspaceError("practice backup capture is incomplete: " + "; ".join(captured["diagnostics"]))
+            snapshot = _load(config)
+    return {"commit_id": snapshot.get("commit_id"), "live_workspaces": live,
+            "checkpoints": {pid: snapshot["practices"][pid]["checkpoints"][-1]["object_sha256"] for pid in live}}
+
+
+def validate_backup_capture(config: WorkspaceConfig, capture: dict[str, Any]) -> None:
+    """Recheck capture while the caller holds the Practice writer lock."""
+    root = _root(config)
+    snapshot = _load(config)
+    if snapshot.get("commit_id") != capture["commit_id"] or _live_workspaces(root, snapshot) != capture["live_workspaces"]:
+        raise WorkspaceError("practice generation or editable workspaces changed during backup")
+    for pid, digest in capture["checkpoints"].items():
+        payload, _ = _capture_task(root, pid)
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise WorkspaceError("practice editable code changed after backup capture")
 
 def record(config:WorkspaceConfig,pid:str,request_path:Path,expected_revision:int)->dict[str,Any]:
     event=read_json(request_path)

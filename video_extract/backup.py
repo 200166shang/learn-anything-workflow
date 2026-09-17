@@ -229,9 +229,12 @@ def create_backup(config: WorkspaceConfig, target: Path) -> dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     try:
+        from .practice import prepare_backup_capture, validate_backup_capture
+        capture = prepare_backup_capture(config)
         with ExitStack() as locks:
             for prefix in STORE_PREFIXES.values():
                 locks.enter_context(package_lock(config.results / prefix))
+            validate_backup_capture(config, capture)
             before = {name: _generation(config, name) for name in STORE_PREFIXES}
             payload = stage / "payload"; entries: list[dict[str, Any]] = []
             payload.mkdir()
@@ -258,6 +261,7 @@ def create_backup(config: WorkspaceConfig, target: Path) -> dict[str, Any]:
             after = {name: _generation(config, name)[0] for name in STORE_PREFIXES}
             if any(before[name][0] != after[name] for name in after):
                 raise WorkspaceError("an authoritative generation changed while backup was being prepared")
+            validate_backup_capture(config, capture)
         unsigned = {"schema_version": SCHEMA_VERSION, "workspace_id": config.workspace_id,
             "created_at": _now(), "tool_version": engineering_revision(), "authorities": authorities,
             "entries": sorted(entries, key=lambda item: item["path"]),
