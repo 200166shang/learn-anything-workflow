@@ -6,12 +6,27 @@
   "required": ["schema_version", "commit_id", "parent_commit_id", "revision", "created_at", "sources", "objects"],
   "properties": {
     "schema_version": {"const": 1},
-    "commit_id": {"type": "string", "pattern": "^commit-"},
-    "parent_commit_id": {"type": ["string", "null"]},
+    "commit_id": {"type": "string", "pattern": "^commit-[0-9a-f]{64}$"},
+    "parent_commit_id": {"type": ["string", "null"], "pattern": "^commit-[0-9a-f]{64}$"},
     "revision": {"type": "integer", "minimum": 1},
     "created_at": {"type": "string", "format": "date-time"},
-    "sources": {"type": "object"},
-    "objects": {"type": "object"}
+    "sources": {
+      "type": "object",
+      "propertyNames": {"pattern": "^source-[0-9a-f-]{36}$"},
+      "additionalProperties": {"$ref": "source-package-v6.schema.json"}
+    },
+    "objects": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[0-9a-f]{64}$"},
+      "additionalProperties": {
+        "type": "object", "required": ["kind", "size"],
+        "properties": {
+          "kind": {"enum": ["source_content"]},
+          "size": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    }
   },
   "additionalProperties": false
 }

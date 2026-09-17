@@ -372,13 +372,22 @@ def cmd_workspace(args: argparse.Namespace) -> int:
     elif args.workspace_action == "doctor":
         if config.schema_version == 2:
             from .source_registry import audit
-            store = audit(config)
-            result = response(status="completed", workspace=str(config.config_path),
-                              result={"workspace": config.as_dict(), "snapshot": store},
-                              validation={"workspace_schema": "passed", "snapshot": "passed",
-                                          "objects": "passed"},
-                              provenance={"workspace_config": str(config.config_path),
-                                          "commit_id": store["commit_id"]})
+            try:
+                store = audit(config)
+                result = response(status="completed", workspace=str(config.config_path),
+                                  result={"workspace": config.as_dict(), "snapshot": store},
+                                  validation={"workspace_schema": "passed", "snapshot": "passed",
+                                              "objects": "passed"},
+                                  provenance={"workspace_config": str(config.config_path),
+                                              "commit_id": store["commit_id"]})
+            except (OSError, ValueError, WorkspaceError) as exc:
+                result = response(status="recoverable_failure", workspace=str(config.config_path),
+                                  result={"workspace": config.as_dict()},
+                                  validation={"workspace_schema": "passed", "snapshot": "failed",
+                                              "objects": "not_checked"},
+                                  provenance={"workspace_config": str(config.config_path)},
+                                  diagnostics=[str(exc)],
+                                  next_action={"command": "video-extract workspace doctor --json"})
         else:
             from .capabilities import check_capabilities
             from .installation import inspect

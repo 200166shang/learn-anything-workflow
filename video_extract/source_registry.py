@@ -5,11 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import ValidationError
+from referencing import Registry, Resource
 
 from .command_response import response
 from .manifest import atomic_write_json, read_json
@@ -18,6 +23,36 @@ from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceConfig, WorkspaceError
 
 PACKAGE_SCHEMA_VERSION = 6
 SNAPSHOT_SCHEMA_VERSION = 1
+SCHEMA_ROOT = Path(__file__).resolve().parent.parent / "schemas"
+
+
+def _schema(name: str) -> dict[str, Any]:
+    return json.loads((SCHEMA_ROOT / name).read_text(encoding="utf-8"))
+
+
+_SCHEMAS = {name: _schema(name) for name in (
+    "source-package-v6.schema.json", "snapshot-v1.schema.json", "current-pointer-v1.schema.json"
+)}
+_SCHEMA_REGISTRY = Registry().with_resources(
+    (schema["$id"], Resource.from_contents(schema)) for schema in _SCHEMAS.values()
+)
+
+
+def _validate_schema(name: str, value: Any) -> None:
+    try:
+        Draft202012Validator(_SCHEMAS[name], registry=_SCHEMA_REGISTRY,
+                             format_checker=FormatChecker()).validate(value)
+    except ValidationError as exc:
+        location = "/".join(map(str, exc.absolute_path)) or "<root>"
+        raise WorkspaceError(f"{name} validation failed at {location}: {exc.message}") from exc
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _now() -> str:
@@ -95,33 +130,36 @@ def _load_snapshot(config: WorkspaceConfig) -> dict[str, Any]:
     if not pointer.is_file():
         return _empty_snapshot()
     pointer_data = read_json(pointer)
-    if pointer_data.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
-        raise WorkspaceError("current pointer is not snapshot schema v1")
+    _validate_schema("current-pointer-v1.schema.json", pointer_data)
     commit_id = pointer_data.get("commit_id")
     manifest_path = _safe_path(commits.parent, "commits", f"{commit_id}.json")
     if not manifest_path.is_file():
         raise WorkspaceError(f"published snapshot manifest is missing: {commit_id}")
     snapshot = read_json(manifest_path)
-    if snapshot.get("schema_version") != SNAPSHOT_SCHEMA_VERSION or snapshot.get("commit_id") != commit_id:
+    if snapshot.get("commit_id") != commit_id:
         raise WorkspaceError("published snapshot manifest failed schema/identity validation")
     expected_manifest = pointer_data.get("manifest_sha256")
     if expected_manifest != _sha256_bytes(manifest_path.read_bytes()):
         raise WorkspaceError("published snapshot manifest digest mismatch")
+    _validate_schema("snapshot-v1.schema.json", snapshot)
     _validate_source_packages(snapshot)
     return snapshot
 
 
 def _validate_source_packages(snapshot: dict[str, Any]) -> None:
-    required_snapshot = {"schema_version", "commit_id", "parent_commit_id", "revision",
-                         "created_at", "sources", "objects"}
-    if set(snapshot) != required_snapshot or not isinstance(snapshot.get("sources"), dict):
-        raise WorkspaceError("snapshot does not satisfy snapshot-v1.schema.json")
     for source_id, package in snapshot["sources"].items():
-        required = {"schema_version", "source_id", "kind", "title", "current_version", "versions"}
-        if (set(package) != required or package.get("schema_version") != PACKAGE_SCHEMA_VERSION
-                or package.get("source_id") != source_id or package.get("kind") not in {"document", "code"}
-                or package.get("current_version") not in package.get("versions", {})):
-            raise WorkspaceError(f"source package does not satisfy source-package-v6.schema.json: {source_id}")
+        _validate_schema("source-package-v6.schema.json", package)
+        if package["source_id"] != source_id or package["current_version"] not in package["versions"]:
+            raise WorkspaceError(f"source-package-v6.schema.json identity/current version mismatch: {source_id}")
+        for version_id, version in package["versions"].items():
+            if version["source_version"] != version_id or version["kind"] != package["kind"]:
+                raise WorkspaceError(f"source-package-v6.schema.json version identity/kind mismatch: {version_id}")
+            if version["version_basis"]["content_sha256"] != version["content_sha256"]:
+                raise WorkspaceError(f"source-package-v6.schema.json version digest mismatch: {version_id}")
+            if version["storage"] == "object" and "object_sha256" not in version:
+                raise WorkspaceError(f"source-package-v6.schema.json object storage lacks object_sha256: {version_id}")
+            if version.get("object_sha256") and version["object_sha256"] != version["content_sha256"]:
+                raise WorkspaceError(f"source-package-v6.schema.json object/content digest mismatch: {version_id}")
 
 
 def _write_object(config: WorkspaceConfig, value: bytes) -> tuple[str, Path]:
@@ -139,6 +177,8 @@ def _write_object(config: WorkspaceConfig, value: bytes) -> tuple[str, Path]:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+    _sync_directory(path.parent)
+    _sync_directory(path.parent.parent)
     return digest, path
 
 
@@ -189,17 +229,27 @@ def _publish(config: WorkspaceConfig, previous: dict[str, Any], sources: dict[st
     content = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     commit_id = "commit-" + _sha256_bytes(content)
     manifest["commit_id"] = commit_id
+    _validate_schema("snapshot-v1.schema.json", manifest)
+    _validate_source_packages(manifest)
     manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n"
     manifest_digest, _ = _write_object(config, manifest_bytes)
     commits.mkdir(parents=True, exist_ok=True)
     commit_path = _safe_path(commits.parent, "commits", f"{commit_id}.json")
-    if not commit_path.exists():
+    if commit_path.exists():
+        if commit_path.read_bytes() != manifest_bytes:
+            raise WorkspaceError(f"immutable commit manifest differs from published content: {commit_id}")
+    else:
         with commit_path.open("xb") as stream:
             stream.write(manifest_bytes); stream.flush(); os.fsync(stream.fileno())
+        _sync_directory(commits)
+        _sync_directory(commits.parent)
     if os.environ.get("VIDEO_EXTRACT_TEST_FAULT") == "before_publish":
         raise OSError("injected failure before snapshot publish")
-    atomic_write_json(pointer, {"schema_version": SNAPSHOT_SCHEMA_VERSION, "commit_id": commit_id,
-                                "manifest_sha256": manifest_digest})
+    pointer_value = {"schema_version": SNAPSHOT_SCHEMA_VERSION, "commit_id": commit_id,
+                     "manifest_sha256": manifest_digest}
+    _validate_schema("current-pointer-v1.schema.json", pointer_value)
+    atomic_write_json(pointer, pointer_value)
+    _sync_directory(pointer.parent)
     if os.environ.get("VIDEO_EXTRACT_TEST_FAULT") == "after_publish":
         raise OSError("injected failure after snapshot publish")
     return manifest
@@ -226,6 +276,7 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
     path = path.expanduser().resolve()
     kind, digest, body, basis, entries = _capture(path)
     source_version = "source-version-" + digest
+    source_id = "unresolved"
     assert config.results is not None
     try:
         with package_lock(config.results):
@@ -273,18 +324,37 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
             locations[source_id] = str(path); _save_locations(config, locations)
             return _result(config, published, source_id, proposed, path, "registered")
     except OSError as exc:
+        observed: dict[str, Any] | None = None
+        try:
+            current = _load_snapshot(config)
+            package = current.get("sources", {}).get(source_id)
+            if package and package.get("current_version") == source_version:
+                observed = {"workspace_id": config.workspace_id, "source_id": source_id,
+                            "source_version": source_version, "revision": current["revision"],
+                            "commit_id": current["commit_id"], "published": True}
+        except (OSError, ValueError, WorkspaceError):
+            pass
+        verify_command = (f"video-extract source verify {shlex.quote(source_id)} "
+                          f"--source-version {shlex.quote(source_version)} "
+                          f"--workspace {shlex.quote(str(config.config_path))} --json")
         return response(status="recoverable_failure", workspace=str(config.config_path),
-                        operation_id=_operation("source.register", config, "unresolved", source_version),
-                        validation={"snapshot": "uncertain"}, diagnostics=[str(exc)],
-                        next_action={"command": "video-extract source verify"})
+                        operation_id=_operation("source.register", config, source_id, source_version),
+                        result=observed or {"workspace_id": config.workspace_id, "source_id": source_id,
+                                           "source_version": source_version, "published": False},
+                        validation={"snapshot": "published" if observed else "uncertain"},
+                        diagnostics=[str(exc)],
+                        next_action={"type": "reconcile", "command": verify_command,
+                                     "source_id": source_id, "source_version": source_version})
 
 
 def _validate_snapshot_objects(config: WorkspaceConfig, snapshot: dict[str, Any]) -> None:
     objects, _, _, _ = _store_roots(config)
-    for digest in snapshot.get("objects", {}):
+    for digest, record in snapshot.get("objects", {}).items():
         path = _safe_path(objects.parent, "objects", digest[:2], digest)
         if not path.is_file() or _sha256_bytes(path.read_bytes()) != digest:
             raise WorkspaceError(f"snapshot object is missing or corrupt: {digest}")
+        if path.stat().st_size != record["size"]:
+            raise WorkspaceError(f"snapshot object size record is inconsistent: {digest}")
 
 
 def audit(config: WorkspaceConfig) -> dict[str, Any]:

@@ -5,6 +5,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
+
+from video_extract.source_registry import register
+from video_extract.workspace import WorkspaceConfig
 
 
 def write_workspace(root: Path, *, results: str = "results", sources: str = "sources") -> Path:
@@ -222,12 +226,75 @@ def test_publish_fault_exposes_only_a_complete_snapshot(tmp_path: Path, fault: s
                        env={"VIDEO_EXTRACT_TEST_FAULT": fault})
     assert code == 1
     assert failed["status"] == "recoverable_failure"
+    assert failed["operation_id"]
+    if fault == "after_publish":
+        assert failed["result"]["source_id"] == first["result"]["source_id"]
+        assert failed["result"]["source_version"] != first["result"]["source_version"]
+        assert failed["result"]["revision"] == first["result"]["revision"] + 1
+        assert failed["result"]["commit_id"].startswith("commit-")
+        assert first["result"]["source_id"] in failed["next_action"]["command"]
+        assert "source verify" in failed["next_action"]["command"]
 
     _, observed = cli("source", "verify", first["result"]["source_id"],
                       "--workspace", config, "--json")
     assert observed["result"]["content"] in {"one\n", "two\n"}
     assert observed["validation"]["snapshot"] == "passed"
     assert observed["validation"]["objects"] == "passed"
+
+
+def test_doctor_and_verify_reject_nested_schema_corruption(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = tmp_path / "fixture.txt"
+    source.write_text("one\n", encoding="utf-8")
+    _, first = cli("source", "register", source, "--workspace", config, "--json")
+    results = config.parent / "results"
+    pointer_path = results / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = results / "commits" / f'{pointer["commit_id"]}.json'
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    version = manifest["sources"][first["result"]["source_id"]]["versions"][first["result"]["source_version"]]
+    version["entries"] = [{"path": "bad", "sha256": 7, "size": "not-an-integer"}]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    code, checked = cli("workspace", "doctor", "--workspace", config, "--json")
+    assert code == 1
+    assert checked["status"] == "recoverable_failure"
+    assert "snapshot-v1.schema.json" in checked["diagnostics"][0]
+    code, verified = cli("source", "verify", first["result"]["source_id"],
+                         "--workspace", config, "--json")
+    assert code == 1
+    assert verified["status"] == "failed"
+    assert "snapshot-v1.schema.json" in verified["diagnostics"][0]
+
+
+def test_publish_syncs_object_manifest_and_pointer_directories_in_order(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    source = tmp_path / "fixture.txt"
+    source.write_text("durable\n", encoding="utf-8")
+    synced: list[str] = []
+
+    with patch("video_extract.source_registry._sync_directory",
+               side_effect=lambda path: synced.append(Path(path).name)):
+        result = register(WorkspaceConfig.load(config_path), source)
+
+    assert result["status"] == "completed"
+    assert synced.index("objects") < synced.index("commits")
+    assert synced.index("commits") < len(synced) - 1
+    assert synced[-1] == "results"
+
+
+def test_directory_sync_failure_is_not_reported_as_success(tmp_path: Path) -> None:
+    config_path = write_workspace(tmp_path / "workspace")
+    source = tmp_path / "fixture.txt"
+    source.write_text("durable\n", encoding="utf-8")
+
+    with patch("video_extract.source_registry._sync_directory", side_effect=OSError("sync failed")):
+        result = register(WorkspaceConfig.load(config_path), source)
+
+    assert result["status"] == "recoverable_failure"
+    assert "sync failed" in result["diagnostics"][0]
 
 
 def test_new_source_commands_reject_unconverted_workspace_v1(tmp_path: Path) -> None:
