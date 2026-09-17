@@ -228,6 +228,51 @@ def test_register_code_directory_records_git_and_dirty_content(tmp_path: Path) -
     assert verified["result"]["observed_version_basis"] == basis
 
 
+def test_git_provenance_is_scoped_to_registered_monorepo_directory_and_expands_rename(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "monorepo"; scope = repo / "packages" / "learn"; outside = repo / "packages" / "other"
+    scope.mkdir(parents=True); outside.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    (scope / "old.py").write_text("value = 1\n"); (outside / "outside.py").write_text("outside = 1\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+
+    (outside / "outside.py").write_text("outside = 2\n")
+    clean_scope = register(WorkspaceConfig.load(config), scope)
+    assert clean_scope["result"]["version_basis"]["working_tree_dirty"] is False
+    assert clean_scope["result"]["version_basis"]["dirty_files"] == {
+        "modified": [], "added": [], "deleted": []}
+
+    subprocess.run(["git", "-C", repo, "mv", "packages/learn/old.py", "packages/learn/new.py"], check=True)
+    renamed = register(WorkspaceConfig.load(config), scope)
+    assert renamed["result"]["version_basis"]["dirty_files"] == {
+        "modified": [], "added": ["new.py"], "deleted": ["old.py"]}
+    assert all(".." not in path for paths in renamed["result"]["version_basis"]["dirty_files"].values()
+               for path in paths)
+
+
+def test_git_provenance_cross_scope_renames_record_only_the_in_scope_side(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    repo = tmp_path / "monorepo"; scope = repo / "scope"; outside = repo / "outside"
+    scope.mkdir(parents=True); outside.mkdir()
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", repo, "config", "user.name", "Fixture"], check=True)
+    (scope / "moves-out.py").write_text("out = 1\n")
+    (outside / "moves-in.py").write_text("inside = 1\n")
+    subprocess.run(["git", "-C", repo, "add", "."], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-qm", "initial"], check=True)
+
+    subprocess.run(["git", "-C", repo, "mv", "scope/moves-out.py", "outside/moves-out.py"], check=True)
+    subprocess.run(["git", "-C", repo, "mv", "outside/moves-in.py", "scope/moves-in.py"], check=True)
+    registered = register(WorkspaceConfig.load(config), scope)
+
+    assert registered["result"]["version_basis"]["dirty_files"] == {
+        "modified": [], "added": ["moves-in.py"], "deleted": ["moves-out.py"]}
+
+
 def test_relocate_finds_same_version_and_does_not_accept_different_content(tmp_path: Path) -> None:
     config = write_workspace(tmp_path / "workspace")
     source = tmp_path / "one.md"

@@ -94,25 +94,56 @@ def _directory_manifest(root: Path) -> tuple[str, list[dict[str, Any]]]:
 
 
 def _git_basis(path: Path) -> dict[str, Any]:
-    def run(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
-    top = run("rev-parse", "--show-toplevel")
+    def run(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    top = run(path, "rev-parse", "--show-toplevel")
     if top.returncode:
         return {"git_commit": None, "working_tree_dirty": None}
-    commit = run("rev-parse", "HEAD")
-    dirty = run("status", "--porcelain", "--untracked-files=all")
+    repository = Path(top.stdout.strip()).resolve()
+    registered_root = path.resolve()
+    try:
+        scope = registered_root.relative_to(repository)
+    except ValueError:
+        return {"git_commit": None, "working_tree_dirty": None}
+    scope_pathspec = scope.as_posix() or "."
+    commit = run(repository, "rev-parse", "HEAD")
+    dirty = run(repository, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+                "--", scope_pathspec)
     dirty_files = {"modified": [], "added": [], "deleted": []}
     if dirty.returncode == 0:
-        for line in dirty.stdout.splitlines():
-            state, relative = line[:2], line[3:]
-            if " -> " in relative:
-                relative = relative.split(" -> ", 1)[1]
-            if state == "??" or "A" in state:
-                dirty_files["added"].append(relative)
-            elif "D" in state:
-                dirty_files["deleted"].append(relative)
+        records = dirty.stdout.split("\0"); index = 0
+
+        def scoped(value: str) -> str | None:
+            candidate = Path(value)
+            try:
+                relative = candidate.relative_to(scope) if scope.parts else candidate
+            except ValueError:
+                return None
+            normalized = relative.as_posix()
+            if not normalized or normalized == "." or normalized == ".." or normalized.startswith("../"):
+                return None
+            return normalized
+
+        while index < len(records) and records[index]:
+            record = records[index]; index += 1
+            state, destination = record[:2], record[3:]
+            if "R" in state or "C" in state:
+                source = records[index] if index < len(records) else ""; index += 1
+                old_path, new_path = scoped(source), scoped(destination)
+                if old_path:
+                    dirty_files["deleted"].append(old_path)
+                if new_path:
+                    dirty_files["added"].append(new_path)
             else:
-                dirty_files["modified"].append(relative)
+                relative = scoped(destination)
+                if relative is None:
+                    continue
+                if state == "??" or "A" in state:
+                    dirty_files["added"].append(relative)
+                elif "D" in state:
+                    dirty_files["deleted"].append(relative)
+                else:
+                    dirty_files["modified"].append(relative)
         dirty_files = {key: sorted(values) for key, values in dirty_files.items()}
     return {"git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
             "working_tree_dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None,
