@@ -56,11 +56,13 @@ include = [
 "schemas/learning-record-v2.schema.json" = "schemas/learning-record-v2.schema.json"
 "schemas/learning-snapshot-v2.schema.json" = "schemas/learning-snapshot-v2.schema.json"
 "schemas/learning-candidate-v2.schema.json" = "schemas/learning-candidate-v2.schema.json"
+"schemas/learning-view-generation-v1.schema.json" = "schemas/learning-view-generation-v1.schema.json"
 "schemas/notes-snapshot-v1.schema.json" = "schemas/notes-snapshot-v1.schema.json"
 "schemas/media-acquire-request-v1.schema.json" = "schemas/media-acquire-request-v1.schema.json"
 "schemas/mandarin-audio-request-v1.schema.json" = "schemas/mandarin-audio-request-v1.schema.json"
 "schemas/netease-publish-request-v1.schema.json" = "schemas/netease-publish-request-v1.schema.json"
 "integrations/skills" = "integrations/skills"
+"integrations/obsidian-learning-map" = "integrations/obsidian-learning-map"
 ".codex/agents" = ".codex/agents"
 
 [project.scripts]

@@ -263,6 +263,26 @@ def cmd_learning(args: argparse.Namespace) -> int:
     return exit_code(result)
 
 
+def cmd_view(args: argparse.Namespace) -> int:
+    from .command_response import exit_code, response
+    from .learning_view import build_view, locate_view, status_view
+    from .workspace import WorkspaceError
+    workspace = discover_workspace(args.workspace)
+    try:
+        if args.view_action == "build":
+            result = build_view(workspace, args.module_id)
+        elif args.view_action == "status":
+            result = status_view(workspace, args.module_id)
+        elif args.view_action == "locate":
+            result = locate_view(workspace, args.question_id)
+        else:
+            result = response(status="unsupported", workspace=str(workspace.config_path))
+    except (OSError, ValueError, WorkspaceError, json.JSONDecodeError) as exc:
+        result = response(status="failed", workspace=str(workspace.config_path), diagnostics=[str(exc)])
+    emit(result, args.json)
+    return exit_code(result)
+
+
 def cmd_explanation(args: argparse.Namespace) -> int:
     from .command_response import exit_code, response
     from .learning import (LearningPublishError, commit_explanation, prepare_explanation,
@@ -670,6 +690,11 @@ def parser() -> argparse.ArgumentParser:
     back_parser = learning_entities.add_parser("back"); back_parser.add_argument("--thread-id", required=True); back_parser.add_argument("--expected-revision", type=int); back_parser.add_argument("--workspace", type=Path); back_parser.add_argument("--json", action="store_true"); back_parser.set_defaults(func=cmd_learning)
     locate_parser = learning_entities.add_parser("locate"); locate_parser.add_argument("question_id"); locate_parser.add_argument("--workspace", type=Path); locate_parser.add_argument("--json", action="store_true"); locate_parser.set_defaults(func=cmd_learning)
     reconcile_parser = learning_entities.add_parser("reconcile"); reconcile_parser.add_argument("--commit-id", required=True); reconcile_parser.add_argument("--workspace", type=Path); reconcile_parser.add_argument("--json", action="store_true"); reconcile_parser.set_defaults(func=cmd_learning)
+    view = commands.add_parser("view", help="build and inspect rebuildable Obsidian learning projections")
+    view_actions = view.add_subparsers(dest="view_action", required=True)
+    view_build = view_actions.add_parser("build"); view_build.add_argument("--module-id", required=True); view_build.add_argument("--workspace", type=Path); view_build.add_argument("--json", action="store_true"); view_build.set_defaults(func=cmd_view)
+    view_status = view_actions.add_parser("status"); view_status.add_argument("--module-id", required=True); view_status.add_argument("--workspace", type=Path); view_status.add_argument("--json", action="store_true"); view_status.set_defaults(func=cmd_view)
+    view_locate = view_actions.add_parser("locate"); view_locate.add_argument("question_id"); view_locate.add_argument("--workspace", type=Path); view_locate.add_argument("--json", action="store_true"); view_locate.set_defaults(func=cmd_view)
     explanation = commands.add_parser("explanation", help="prepare and commit versioned teaching explanations")
     explanation_actions = explanation.add_subparsers(dest="explanation_action", required=True)
     explanation_prepare = explanation_actions.add_parser("prepare"); explanation_prepare.add_argument("--question-id", required=True); explanation_prepare.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_prepare.add_argument("--workspace", type=Path); explanation_prepare.add_argument("--json", action="store_true"); explanation_prepare.set_defaults(func=cmd_explanation)
