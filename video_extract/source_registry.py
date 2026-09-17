@@ -300,7 +300,8 @@ def _capture(path: Path) -> tuple[str, str, bytes | None, dict[str, Any], list[d
 
 
 def register(config: WorkspaceConfig, path: Path, title: str | None = None,
-             expected_revision: int | None = None, explicit_source_id: str | None = None) -> dict[str, Any]:
+             expected_revision: int | None = None, explicit_source_id: str | None = None,
+             provenance: dict[str, Any] | None = None) -> dict[str, Any]:
     _require_v2(config)
     path = path.expanduser().resolve()
     kind, digest, body, basis, entries = _capture(path)
@@ -332,6 +333,8 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
             proposed = {"source_version": source_version, "content_sha256": digest, "kind": kind,
                         "captured_at": _now(), "version_basis": basis, "entries": entries,
                         "storage": "object" if body is not None else "reference"}
+            if provenance is not None:
+                proposed["provenance"] = provenance
             if expected_revision is not None and expected_revision != snapshot["revision"]:
                 if body is not None:
                     object_digest, _ = _write_object(config, body)
@@ -348,6 +351,8 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
                                 next_action={"type": "user", "reason": "resolve source revision conflict"})
             versions = dict(current.get("versions", {})) if current else {}
             if source_version in versions:
+                if provenance is not None and versions[source_version].get("provenance") != provenance:
+                    raise ValueError("registered source version provenance is immutable")
                 if current["current_version"] == source_version:
                     locations[source_id] = str(path); _save_locations(config, locations)
                     return _result(config, snapshot, source_id, versions[source_version], path, "reused")
@@ -504,7 +509,27 @@ def verify(config: WorkspaceConfig, source_id: str, source_version: str | None =
               "availability": availability, "content": content,
               "package_schema_version": PACKAGE_SCHEMA_VERSION,
               "snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
-              "version_basis": version["version_basis"], "storage": version["storage"]}
+              "version_basis": version["version_basis"], "storage": version["storage"],
+              "entries": version.get("entries", [])}
+    result["current_version"] = package["current_version"]
+    result["version_state"] = "current" if version_id == package["current_version"] else "historical"
+    result["change_check"] = "current" if result["version_state"] == "current" else "needs_review"
+    if result["version_state"] == "historical":
+        current_version = package["versions"][package["current_version"]]
+        before = {entry["path"]: entry["sha256"] for entry in version.get("entries", [])}
+        after = {entry["path"]: entry["sha256"] for entry in current_version.get("entries", [])}
+        if package["kind"] == "code":
+            result["change_summary"] = {
+                "added": sorted(after.keys() - before.keys()),
+                "modified": sorted(path for path in before.keys() & after.keys() if before[path] != after[path]),
+                "removed": sorted(before.keys() - after.keys()),
+            }
+        else:
+            result["change_summary"] = {"added": [], "modified": ["<document>"], "removed": []}
+    else:
+        result["change_summary"] = {"added": [], "modified": [], "removed": []}
+    result["provenance"] = version.get("provenance")
+    result["provenance_status"] = "recorded" if version.get("provenance") else "unknown"
     return response(status="completed", workspace=str(config.config_path),
                     operation_id=_operation("source.verify", config, source_id, version_id), result=result,
                     validation={"package": "passed", "snapshot": "passed", "objects": "passed"},

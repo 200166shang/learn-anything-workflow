@@ -57,6 +57,8 @@ ledger digests, and fact summaries; free-form provider evidence is excluded.
 
 - New acquisition uses `plan/ensure --media`; it never synthesizes a missing language track.
 - New source-note work uses `source import`, `notes prepare`, and `notes finalize`.
+- `source register --provenance FILE` records immutable public-source provenance on a source version: origin, author or organization, published version/date, access time, relevant summary, concrete locator, applicability, and manual-verification state. Older registrations remain readable and report provenance as `unknown`.
+- `source verify` never silently upgrades a pinned reference. It reports `current` or `historical`, the current version, and a per-file change summary for code sources. `notes prepare`, `learning module show`, `learning locate`, and `explanation prepare` surface `needs_review`; old note/explanation objects and user corrections remain immutable. A changed key source pauses only consumers pinned to it. Current-code evidence uses a `file::symbol` (or file/line) locator plus that file's content digest; unchanged files remain reusable after an unrelated tree change. Inferences remain explicitly distinct and require review.
 - `podcast_zh` and `notes_zh` remain artifact validation names for historical packages and final note checks; they are not public `plan/ensure --goal` inputs.
 
 `plan` is read-only. Pass `--output EXISTING_PACKAGE` only for an explicitly selected package. `notes prepare` returns `awaiting_ai` with package-relative input/output and a resume argv; `notes finalize` verifies, exports, and updates the library.

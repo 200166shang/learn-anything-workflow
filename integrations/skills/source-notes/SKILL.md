@@ -21,3 +21,5 @@ When the action is `evidence_select`, read [evidence and writing](references/evi
 Reconstruct the source's main line and important reasoning instead of paraphrasing transcript chunks. Keep source-specific conclusions beside real timestamps, headings, or paragraph locators. Adopt every approved image and exclude material explicitly when coverage would otherwise be ambiguous. Audio and transcript sources require timestamps; documents use headings or paragraph locators. Never fabricate screenshots for sources without video.
 
 The package chooses storage. Do not write loose notes beside an input file or choose another Vault directory. This skill does not acquire media, choose an ASR provider, create Mandarin audio, update learning `thread.yaml`, or perform a learning dialogue.
+
+Before reusing a pinned note, run `source verify` and then `notes prepare` for its exact version. If it returns `needs_review`, preserve the old note, original transcript wording, corrections, and evidence; compare the current version and revise only affected claims. Never rewrite the registered source.

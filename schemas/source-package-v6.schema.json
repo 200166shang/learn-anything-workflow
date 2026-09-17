@@ -47,7 +47,22 @@
           }
         },
         "storage": {"enum": ["object", "reference"]},
-        "object_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        "object_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provenance": {
+          "type": "object",
+          "required": ["origin", "author_or_organization", "published_version_or_date", "accessed_at", "summary", "locator", "applicability", "verification"],
+          "properties": {
+            "origin": {"type": "string", "minLength": 1},
+            "author_or_organization": {"type": "string", "minLength": 1},
+            "published_version_or_date": {"type": "string", "minLength": 1},
+            "accessed_at": {"type": "string", "format": "date-time"},
+            "summary": {"type": "string", "minLength": 1},
+            "locator": {"type": "string", "minLength": 1},
+            "applicability": {"type": "string", "minLength": 1},
+            "verification": {"enum": ["manual_review_required", "manually_verified"]}
+          },
+          "additionalProperties": false
+        }
       },
       "allOf": [
         {

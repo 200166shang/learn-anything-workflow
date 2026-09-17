@@ -118,6 +118,50 @@ def test_register_document_reuses_source_identity_and_versions_content(tmp_path:
     assert current["result"]["source_version"] == first_version
 
 
+def test_register_supplemental_source_preserves_public_provenance_and_unknown_is_explicit(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = tmp_path / "reference.md"
+    source.write_text("# Public explanation\nOnly applies to CPython 3.13.\n", encoding="utf-8")
+    provenance = tmp_path / "provenance.json"
+    provenance.write_text(json.dumps({
+        "origin": "https://example.org/reference",
+        "author_or_organization": "Example Institute",
+        "published_version_or_date": "2026-08-01",
+        "accessed_at": "2026-09-17T09:00:00+08:00",
+        "summary": "Explains the public API behavior.",
+        "locator": "Section 2, API boundary",
+        "applicability": "CPython 3.13 only",
+        "verification": "manual_review_required",
+    }), encoding="utf-8")
+
+    code, registered = cli("source", "register", source, "--provenance", provenance,
+                           "--workspace", config, "--json")
+    assert code == 0
+    code, verified = cli("source", "verify", registered["result"]["source_id"],
+                         "--workspace", config, "--json")
+    assert code == 0
+    assert verified["result"]["provenance_status"] == "recorded"
+    assert verified["result"]["provenance"] == json.loads(provenance.read_text())
+
+    _, module = cli("learning", "module", "create", "--goal", "check applicability", "--scope", "API",
+                    "--source-id", registered["result"]["source_id"],
+                    "--source-version", registered["result"]["source_version"],
+                    "--source-role", "supplemental_source", "--workspace", config, "--json")
+    _, rooted = cli("learning", "thread", "create", "--module-id", module["result"]["module"]["module_id"],
+                    "--root-question", "When does it apply?", "--workspace", config, "--json")
+    _, prepared = cli("explanation", "prepare", "--question-id", rooted["result"]["question"]["question_id"],
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    assert prepared["result"]["source_context"][0]["provenance"]["applicability"] == "CPython 3.13 only"
+    assert prepared["result"]["source_context"][0]["provenance"]["verification"] == "manual_review_required"
+
+    plain = tmp_path / "plain.md"; plain.write_text("legacy-style source\n", encoding="utf-8")
+    _, unannotated = cli("source", "register", plain, "--workspace", config, "--json")
+    _, checked = cli("source", "verify", unannotated["result"]["source_id"],
+                     "--workspace", config, "--json")
+    assert checked["result"]["provenance_status"] == "unknown"
+    assert checked["result"]["provenance"] is None
+
+
 def test_import_alias_and_doctor_validate_the_published_store(tmp_path: Path) -> None:
     config = write_workspace(tmp_path / "workspace")
     source = tmp_path / "fixture.txt"
