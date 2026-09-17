@@ -36,7 +36,7 @@ def register_source(tmp_path: Path, config: Path, content: str = "# Vectors\n") 
     source = tmp_path / "source.md"
     source.write_text(content, encoding="utf-8")
     code, result = cli("source", "register", source, "--workspace", config, "--json")
-    assert code == 0
+    assert code == 0, result.get("diagnostics")
     return result["result"]
 
 
@@ -249,6 +249,9 @@ def test_stale_learning_revision_preserves_a_conflict_candidate(tmp_path: Path) 
     candidate = Path(conflict["result"]["candidate"])
     assert candidate.is_file()
     assert json.loads(candidate.read_text(encoding="utf-8"))["proposal"]["question"] == "不会覆盖的问题"
+    replay_code, unsupported = cli("explanation", "replay", "--candidate", candidate,
+                                   "--workspace", config, "--json")
+    assert replay_code == 1 and unsupported["status"] == "unsupported"
     _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
     assert [item["question_id"] for item in shown["result"]["questions"]] == [root_id]
 
@@ -841,3 +844,201 @@ def test_locator_resolves_from_digest_after_results_root_moves(tmp_path: Path) -
     assert location["logical_path"].startswith("learning/objects/")
     assert Path(location["document_path"]).is_file()
     assert str(second_root / "results") in location["document_path"]
+
+
+def test_same_root_refactor_keeps_every_historical_question_locatable(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "矩阵列为什么重要？")
+    _, pursued = cli("learning", "pursue", "--thread-id", thread_id,
+                     "--from-question-id", root_id, "--relation", "deepens",
+                     "--question", "坐标为什么依赖基？", "--workspace", config, "--json")
+    followup_id = pursued["result"]["question"]["question_id"]
+    _, prepared = cli("explanation", "prepare", "--question-id", root_id,
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    first_section = prepared["result"]["section_id"]
+    second_section = "section-22222222-2222-4222-8222-222222222222"
+    draft, evidence, review = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    draft.write_text(
+        f"# 合并讲解\n<!-- section-id: {first_section} -->\n"
+        "直觉和因果机制：基向量决定矩阵列。例子 (1,2) 变 (2,6)。条件边界：平移需要仿射。\n"
+        f"<!-- section-id: {second_section} -->\n坐标是相对所选基的系数。\n")
+    section_map = tmp_path / "sections.json"
+    section_map.write_text(json.dumps({root_id: [first_section], followup_id: [second_section]}))
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"summary": "合并并重排两个同根回答",
+                                   "affected_question_ids": [root_id, followup_id]}))
+
+    code, committed = cli("explanation", "commit", "--question-id", root_id,
+                          "--draft", draft, "--evidence", evidence, "--teaching-review", review,
+                          "--profile", "linear_transform", "--preparation-id", prepared["result"]["preparation_id"],
+                          "--section-map", section_map, "--revision-metadata", summary,
+                          "--workspace", config, "--json")
+
+    assert code == 0, committed.get("diagnostics")
+    assert committed["result"]["explanation"]["revision_kind"] == "refactor"
+    for question_id, section_id in ((root_id, first_section), (followup_id, second_section)):
+        locate_code, located = cli("learning", "locate", question_id, "--workspace", config, "--json")
+        assert locate_code == 0
+        assert located["result"]["question"]["original_question"]
+        assert located["result"]["locations"][0]["section_id"] == section_id
+
+
+def test_refactor_rejects_a_section_map_from_another_root(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = register_source(tmp_path, config)
+    _, first_id = create_root(tmp_path, config, source, "第一根")
+    _, other_id = create_root(tmp_path, config, source, "另一根")
+    _, prepared = cli("explanation", "prepare", "--question-id", first_id,
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    draft, evidence, review = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    section_map = tmp_path / "cross-root.json"
+    section_map.write_text(json.dumps({other_id: [prepared["result"]["section_id"]]}))
+
+    code, rejected = cli("explanation", "commit", "--question-id", first_id,
+                         "--draft", draft, "--evidence", evidence, "--teaching-review", review,
+                         "--profile", "linear_transform", "--preparation-id", prepared["result"]["preparation_id"],
+                         "--section-map", section_map, "--workspace", config, "--json")
+
+    assert code == 1
+    assert rejected["validation"]["same_root_scope"] == "failed"
+    other_code, other = cli("learning", "locate", other_id, "--workspace", config, "--json")
+    assert other_code == 3 and other["result"]["explanation_state"] == "pending"
+
+
+def test_restore_old_expression_overlays_confirmed_correction_without_moving_progress(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "矩阵是什么？")
+    _, prepared = cli("explanation", "prepare", "--question-id", root_id,
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    draft, evidence, review = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    draft.write_text(draft.read_text() + "\n\n矩阵行是基向量的像。\n")
+    code, first = cli("explanation", "commit", "--question-id", root_id, "--draft", draft,
+                      "--evidence", evidence, "--teaching-review", review, "--profile", "linear_transform",
+                      "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
+    assert code == 0
+    _, pursued = cli("learning", "pursue", "--thread-id", thread_id,
+                     "--from-question-id", root_id, "--relation", "deepens", "--question", "继续追问",
+                     "--workspace", config, "--json")
+    current_question_id = pursued["result"]["question"]["question_id"]
+    _, correction_prepare = cli("explanation", "prepare", "--question-id", root_id,
+                                "--profile", "linear_transform", "--workspace", config, "--json")
+    corrected, correction_evidence, correction_review = _linear_inputs(
+        tmp_path, source, correction_prepare["result"]["required_marker"])
+    corrections = tmp_path / "corrections.json"
+    corrections.write_text(json.dumps([{
+        "original_claim": "矩阵行是基向量的像",
+        "corrected_claim": "“矩阵行是基向量的像”不成立；矩阵列才是基向量的像",
+        "applicability": "在线性映射采用列向量坐标约定时",
+        "evidence_refs": json.loads(correction_evidence.read_text()),
+        "affected_conclusions": ["列向量与基向量像的对应关系"]}]))
+    code, revised = cli("explanation", "commit", "--question-id", root_id, "--draft", corrected,
+                        "--evidence", correction_evidence, "--teaching-review", correction_review,
+                        "--profile", "linear_transform", "--preparation-id", correction_prepare["result"]["preparation_id"],
+                        "--corrections", corrections, "--workspace", config, "--json")
+    assert code == 0
+    correction_id = revised["result"]["explanation"]["introduced_correction_ids"][0]
+    corrected_text = Path(revised["result"]["explanation"]["document_path"]).read_text()
+    assert corrected_text.count(f"<!-- correction-id: {correction_id} -->") == 1
+    assert "纠正说法：“矩阵行是基向量的像”不成立；矩阵列才是基向量的像" in corrected_text
+    assert "适用边界：在线性映射采用列向量坐标约定时" in corrected_text
+
+    _, rollback_prepare = cli("explanation", "prepare", "--question-id", root_id,
+                              "--profile", "linear_transform", "--workspace", config, "--json")
+    rollback, rollback_evidence, rollback_review = _linear_inputs(
+        tmp_path, source, rollback_prepare["result"]["required_marker"])
+    prior_marker = correction_prepare["result"]["required_marker"]
+    canonical_update = corrected_text.replace(prior_marker, rollback_prepare["result"]["required_marker"])
+    opening = f"<!-- correction-id: {correction_id} -->"
+    closing = f"<!-- /correction-id: {correction_id} -->"
+    unknown_id = "correction-22222222-2222-4222-8222-222222222222"
+    tampered_variants = {
+        "suffix": canonical_update.replace("适用边界：在线性映射采用列向量坐标约定时",
+                                             "适用边界：在线性映射采用列向量坐标约定时（篡改）"),
+        "duplicate_opening": canonical_update.replace(opening, opening + "\n" + opening),
+        "orphan_closing": canonical_update + f"\n{closing}\n",
+        "unknown_id": canonical_update + (f"\n<!-- correction-id: {unknown_id} -->\n未知\n"
+                                                   f"<!-- /correction-id: {unknown_id} -->\n"),
+        "one_space_indent": canonical_update.replace(opening, " " + opening),
+        "three_space_indent": canonical_update.replace(opening, "   " + opening),
+        "tab_indent": canonical_update.replace(opening, "\t" + opening),
+        "inline_marker": canonical_update.replace(opening, "正文" + opening),
+        "spacing_variant_duplicate": canonical_update.replace(
+            opening, opening + f"\n<!--  correction-id: {correction_id} -->"),
+    }
+    for label, tampered in tampered_variants.items():
+        rollback.write_text(tampered)
+        tampered_code, tampered_result = cli(
+            "explanation", "commit", "--question-id", root_id, "--draft", rollback,
+            "--evidence", rollback_evidence, "--teaching-review", rollback_review,
+            "--profile", "linear_transform", "--preparation-id", rollback_prepare["result"]["preparation_id"],
+            "--workspace", config, "--json")
+        assert tampered_code == 3, label
+        assert tampered_result["validation"]["confirmed_corrections"] == "conflict", label
+
+    rollback.write_text(canonical_update + "\n\n矩阵行是基向量的像。\n")
+    code, rejected = cli("explanation", "commit", "--question-id", root_id, "--draft", rollback,
+                         "--evidence", rollback_evidence, "--teaching-review", rollback_review,
+                         "--profile", "linear_transform", "--preparation-id", rollback_prepare["result"]["preparation_id"],
+                         "--workspace", config, "--json")
+    assert code == 3 and rejected["status"] == "awaiting_user"
+    assert rejected["validation"]["confirmed_corrections"] == "conflict"
+    assert any("reintroduce original claim" in item for item in rejected["diagnostics"])
+
+    code, restored = cli("explanation", "restore", "--question-id", root_id,
+                         "--revision", first["result"]["explanation"]["revision"],
+                         "--workspace", config, "--json")
+
+    assert code == 0
+    restored_explanation = restored["result"]["explanation"]
+    assert restored_explanation["revision_kind"] == "restore"
+    assert restored_explanation["restored_from_revision"] == 1
+    restored_text = Path(restored_explanation["document_path"]).read_text()
+    assert restored_text.count(f"<!-- correction-id: {correction_id} -->") == 1
+    assert "纠正说法：“矩阵行是基向量的像”不成立；矩阵列才是基向量的像" in restored_text
+    assert "适用边界：在线性映射采用列向量坐标约定时" in restored_text
+    assert restored_explanation["confirmed_corrections"][0]["original_claim"] == "矩阵行是基向量的像"
+    _, shown = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+    assert shown["result"]["thread"]["current_question_id"] == current_question_id
+
+
+def test_refactor_conflict_and_pre_publish_failure_keep_the_formal_revision_complete(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    _, question_id = create_root(tmp_path, config, source, "根问题")
+    _, prepared = cli("explanation", "prepare", "--question-id", question_id,
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    draft, evidence, review = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    code, initial = cli("explanation", "commit", "--question-id", question_id, "--draft", draft,
+                        "--evidence", evidence, "--teaching-review", review, "--profile", "linear_transform",
+                        "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
+    assert code == 0
+    _, update = cli("explanation", "prepare", "--question-id", question_id,
+                    "--profile", "linear_transform", "--workspace", config, "--json")
+    revised, revised_evidence, revised_review = _linear_inputs(tmp_path, source, update["result"]["required_marker"])
+    code, conflict = cli("explanation", "commit", "--question-id", question_id, "--draft", revised,
+                         "--evidence", revised_evidence, "--teaching-review", revised_review,
+                         "--profile", "linear_transform", "--preparation-id", update["result"]["preparation_id"],
+                         "--expected-revision", 0, "--workspace", config, "--json")
+    assert code == 3 and conflict["status"] == "awaiting_user"
+    assert Path(conflict["result"]["candidate"]).is_file()
+    candidate_path = Path(conflict["result"]["candidate"])
+    candidate = json.loads(candidate_path.read_text())
+    assert candidate["proposal"]["draft_object"]["sha256"]
+    assert candidate["proposal"]["evidence_refs"] == json.loads(revised_evidence.read_text())
+    assert candidate["proposal"]["profile"] == "linear_transform"
+    revised.unlink(); revised_evidence.unlink(); revised_review.unlink()
+
+    code, replayed = cli("explanation", "replay", "--candidate", candidate_path,
+                         "--workspace", config, "--json")
+    assert code == 0
+    assert replayed["result"]["candidate_replayed"] == str(candidate_path)
+    _, replay_location = cli("learning", "locate", question_id, "--workspace", config, "--json")
+    assert replay_location["result"]["locations"][0]["explanation_revision"] == 2
+    code, repeated = cli("explanation", "replay", "--candidate", candidate_path,
+                         "--workspace", config, "--json")
+    assert code == 3 and repeated["validation"]["candidate_cas"] == "conflict"
+    _, unchanged = cli("learning", "locate", question_id, "--workspace", config, "--json")
+    assert unchanged["result"]["locations"][0]["explanation_revision"] == 2
+
+    assert initial["result"]["explanation"]["revision"] == 1
