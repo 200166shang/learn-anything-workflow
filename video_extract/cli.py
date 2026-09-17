@@ -19,7 +19,7 @@ from . import media_workflow
 from .orchestrator import existing_capabilities
 from .playlists import build_playback_views, build_xiaoe_playback_views, verify_playback
 from .validate import validate, validate_goals, validate_media_request
-from .workspace import PORTABLE_SCHEMA_VERSION, discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
+from .workspace import PORTABLE_SCHEMA_VERSION, WorkspaceError, discover_workspace, doctor as workspace_doctor, prepare_migration, rebuild as workspace_rebuild
 
 PROJECT = Path(__file__).resolve().parent.parent
 
@@ -94,15 +94,50 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
+    if args.request:
+        from .command_response import exit_code, response
+        from .media_operations import plan_request
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = plan_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json); return exit_code(result)
     result = media_workflow.plan(args.source, normalize_media_request(args.media, args.language, args.quality), args.output)
     emit(result, args.json); return 0 if not result.get("blockers") else 1
 
 
 def cmd_ensure(args: argparse.Namespace) -> int:
+    if args.request:
+        from .command_response import exit_code, response
+        from .media_operations import ensure_request
+        try:
+            request = json.loads(args.request.read_text(encoding="utf-8"))
+            result = ensure_request(request)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, WorkspaceError) as exc:
+            workspace = request.get("workspace") if isinstance(locals().get("request"), dict) else None
+            result = response(status="missing_input", workspace=workspace,
+                              validation={"media-acquire-request-v1": "failed"}, diagnostics=[str(exc)])
+        emit(result, args.json); return exit_code(result)
     workspace = discover_workspace(args.workspace)
     result = media_workflow.ensure(args.source, normalize_media_request(args.media, args.language, args.quality), args.output, workspace.media)
     emit(result, args.json)
     return 0 if result.get("status") == "complete" else 1
+
+
+def cmd_operation(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
+    from .media_operations import reconcile_operation, resume_operation, show_operation
+    workspace = discover_workspace(args.workspace)
+    if args.operation_action == "show":
+        result = show_operation(workspace, args.operation_id)
+    elif args.operation_action == "resume":
+        result = resume_operation(workspace, args.operation_id)
+    else:
+        result = reconcile_operation(workspace, args.operation_id)
+    emit(result, args.json); return exit_code(result)
 
 
 def cmd_source(args: argparse.Namespace) -> int:
@@ -496,8 +531,12 @@ def parser() -> argparse.ArgumentParser:
         p.add_argument("--quality", choices=("standard", "balanced", "high"), default="high")
         p.add_argument("--workspace", type=Path)
         p.add_argument("--json", action="store_true")
-    planning = commands.add_parser("plan", help="read-only media extraction plan"); planning.add_argument("source"); planning.add_argument("--output", type=Path, help="existing package whose validated artifacts may be reused"); media_arguments(planning); planning.set_defaults(func=cmd_plan)
-    ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
+    planning = commands.add_parser("plan", help="read-only media extraction plan"); planning.add_argument("source", nargs="?"); planning.add_argument("--request", type=Path, help="versioned scoped media request JSON"); planning.add_argument("--output", type=Path, help="existing package whose validated artifacts may be reused"); media_arguments(planning); planning.set_defaults(func=cmd_plan)
+    ensuring = commands.add_parser("ensure", help="materialize requested media into a managed package"); ensuring.add_argument("source", nargs="?"); ensuring.add_argument("--request", type=Path, help="versioned scoped media request JSON"); ensuring.add_argument("--output", type=Path); media_arguments(ensuring); ensuring.set_defaults(func=cmd_ensure)
+    operation = commands.add_parser("operation", help="inspect or resume a persistent operation")
+    operation_actions = operation.add_subparsers(dest="operation_action", required=True)
+    for action in ("show", "resume", "reconcile"):
+        p = operation_actions.add_parser(action); p.add_argument("operation_id"); p.add_argument("--workspace", type=Path, required=True); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_operation)
     source = commands.add_parser("source", help="import local source material into a managed package")
     source_actions = source.add_subparsers(dest="source_action", required=True)
     source_import = source_actions.add_parser("import"); source_import.add_argument("input", type=Path); source_import.add_argument("--package", type=Path); source_import.add_argument("--title"); source_import.add_argument("--source-id"); source_import.add_argument("--expected-revision", type=int); source_import.add_argument("--workspace", type=Path); source_import.add_argument("--json", action="store_true"); source_import.set_defaults(func=cmd_source)

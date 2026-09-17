@@ -51,14 +51,17 @@ def test_list_declares_only_real_capability_contracts() -> None:
     assert code == 0
     assert result["api_version"] == 1
     assert result["status"] == "completed"
-    assert [item["id"] for item in result["result"]["capabilities"]] == ["source.notes"]
-    declared = result["result"]["capabilities"][0]
+    assert [item["id"] for item in result["result"]["capabilities"]] == ["media.acquire", "source.notes"]
+    declared = next(item for item in result["result"]["capabilities"] if item["id"] == "source.notes")
     assert declared["contract_version"] == 1
     assert declared["input_type"] == "source-notes-request-v1"
     assert declared["output_type"] == "command-response-v1"
     assert declared["side_effect"] == "workspace_write"
     assert declared["authorization_category"] == "local_workspace"
     assert declared["recovery_query"] == "capability run source.notes with the same request"
+    media = next(item for item in result["result"]["capabilities"] if item["id"] == "media.acquire")
+    assert media["input_type"] == "media-acquire-request-v1"
+    assert media["output_type"] == "command-response-v1"
     assert declared["implementation"] == "video_extract.capabilities:run_source_notes"
 
 

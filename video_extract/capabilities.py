@@ -46,6 +46,18 @@ CAPABILITIES: dict[str, Capability] = {
         authorization_category="local_workspace",
         recovery_query="capability run source.notes with the same request",
     ),
+    "media.acquire": Capability(
+        id="media.acquire",
+        contract_version=1,
+        implementation_version=1,
+        implementation="video_extract.media_operations:run_media_acquire",
+        input_type="media-acquire-request-v1",
+        output_type="command-response-v1",
+        side_effect="authorized_remote_read_and_workspace_write",
+        dependencies=("command:ffmpeg", "command:ffprobe"),
+        authorization_category="user_authorized_media_source",
+        recovery_query="operation show/resume with the returned operation_id",
+    ),
 }
 
 
@@ -88,8 +100,6 @@ def _dependency_available(dependency: str) -> bool:
 
 
 def _contract_compatible(entry: Capability, implementation: Callable[..., Any] | None) -> bool:
-    if entry.input_type != "source-notes-request-v1" or entry.output_type != "command-response-v1":
-        return False
     if implementation is None:
         return False
     declared = getattr(implementation, "__capability_contract__", None)
@@ -266,6 +276,10 @@ def run_capability(capability_id: str, request_path: Path) -> dict[str, Any]:
                         validation={"contract_version": "passed", "output_type": "failed"},
                         provenance=provenance, diagnostics=["capability implementation returned a non-mapping result"],
                         next_action={"type": "maintenance", "maintenance_path": str(Path(__file__).resolve())})
+    if raw.get("api_version") == 1 and raw.get("operation_id") == operation_id:
+        # Implementations of command-response-v1 may provide the complete
+        # public envelope (including durable progress and artifact references).
+        return dict(raw)
     status_map = {"complete": "completed", "ready": "completed", "awaiting_ai": "awaiting_model",
                   "needs_input": "missing_input", "failed": "failed"}
     status = status_map.get(raw.get("status"), raw.get("status"))
