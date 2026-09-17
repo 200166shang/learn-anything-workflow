@@ -280,7 +280,8 @@ def backup_entries(config: WorkspaceConfig) -> dict[str, Any]:
                         *[str(objects / digest[:2] / digest) for digest in sorted(snapshot["objects"])]]}
 
 
-def _source_context(config: WorkspaceConfig, source_refs: list[dict[str, str]]) -> tuple[list[dict[str, Any]], list[str]]:
+def _source_context(config: WorkspaceConfig, source_refs: list[dict[str, str]], *,
+                    trusted_historical: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
     context: list[dict[str, Any]] = []; errors: list[str] = []
     for ref in source_refs:
         try:
@@ -292,10 +293,17 @@ def _source_context(config: WorkspaceConfig, source_refs: list[dict[str, str]]) 
         item = {**ref, "kind": checked["result"]["kind"], "title": checked["result"]["title"],
                 "content": checked["result"].get("content"), "location": checked["result"].get("location"),
                 "availability": checked["result"].get("availability"),
+                "version_state": checked["result"].get("version_state", "unknown"),
+                "current_version": checked["result"].get("current_version"),
+                "entries": checked["result"].get("entries", []),
+                "provenance": checked["result"].get("provenance"),
+                "provenance_status": checked["result"].get("provenance_status", "unknown"),
                 "version_basis": checked["result"]["version_basis"]}
         context.append(item)
-        if item["availability"] not in {"available_from_results", "available_at_location"}:
+        if not trusted_historical and item["availability"] not in {"available_from_results", "available_at_location"}:
             errors.append(f'{ref["source_id"]}@{ref["source_version"]}: {item["availability"]}')
+        elif not trusted_historical and item["version_state"] != "current":
+            errors.append(f'{ref["source_id"]}@{ref["source_version"]}: historical; current is {item["current_version"]}')
     return context, errors
 
 
@@ -349,7 +357,19 @@ def show_module(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
     if module is None:
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=[f"unknown module_id: {module_id}"])
+    source_checks = []
+    for ref in module["source_refs"]:
+        checked = verify_source(config, ref["source_id"], ref["source_version"])
+        value = checked.get("result") or {}
+        availability = value.get("availability", "missing")
+        status = value.get("change_check", "unknown")
+        if availability not in {"available_from_results", "available_at_location"}:
+            status = availability
+        source_checks.append({**ref, "status": status,
+                              "current_version": value.get("current_version"),
+                              "availability": availability})
     return response(status="completed", workspace=str(config.config_path), result={"module": module,
+                    "source_checks": source_checks,
                     "learning_schema_version": 2, "revision": snapshot["revision"],
                     "commit_id": snapshot["commit_id"]}, validation={"learning_record": "passed"})
 
@@ -623,6 +643,52 @@ def back(config: WorkspaceConfig, thread_id: str, expected_revision: int | None 
         published = _publish(config, snapshot, updated)
     return response(status="completed", workspace=str(config.config_path), result={"thread": returned_thread,
                     "returned_to": frame, "revision": published["revision"], "commit_id": published["commit_id"]})
+def _parse_code_locator(locator: dict[str, Any]) -> tuple[str, str, str]:
+    value = str(locator.get("value", ""))
+    kind = locator.get("kind")
+    if kind == "symbol" and "::" in value:
+        path, symbol = value.split("::", 1)
+        if path and symbol:
+            return path, "symbol", symbol
+    if kind == "line_range" and ":" in value:
+        path, lines = value.rsplit(":", 1)
+        if path and re.fullmatch(r"[1-9][0-9]*-[1-9][0-9]*", lines):
+            start, end = map(int, lines.split("-", 1))
+            if start <= end:
+                return path, "line_range", lines
+    raise ValueError("current_code locator must be file::symbol or file:start-end with matching locator kind")
+
+
+def _evidence_source_checks(config: WorkspaceConfig, evidence_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    for evidence in evidence_refs:
+        checked = verify_source(config, evidence["source_id"], evidence["source_version"])
+        value = checked.get("result") or {}
+        availability = value.get("availability", "missing")
+        check_status = value.get("change_check", "unknown") if checked.get("status") == "completed" else "missing"
+        if availability not in {"available_from_results", "available_at_location"}:
+            check_status = availability
+        if evidence["claim_type"] == "current_code" and value.get("version_state") == "historical":
+            try:
+                path, _, _ = _parse_code_locator(evidence.get("locator") or {})
+            except ValueError:
+                check_status = "needs_review"
+            else:
+                current = verify_source(config, evidence["source_id"], value["current_version"])
+                current_value = current.get("result") or {}
+                current_entries = {entry["path"]: entry["sha256"] for entry in current_value.get("entries", [])}
+                expected_digest = (evidence.get("locator") or {}).get("content_sha256")
+                if (current.get("status") == "completed"
+                        and current_value.get("availability") == "available_at_location"
+                        and expected_digest and current_entries.get(path) == expected_digest):
+                    check_status = "current"
+                else:
+                    check_status = "needs_review" if current.get("status") == "completed" else "missing"
+        checks.append({"source_id": evidence["source_id"], "source_version": evidence["source_version"],
+                       "claim_type": evidence["claim_type"], "locator": evidence["locator"],
+                       "status": check_status, "availability": availability,
+                       "current_version": value.get("current_version")})
+    return checks
 
 
 def locate(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
@@ -635,8 +701,17 @@ def locate(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
             next_action={"type": "model", "action": "prepare_explanation"})
     locations = [{**ref, "document_path": str(config.results / ref["logical_path"])}
                  for ref in question["explanation_refs"]]
+    evidence_refs: list[dict[str, Any]] = []
+    for ref in question["explanation_refs"]:
+        explanation = snapshot["record"]["explanations"][ref["explanation_id"]]
+        revision = explanation["revisions"][str(ref["explanation_revision"])]
+        evidence_refs.extend(revision["evidence_refs"])
+    source_checks = _evidence_source_checks(config, evidence_refs)
+    explanation_state = ("needs_review" if any(item["status"] != "current" for item in source_checks)
+                         else "available")
     return response(status="completed", workspace=str(config.config_path), result={
-        "question": question, "explanation_state": "available", "locations": locations})
+        "question": question, "explanation_state": explanation_state, "locations": locations,
+        "source_checks": source_checks})
 
 
 PROFILES = {
@@ -654,7 +729,36 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str)
     if question is None:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
     thread = record["threads"][question["thread_id"]]; module = record["modules"][thread["module_id"]]
-    context, errors = _source_context(config, module["source_refs"])
+    trusted_evidence_refs: list[dict[str, Any]] | None = None
+    if question["explanation_refs"]:
+        evidence_refs: list[dict[str, Any]] = []
+        for ref in question["explanation_refs"]:
+            explanation = record["explanations"][ref["explanation_id"]]
+            evidence_refs.extend(explanation["revisions"][str(ref["explanation_revision"])]["evidence_refs"])
+        source_checks = _evidence_source_checks(config, evidence_refs)
+        if any(item["status"] != "current" for item in source_checks):
+            return response(status="awaiting_user", workspace=str(config.config_path), result={
+                "question": question, "explanation_state": "needs_review", "source_checks": source_checks,
+                "locations": [{**ref, "document_path": str(config.results / ref["logical_path"])}
+                              for ref in question["explanation_refs"]]},
+                validation={"learning_record": "passed", "sources": "needs_review"},
+                diagnostics=["the existing explanation has evidence that is missing, version-mismatched, or changed"],
+                next_action={"type": "user", "reason": "review only the affected evidence before revising the explanation"})
+        trusted_evidence_refs = evidence_refs
+    if trusted_evidence_refs is None:
+        context_refs = module["source_refs"]
+        context, errors = _source_context(config, context_refs)
+    else:
+        roles = {(ref["source_id"], ref["source_version"]): ref["role"] for ref in module["source_refs"]}
+        seen: set[tuple[str, str]] = set()
+        context_refs = []
+        for evidence in trusted_evidence_refs:
+            identity = (evidence["source_id"], evidence["source_version"])
+            if identity not in seen:
+                seen.add(identity)
+                context_refs.append({"source_id": identity[0], "source_version": identity[1],
+                                     "role": roles[identity]})
+        context, errors = _source_context(config, context_refs, trusted_historical=True)
     if errors:
         return _sources_blocked(config, question, context, errors)
     section_id = "section-" + str(uuid.uuid4()); preparation_id = "preparation-" + str(uuid.uuid4())
@@ -753,6 +857,21 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
             expected_type = allowed_refs[identity]
             if item["claim_type"] not in {expected_type, "inference"}:
                 evidence_errors.append(f"claim_type {item['claim_type']} does not match confirmed source role {expected_type}")
+            if item["claim_type"] == "current_code":
+                locator = item.get("locator") or {}
+                content_digest = locator.get("content_sha256")
+                try:
+                    path, _, _ = _parse_code_locator(locator)
+                except ValueError as exc:
+                    evidence_errors.append(str(exc)); continue
+                source_context = next((candidate for candidate in context
+                                       if (candidate["source_id"], candidate["source_version"]) == identity), None)
+                entry_digests = {entry["path"]: entry["sha256"]
+                                 for entry in (source_context or {}).get("entries", [])}
+                if not content_digest:
+                    evidence_errors.append("current_code locator requires content_sha256 with a file::symbol or line-range locator")
+                elif path not in entry_digests or entry_digests[path] != content_digest:
+                    evidence_errors.append("current_code locator content_sha256 does not match the pinned source file")
         if evidence_errors:
             return response(status="failed", workspace=str(config.config_path),
                             validation={"source_scope": "failed"}, diagnostics=evidence_errors)

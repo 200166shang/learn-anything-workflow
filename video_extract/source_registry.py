@@ -94,15 +94,61 @@ def _directory_manifest(root: Path) -> tuple[str, list[dict[str, Any]]]:
 
 
 def _git_basis(path: Path) -> dict[str, Any]:
-    def run(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
-    top = run("rev-parse", "--show-toplevel")
+    def run(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    top = run(path, "rev-parse", "--show-toplevel")
     if top.returncode:
         return {"git_commit": None, "working_tree_dirty": None}
-    commit = run("rev-parse", "HEAD")
-    dirty = run("status", "--porcelain", "--untracked-files=all")
+    repository = Path(top.stdout.strip()).resolve()
+    registered_root = path.resolve()
+    try:
+        scope = registered_root.relative_to(repository)
+    except ValueError:
+        return {"git_commit": None, "working_tree_dirty": None}
+    scope_pathspec = scope.as_posix() or "."
+    commit = run(repository, "rev-parse", "HEAD")
+    dirty = subprocess.run(
+        ["git", "--literal-pathspecs", "-C", str(repository), "status", "--porcelain=v1", "-z",
+         "--untracked-files=all", "--", scope_pathspec], capture_output=True, text=True)
+    dirty_files = {"modified": [], "added": [], "deleted": []}
+    if dirty.returncode == 0:
+        records = dirty.stdout.split("\0"); index = 0
+
+        def scoped(value: str) -> str | None:
+            candidate = Path(value)
+            try:
+                relative = candidate.relative_to(scope) if scope.parts else candidate
+            except ValueError:
+                return None
+            normalized = relative.as_posix()
+            if not normalized or normalized == "." or normalized == ".." or normalized.startswith("../"):
+                return None
+            return normalized
+
+        while index < len(records) and records[index]:
+            record = records[index]; index += 1
+            state, destination = record[:2], record[3:]
+            if "R" in state or "C" in state:
+                source = records[index] if index < len(records) else ""; index += 1
+                old_path, new_path = scoped(source), scoped(destination)
+                if "R" in state and old_path:
+                    dirty_files["deleted"].append(old_path)
+                if new_path:
+                    dirty_files["added"].append(new_path)
+            else:
+                relative = scoped(destination)
+                if relative is None:
+                    continue
+                if state == "??" or "A" in state:
+                    dirty_files["added"].append(relative)
+                elif "D" in state:
+                    dirty_files["deleted"].append(relative)
+                else:
+                    dirty_files["modified"].append(relative)
+        dirty_files = {key: sorted(values) for key, values in dirty_files.items()}
     return {"git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
-            "working_tree_dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None}
+            "working_tree_dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None,
+            "dirty_files": dirty_files if dirty.returncode == 0 else None}
 
 
 def _require_v2(config: WorkspaceConfig) -> None:
@@ -300,7 +346,8 @@ def _capture(path: Path) -> tuple[str, str, bytes | None, dict[str, Any], list[d
 
 
 def register(config: WorkspaceConfig, path: Path, title: str | None = None,
-             expected_revision: int | None = None, explicit_source_id: str | None = None) -> dict[str, Any]:
+             expected_revision: int | None = None, explicit_source_id: str | None = None,
+             provenance: dict[str, Any] | None = None) -> dict[str, Any]:
     _require_v2(config)
     path = path.expanduser().resolve()
     kind, digest, body, basis, entries = _capture(path)
@@ -332,6 +379,8 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
             proposed = {"source_version": source_version, "content_sha256": digest, "kind": kind,
                         "captured_at": _now(), "version_basis": basis, "entries": entries,
                         "storage": "object" if body is not None else "reference"}
+            if provenance is not None:
+                proposed["provenance"] = provenance
             if expected_revision is not None and expected_revision != snapshot["revision"]:
                 if body is not None:
                     object_digest, _ = _write_object(config, body)
@@ -348,6 +397,8 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
                                 next_action={"type": "user", "reason": "resolve source revision conflict"})
             versions = dict(current.get("versions", {})) if current else {}
             if source_version in versions:
+                if provenance is not None and versions[source_version].get("provenance") != provenance:
+                    raise ValueError("registered source version provenance is immutable")
                 if current["current_version"] == source_version:
                     locations[source_id] = str(path); _save_locations(config, locations)
                     return _result(config, snapshot, source_id, versions[source_version], path, "reused")
@@ -393,6 +444,9 @@ def register(config: WorkspaceConfig, path: Path, title: str | None = None,
                                 f" --source-id {shlex.quote(source_id)}")
             if title is not None:
                 recovery_command += f" --title {shlex.quote(title)}"
+            if provenance is not None:
+                provenance_request = _candidate(config, provenance)
+                recovery_command += f" --provenance {shlex.quote(str(provenance_request))}"
             recovery_command += (f"{revision_argument} --workspace "
                                 f"{shlex.quote(str(config.config_path))} --json")
             recovery_type = "retry"
@@ -490,13 +544,14 @@ def verify(config: WorkspaceConfig, source_id: str, source_version: str | None =
     location = locations.get(source_id)
     availability = "missing"
     content: str | None = None
+    observed_version_basis: dict[str, Any] | None = None
     if version.get("object_sha256"):
         objects, _, _, _ = _store_roots(config)
         body = _safe_path(objects.parent, "objects", version["object_sha256"][:2], version["object_sha256"]).read_bytes()
         content = body.decode("utf-8")
         availability = "available_from_results"
     elif location and Path(location).exists():
-        _, current_digest, _, _, _ = _capture(Path(location))
+        _, current_digest, _, observed_version_basis, _ = _capture(Path(location))
         availability = "available_at_location" if current_digest == version["content_sha256"] else "version_mismatch"
     result = {"source_id": source_id, "source_version": version_id, "kind": package["kind"],
               "title": package["title"], "revision": snapshot["revision"],
@@ -504,7 +559,27 @@ def verify(config: WorkspaceConfig, source_id: str, source_version: str | None =
               "availability": availability, "content": content,
               "package_schema_version": PACKAGE_SCHEMA_VERSION,
               "snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
-              "version_basis": version["version_basis"], "storage": version["storage"]}
+              "version_basis": version["version_basis"], "storage": version["storage"],
+              "entries": version.get("entries", []), "observed_version_basis": observed_version_basis}
+    result["current_version"] = package["current_version"]
+    result["version_state"] = "current" if version_id == package["current_version"] else "historical"
+    result["change_check"] = "current" if result["version_state"] == "current" else "needs_review"
+    if result["version_state"] == "historical":
+        current_version = package["versions"][package["current_version"]]
+        before = {entry["path"]: entry["sha256"] for entry in version.get("entries", [])}
+        after = {entry["path"]: entry["sha256"] for entry in current_version.get("entries", [])}
+        if package["kind"] == "code":
+            result["change_summary"] = {
+                "added": sorted(after.keys() - before.keys()),
+                "modified": sorted(path for path in before.keys() & after.keys() if before[path] != after[path]),
+                "removed": sorted(before.keys() - after.keys()),
+            }
+        else:
+            result["change_summary"] = {"added": [], "modified": ["<document>"], "removed": []}
+    else:
+        result["change_summary"] = {"added": [], "modified": [], "removed": []}
+    result["provenance"] = version.get("provenance")
+    result["provenance_status"] = "recorded" if version.get("provenance") else "unknown"
     return response(status="completed", workspace=str(config.config_path),
                     operation_id=_operation("source.verify", config, source_id, version_id), result=result,
                     validation={"package": "passed", "snapshot": "passed", "objects": "passed"},
