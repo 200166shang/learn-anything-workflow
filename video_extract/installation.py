@@ -14,9 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .command_response import response
+
 
 PROJECT = Path(__file__).resolve().parent.parent
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
+API_VERSION = 1
+RECEIPT_PARTS = ("video-extract", "install-receipt.json")
 
 
 @dataclass(frozen=True)
@@ -63,9 +67,18 @@ def _revision() -> str:
 
 def source_info() -> dict[str, Any]:
     digest = hashlib.sha256()
-    for entry in ENTRIES:
-        digest.update(entry.id.encode())
-        digest.update(_digest(entry.source).encode())
+    roots = [PROJECT / "pyproject.toml", PROJECT / "video_extract", PROJECT / "schemas",
+             PROJECT / "integrations/skills", PROJECT / ".codex/agents"]
+    files = sorted({item for root in roots for item in _files(root)
+                    if "__pycache__" not in item.parts and item.suffix != ".pyc"})
+    fingerprinted_paths = []
+    for item in files:
+        relative = str(item.relative_to(PROJECT))
+        fingerprinted_paths.append(relative)
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(item.read_bytes())
+        digest.update(b"\0")
     status = subprocess.run(
         ["git", "-C", str(PROJECT), "status", "--porcelain"], capture_output=True, text=True
     )
@@ -74,6 +87,7 @@ def source_info() -> dict[str, Any]:
         "revision": _revision(),
         "dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
         "content_fingerprint": digest.hexdigest(),
+        "fingerprinted_paths": fingerprinted_paths,
         "contract_version": CONTRACT_VERSION,
     }
 
@@ -122,7 +136,7 @@ def _tool() -> dict[str, Any]:
     }
 
 
-def inspect(agents_root: Path, codex_root: Path) -> dict[str, Any]:
+def _inspect_details(agents_root: Path, codex_root: Path) -> tuple[str, dict[str, Any], list[str]]:
     entries = []
     for entry in ENTRIES:
         target = entry.target(agents_root, codex_root)
@@ -140,35 +154,84 @@ def inspect(agents_root: Path, codex_root: Path) -> dict[str, Any]:
     entries_ok = all(item["state"] == "linked" for item in entries)
     dependencies_ok = all(dependencies.values())
     tool_ok = tool["matches_source"]
-    ok = entries_ok and dependencies_ok and tool_ok
+    receipt_path = codex_root.joinpath(*RECEIPT_PARTS)
+    receipt = None
+    if receipt_path.is_file():
+        try:
+            recorded = json.loads(receipt_path.read_text(encoding="utf-8"))
+            recorded_source = recorded.get("source", {})
+            current_source = source_info()
+            if recorded_source.get("contract_version") != CONTRACT_VERSION:
+                state = "contract_drift"
+            elif recorded_source.get("revision") != current_source["revision"]:
+                state = "revision_drift"
+            elif recorded_source.get("content_fingerprint") != current_source["content_fingerprint"]:
+                state = "source_drift"
+            else:
+                state = "matched"
+            receipt = {"path": str(receipt_path), "state": state, "recorded_source": recorded_source}
+        except (OSError, json.JSONDecodeError):
+            receipt = {"path": str(receipt_path), "state": "invalid"}
+    else:
+        receipt = {"path": str(receipt_path), "state": "missing"}
+    receipt_ok = receipt["state"] == "matched"
+    ok = entries_ok and dependencies_ok and tool_ok and receipt_ok
     status = "completed"
     diagnostics = []
     if not entries_ok or not tool_ok:
-        status = "installation_drift"
-        diagnostics.append("installed entries or the video-extract executable do not match the maintenance source")
+        status = "recoverable_failure"
+        diagnostics.append("source_or_install_drift: installed entries or the video-extract executable do not match the maintenance source")
+    elif not receipt_ok:
+        status = "recoverable_failure"
+        diagnostics.append(f"source_or_install_drift: install receipt is {receipt['state']}")
     elif not dependencies_ok:
         status = "missing_dependency"
         diagnostics.append("one or more required deterministic dependencies are unavailable")
-    return {
+    details = {
         "ok": ok,
-        "status": status,
         "source": source_info(),
         "tool": tool,
         "dependencies": dependencies,
         "entries": entries,
-        "diagnostics": diagnostics,
+        "receipt": receipt,
+        "validation": {"entries": entries_ok, "dependencies": dependencies_ok, "tool": tool_ok, "receipt": receipt_ok},
     }
+    return status, details, diagnostics
+
+
+def _wrap(status: str, details: dict[str, Any], diagnostics: list[str], *, operation_id: str | None = None,
+          next_command: str | None = None) -> dict[str, Any]:
+    next_action = None
+    if next_command:
+        next_action = {"command": next_command, "maintenance_path": str(PROJECT / "video_extract/installation.py")}
+    return response(status=status, operation_id=operation_id, result=details,
+                    validation=details.get("validation", {}),
+                    provenance={"engineering_source": str(PROJECT),
+                                "contract_version": CONTRACT_VERSION},
+                    next_action=next_action, diagnostics=diagnostics,
+                    artifact_refs=[details["backup"]] if details.get("backup") else [])
+
+
+def _install_operation_id(agents_root: Path, codex_root: Path) -> str:
+    payload = json.dumps({"agents_root": str(agents_root.expanduser().resolve()),
+                          "codex_root": str(codex_root.expanduser().resolve()),
+                          "contract_version": CONTRACT_VERSION}, sort_keys=True)
+    return "install-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
+def inspect(agents_root: Path, codex_root: Path) -> dict[str, Any]:
+    status, details, diagnostics = _inspect_details(agents_root, codex_root)
+    return _wrap(status, details, diagnostics,
+                 next_command=None if status == "completed" else "video-extract install plan --json")
 
 
 def plan(agents_root: Path, codex_root: Path) -> dict[str, Any]:
-    result = inspect(agents_root, codex_root)
-    result["ok"] = True
-    result["status"] = "completed"
-    result["changes"] = [
+    _, details, diagnostics = _inspect_details(agents_root, codex_root)
+    details["changes"] = [
         {"id": item["id"], "action": "keep" if item["state"] == "linked" else "link", "target": item["target"]}
-        for item in result["entries"]
+        for item in details["entries"]
     ]
-    return result
+    return _wrap("completed", details, diagnostics, next_command="video-extract install apply --json")
 
 
 def apply(agents_root: Path, codex_root: Path, backup_root: Path | None = None) -> dict[str, Any]:
@@ -194,6 +257,9 @@ def apply(agents_root: Path, codex_root: Path, backup_root: Path | None = None) 
             changed.append((target, destination))
             target.parent.mkdir(parents=True, exist_ok=True)
             target.symlink_to(entry.source, target_is_directory=entry.source.is_dir())
+        from .manifest import atomic_write_json
+        receipt = codex_root.joinpath(*RECEIPT_PARTS)
+        atomic_write_json(receipt, {"api_version": API_VERSION, "source": source_info(), "entries": [entry.id for entry in ENTRIES]})
     except Exception as exc:
         rollback_errors = []
         for target, destination in reversed(changed):
@@ -205,15 +271,13 @@ def apply(agents_root: Path, codex_root: Path, backup_root: Path | None = None) 
                     os.replace(destination, target)
             except OSError as rollback_exc:
                 rollback_errors.append(f"rollback failed for {target}: {rollback_exc}")
-        result = inspect(agents_root, codex_root)
-        result.update({
-            "ok": False,
-            "status": "recoverable_failure",
-            "backup": str(backup),
-            "backed_up": backed_up,
-            "diagnostics": [str(exc), *rollback_errors],
-        })
-        return result
-    result = inspect(agents_root, codex_root)
-    result.update({"backup": str(backup), "backed_up": backed_up})
-    return result
+        _, details, _ = _inspect_details(agents_root, codex_root)
+        details.update({"ok": False, "backup": str(backup), "backed_up": backed_up})
+        return _wrap("recoverable_failure", details, [str(exc), *rollback_errors],
+                     operation_id=_install_operation_id(agents_root, codex_root),
+                     next_command="video-extract install plan --json")
+    status, details, diagnostics = _inspect_details(agents_root, codex_root)
+    details.update({"backup": str(backup), "backed_up": backed_up})
+    return _wrap(status, details, diagnostics,
+                 operation_id=_install_operation_id(agents_root, codex_root),
+                 next_command=None if status == "completed" else "video-extract install plan --json")

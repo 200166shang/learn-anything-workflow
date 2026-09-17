@@ -71,4 +71,18 @@ video-extract install check --json
 
 `integrations/skills/`、`.codex/agents/` 和 Python 工具都只在本工程维护。`install apply` 在链接宿主入口前备份已有副本；`install check` 报告源码修订、内容指纹、依赖、安装漂移和确切维护位置。不要直接修改链接目标之外的安装副本。
 
+稳定能力入口由工程内唯一映射维护，调用方只保存能力 ID 和公开契约版本：
+
+~~~text
+video-extract capability list --json
+video-extract capability check source.notes --json
+video-extract capability run source.notes --request request.json --json
+~~~
+
+`source.notes` 的请求使用 `contract_version: 1`，包含 `action`（`prepare` 或 `finalize`）、`workspace`、`package` 和可选的 `source_version`。能力声明同时记录 `implementation_version` 及 `ffmpeg`、`ffprobe`、Pillow、faster-whisper 依赖。实现函数通过无副作用的 `__capability_contract__` 元数据声明 adapter I/O；check 同时验证注册声明、callable 形状、该元数据和类型注解。runner 传入普通 dict，因此输入注解必须能接受 dict（dict 或相应 Mapping 协议），不能要求某个更具体的 dict 子类；输出可使用 dict、Mapping 子类或 TypedDict。明确的非 mapping 类型拒绝，无注解则由协议声明并在 run 时强制验证真实返回。响应采用 `api_version: 1`；`completed` 退出 0，可继续但未完成的状态退出 3，contract 不兼容和其他失败退出非零。实现移动时只修改 `video_extract.capabilities:CAPABILITIES`；兼容移动不改变同一逻辑请求的 operation ID，行为版本只作为 provenance 和诊断事实。入口、I/O contract、依赖或版本不匹配会返回确切维护位置，不会猜测替代工具。
+
+`install apply` 在 Codex 安装根原子写入 `video-extract/install-receipt.json`，记录工程 revision、CLI/capability/schema/集成源码指纹和安装契约版本；收据提交失败会回滚本次新链接并恢复已备份手改。`install check` 将源码、revision、链接、依赖或收据漂移报告为 `recoverable_failure`。`install` 与 `workspace doctor` 都返回统一 command-response-v1 envelope；后者同时汇总能力和安装诊断，并可用 `--agents-root`、`--codex-root` 指向临时根完成隔离检查。
+
+新建 workspace 时必须把 `workspace.example.toml` 中的占位值替换为一次生成、之后不随改名、搬迁或路径映射变化而修改的 `workspace_id`。旧配置仍可被旧的内部工作流读取，但稳定公共 `workspace doctor` 和 capability 执行会返回 `missing_input`，提示先在配置中补入持久逻辑 ID；工具不会擅自修改真实 workspace。
+
 移动工作区后更新 locator，并重新执行 editable 安装、`install check` 与 `workspace doctor`。不要在 skill 或 agent 中写入项目、Media、资料库或 Python 环境的机器路径。

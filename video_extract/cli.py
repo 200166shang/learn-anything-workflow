@@ -120,6 +120,7 @@ def cmd_notes(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
+    from .command_response import exit_code
     from .installation import apply, inspect, plan
     agents_root = args.agents_root.expanduser().resolve()
     codex_root = args.codex_root.expanduser().resolve()
@@ -130,7 +131,19 @@ def cmd_install(args: argparse.Namespace) -> int:
     else:
         result = inspect(agents_root, codex_root)
     emit(result, args.json)
-    return 0 if result.get("ok") else 1
+    return exit_code(result)
+
+
+def cmd_capability(args: argparse.Namespace) -> int:
+    from .capabilities import check_capabilities, exit_code, list_capabilities, run_capability
+    if args.capability_action == "list":
+        result = list_capabilities()
+    elif args.capability_action == "check":
+        result = check_capabilities(args.capability_id)
+    else:
+        result = run_capability(args.capability_id, args.request)
+    emit(result, args.json)
+    return exit_code(result)
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -304,12 +317,48 @@ def cmd_library(args: argparse.Namespace) -> int:
 
 
 def cmd_workspace(args: argparse.Namespace) -> int:
-    config = discover_workspace(args.workspace)
+    from .command_response import exit_code, response
+    from .workspace import WorkspaceError
+    try:
+        config = discover_workspace(args.workspace)
+    except WorkspaceError as exc:
+        if args.workspace_action != "doctor":
+            raise
+        result = response(status="missing_input", workspace=str(args.workspace) if args.workspace else None,
+                          validation={"workspace": "failed"}, diagnostics=[str(exc)],
+                          next_action={"type": "user", "reason": "provide a valid workspace config"})
+        emit(result, args.json)
+        return exit_code(result)
+    if args.workspace_action == "doctor" and not config.workspace_id:
+        result = response(status="missing_input", workspace=str(config.config_path),
+                          validation={"workspace_id": "failed"},
+                          diagnostics=["workspace_id is required for stable public execution; add a persistent logical ID to workspace.toml"],
+                          next_action={"type": "user", "reason": "add workspace_id to workspace.toml; do not change it when moving the workspace"})
+        emit(result, args.json)
+        return exit_code(result)
     if args.workspace_action == "show": result = config.as_dict()
-    elif args.workspace_action == "doctor": result = workspace_doctor(config)
+    elif args.workspace_action == "doctor":
+        from .capabilities import check_capabilities
+        from .installation import inspect
+        doctor_result = workspace_doctor(config)
+        capabilities = check_capabilities()
+        installation = inspect(args.agents_root.expanduser().resolve(), args.codex_root.expanduser().resolve())
+        doctor_result["capabilities"] = capabilities
+        doctor_result["installation"] = installation
+        ok = doctor_result["ok"] and capabilities["status"] == "completed" and installation["status"] == "completed"
+        result = response(status="completed" if ok else "recoverable_failure",
+                          workspace=str(config.config_path), result=doctor_result,
+                          validation={"workspace": doctor_result["ok"],
+                                      "capabilities": capabilities["status"] == "completed",
+                                      "installation": installation["status"] == "completed"},
+                          provenance={"workspace_config": str(config.config_path)},
+                          next_action=None if ok else {"command": "video-extract install plan --json"},
+                          diagnostics=[] if ok else ["workspace, capability, or installation diagnostics require attention"])
     elif args.workspace_action == "rebuild": result = workspace_rebuild(config, args.apply)
     else: result = prepare_migration(config, args.full_hash)
     emit(result, args.json)
+    if args.workspace_action == "doctor":
+        return exit_code(result)
     return 0 if result.get("ok", False) else 1
 
 
@@ -319,7 +368,11 @@ def parser() -> argparse.ArgumentParser:
     workspace = commands.add_parser("workspace", help="inspect and rebuild a portable workspace")
     workspace_actions = workspace.add_subparsers(dest="workspace_action", required=True)
     for action in ("show", "doctor"):
-        p = workspace_actions.add_parser(action); p.add_argument("--workspace", type=Path); p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_workspace)
+        p = workspace_actions.add_parser(action); p.add_argument("--workspace", type=Path)
+        if action == "doctor":
+            p.add_argument("--agents-root", type=Path, default=Path.home() / ".agents")
+            p.add_argument("--codex-root", type=Path, default=Path.home() / ".codex")
+        p.add_argument("--json", action="store_true"); p.set_defaults(func=cmd_workspace)
     rebuild = workspace_actions.add_parser("rebuild"); rebuild.add_argument("--workspace", type=Path); rebuild.add_argument("--json", action="store_true")
     rebuild_mode = rebuild.add_mutually_exclusive_group(required=True); rebuild_mode.add_argument("--dry-run", action="store_true"); rebuild_mode.add_argument("--apply", action="store_true"); rebuild.set_defaults(func=cmd_workspace)
     migration = workspace_actions.add_parser("prepare-migration"); migration.add_argument("--workspace", type=Path); migration.add_argument("--full-hash", action="store_true"); migration.add_argument("--json", action="store_true"); migration.set_defaults(func=cmd_workspace)
@@ -379,6 +432,15 @@ def parser() -> argparse.ArgumentParser:
         if action == "apply": p.add_argument("--backup-root", type=Path)
         p.add_argument("--json", action="store_true")
         p.set_defaults(func=cmd_install)
+    capability = commands.add_parser("capability", help="list, check, or run a stable capability ID")
+    capability_actions = capability.add_subparsers(dest="capability_action", required=True)
+    capability_list = capability_actions.add_parser("list", help="list declared capability contracts")
+    capability_list.add_argument("--json", action="store_true"); capability_list.set_defaults(func=cmd_capability)
+    capability_check = capability_actions.add_parser("check", help="check a capability implementation and contract")
+    capability_check.add_argument("capability_id", nargs="?"); capability_check.add_argument("--json", action="store_true"); capability_check.set_defaults(func=cmd_capability)
+    capability_run = capability_actions.add_parser("run", help="run a capability from a versioned JSON request")
+    capability_run.add_argument("capability_id"); capability_run.add_argument("--request", type=Path, required=True)
+    capability_run.add_argument("--json", action="store_true"); capability_run.set_defaults(func=cmd_capability)
     scan = commands.add_parser("scan", help="scan a homogeneous collection inventory"); scan.add_argument("source"); scan.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); scan.add_argument("--output", type=Path, required=True); scan.add_argument("--visible", action="store_true"); scan.add_argument("--wait-seconds", type=int); scan.add_argument("--json", action="store_true"); scan.set_defaults(func=cmd_scan)
     acquire = commands.add_parser("acquire", help="acquire authorized media for one platform scope"); acquire.add_argument("source", nargs="?", default=""); acquire.add_argument("--platform", choices=("xiaoe", "bilibili", "youtube"), required=True); acquire.add_argument("--urls-file", type=Path); acquire.add_argument("--output", type=Path, required=True); acquire.add_argument("--media", choices=("video", "audio", "both"), default="video"); acquire.add_argument("--quality", type=int); acquire.add_argument("--workers", type=int); acquire.add_argument("--session-dir", type=Path, default=Path("work/browser_session")); acquire.add_argument("--wait-seconds", type=int); acquire.add_argument("--headless", action="store_true"); acquire.add_argument("--cdp-url", help="连接已打开的 Chrome CDP 地址"); acquire.add_argument("--json", action="store_true"); acquire.set_defaults(func=cmd_acquire)
     xiaoe = commands.add_parser("xiaoe", help="persistent, resumable Xiaoe course downloads")

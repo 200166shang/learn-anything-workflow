@@ -30,6 +30,13 @@ class WorkspaceError(RuntimeError):
     pass
 
 
+def validate_workspace_id(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    return None if candidate == "REPLACE_ME_WITH_UUID" else candidate
+
+
 def _contained(child: Path, parent: Path, label: str) -> Path:
     child, parent = child.resolve(), parent.resolve()
     try:
@@ -51,6 +58,7 @@ class WorkspaceConfig:
     threads: Path
     concepts: Path
     review: Path
+    workspace_id: str | None = None
     pyvideotrans_python: Path | None = None
     pyvideotrans_cli: Path | None = None
 
@@ -59,9 +67,15 @@ class WorkspaceConfig:
         path = path.expanduser().resolve()
         if not path.is_file():
             raise WorkspaceError(f"workspace config not found: {path}; create it from workspace.example.toml")
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise WorkspaceError(f"invalid workspace config: {path}: {exc}") from exc
         if raw.get("schema_version") != SCHEMA_VERSION:
             raise WorkspaceError(f"unsupported workspace schema_version: {raw.get('schema_version')!r}")
+        workspace_id = raw.get("workspace_id")
+        if workspace_id is not None and validate_workspace_id(workspace_id) is None:
+            raise WorkspaceError("workspace_id must be a non-empty persistent logical identifier, not a placeholder")
         paths, obs = raw.get("paths", {}), raw.get("obsidian", {})
         root = path.parent.resolve()
         project = _contained(root / _required(paths, "project"), root, "project")
@@ -78,10 +92,12 @@ class WorkspaceConfig:
         if generated == vault or any(generated == item or generated in item.parents for item in (threads, concepts, review, vault / "收件箱")):
             raise WorkspaceError("generated path overlaps a protected Vault boundary")
         return cls(path, source, root, project, media, vault, generated, threads, concepts, review,
+                   validate_workspace_id(workspace_id),
                    pyvideotrans_python, pyvideotrans_cli)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"ok": True, "schema_version": SCHEMA_VERSION, "config_source": self.source,
+        return {"ok": True, "schema_version": SCHEMA_VERSION, "workspace_id": self.workspace_id,
+                "config_source": self.source,
                 "config": str(self.config_path), "root": str(self.root), "project": str(self.project),
                 "media": str(self.media), "obsidian": str(self.obsidian), "generated": str(self.generated),
                 "threads": str(self.threads), "concepts": str(self.concepts), "review": str(self.review),

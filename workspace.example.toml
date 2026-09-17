@@ -1,4 +1,6 @@
 schema_version = 1
+# Generate once, for example: python -c 'import uuid; print(uuid.uuid4())'
+workspace_id = "REPLACE_ME_WITH_UUID"
 
 [paths]
 project = "video-extract-core"
