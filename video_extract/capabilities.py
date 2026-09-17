@@ -241,27 +241,36 @@ run_source_notes.__capability_contract__ = {
 
 
 def run_learning(request: dict[str, Any]) -> dict[str, Any]:
-    from .learning import (commit_explanation, create_module, create_thread, locate,
-                           prepare_explanation, pursue, recommend_roots, show_module, show_thread)
+    from .learning import (LearningPublishError, commit_explanation, create_module, create_thread,
+                           locate, prepare_explanation, publish_failure_response, pursue,
+                           recommend_roots, show_module, show_thread)
 
     workspace = discover_workspace(Path(request["workspace"]))
     action = request.get("action")
-    if action == "module.create":
-        return create_module(workspace, request["goal"], request["scope"], request["source_id"], request["source_version"])
-    if action == "module.show": return show_module(workspace, request["module_id"])
-    if action == "recommend": return recommend_roots(workspace, request["module_id"])
-    if action == "thread.create": return create_thread(workspace, request["module_id"], request["root_question"])
-    if action == "thread.show": return show_thread(workspace, request["thread_id"])
-    if action == "pursue":
-        return pursue(workspace, request["thread_id"], request["from_question_id"], request["relation"], request["question"])
-    if action == "locate": return locate(workspace, request["question_id"])
-    if action == "explanation.prepare":
-        return prepare_explanation(workspace, request["question_id"], request["profile"])
-    if action == "explanation.commit":
-        return commit_explanation(workspace, request["question_id"], Path(request["draft"]),
-                                  Path(request["evidence"]), Path(request["teaching_review"]),
-                                  request["profile"], request.get("expected_revision"))
-    return {"status": "needs_input", "error": "unsupported learning action"}
+    try:
+        if action == "module.create":
+            return create_module(workspace, request["goal"], request["scope"], request["source_id"],
+                                 request["source_version"], request.get("expected_revision"))
+        if action == "module.show": return show_module(workspace, request["module_id"])
+        if action == "recommend": return recommend_roots(workspace, request["module_id"])
+        if action == "thread.create":
+            return create_thread(workspace, request["module_id"], request["root_question"],
+                                 request.get("expected_revision"))
+        if action == "thread.show": return show_thread(workspace, request["thread_id"])
+        if action == "pursue":
+            return pursue(workspace, request["thread_id"], request["from_question_id"], request["relation"],
+                          request["question"], request.get("expected_revision"))
+        if action == "locate": return locate(workspace, request["question_id"])
+        if action == "explanation.prepare":
+            return prepare_explanation(workspace, request["question_id"], request["profile"])
+        if action == "explanation.commit":
+            return commit_explanation(workspace, request["question_id"], Path(request["draft"]),
+                                      Path(request["evidence"]), Path(request["teaching_review"]),
+                                      request["profile"], request["preparation_id"],
+                                      request.get("expected_revision"))
+        return {"status": "needs_input", "error": "unsupported learning action"}
+    except LearningPublishError as exc:
+        return publish_failure_response(workspace, exc)
 
 
 run_learning.__capability_contract__ = {
@@ -318,10 +327,13 @@ def run_capability(capability_id: str, request_path: Path) -> dict[str, Any]:
                         validation={"contract_version": "passed", "output_type": "failed"},
                         provenance=provenance, diagnostics=["capability implementation returned a non-mapping result"],
                         next_action={"type": "maintenance", "maintenance_path": str(Path(__file__).resolve())})
-    if raw.get("api_version") == 1 and raw.get("operation_id") == operation_id:
+    if raw.get("api_version") == 1:
         # Implementations of command-response-v1 may provide the complete
         # public envelope (including durable progress and artifact references).
-        return dict(raw)
+        envelope = dict(raw)
+        envelope["operation_id"] = operation_id
+        envelope["provenance"] = {**provenance, **(raw.get("provenance") or {})}
+        return envelope
     status_map = {"complete": "completed", "ready": "completed", "awaiting_ai": "awaiting_model",
                   "needs_input": "missing_input", "failed": "failed"}
     status = status_map.get(raw.get("status"), raw.get("status"))

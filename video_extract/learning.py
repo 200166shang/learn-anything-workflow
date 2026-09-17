@@ -71,8 +71,72 @@ def _object_path(config: WorkspaceConfig, digest: str) -> Path:
 def _empty() -> dict[str, Any]:
     return {"schema_version": 2, "commit_id": None, "parent_commit_id": None, "revision": 0,
             "created_at": None, "record": {"schema_version": 2, "modules": {}, "threads": {},
-                                              "questions": {}, "relationships": {},
-                                              "explanations": {}}, "objects": {}}
+                                              "questions": {}, "relationships": {}, "feedbacks": {},
+                                              "preparations": {}, "explanations": {}}, "objects": {}}
+
+
+def _logical_object_path(digest: str) -> str:
+    return f"learning/objects/{digest[:2]}/{digest}"
+
+
+def _deep_validate(value: dict[str, Any]) -> None:
+    record = value["record"]; modules = record["modules"]; threads = record["threads"]
+    questions = record["questions"]; explanations = record["explanations"]
+    for module_id, module in modules.items():
+        if module["module_id"] != module_id:
+            raise WorkspaceError(f"module identity mismatch: {module_id}")
+        owned = {thread_id for thread_id, thread in threads.items() if thread["module_id"] == module_id}
+        if set(module["thread_ids"]) != owned:
+            raise WorkspaceError(f"module thread ownership is incomplete or duplicated: {module_id}")
+        if module["last_active_thread_id"] is not None and module["last_active_thread_id"] not in owned:
+            raise WorkspaceError(f"module last_active_thread_id is not owned: {module_id}")
+    for thread_id, thread in threads.items():
+        if thread["thread_id"] != thread_id or thread["module_id"] not in modules:
+            raise WorkspaceError(f"thread identity or module reference is invalid: {thread_id}")
+        for field in ("root_question_id", "current_question_id"):
+            question = questions.get(thread[field])
+            if question is None or question["thread_id"] != thread_id:
+                raise WorkspaceError(f"thread {field} is not owned by thread: {thread_id}")
+    for question_id, question in questions.items():
+        if question["question_id"] != question_id or question["thread_id"] not in threads:
+            raise WorkspaceError(f"question identity or thread reference is invalid: {question_id}")
+    for relationship_id, relation in record["relationships"].items():
+        endpoints = (questions.get(relation["from_question_id"]), questions.get(relation["to_question_id"]))
+        if relation["relationship_id"] != relationship_id or relation["thread_id"] not in threads \
+                or any(item is None or item["thread_id"] != relation["thread_id"] for item in endpoints):
+            raise WorkspaceError(f"relationship crosses or misses thread ownership: {relationship_id}")
+    for feedback_id, feedback in record["feedbacks"].items():
+        if feedback["feedback_id"] != feedback_id or feedback["question_id"] not in questions:
+            raise WorkspaceError(f"feedback reference is invalid: {feedback_id}")
+    for preparation_id, preparation in record["preparations"].items():
+        question = questions.get(preparation["question_id"])
+        calculated_scope = hashlib.sha256(json.dumps(preparation["source_refs"], sort_keys=True).encode()).hexdigest()
+        if preparation["preparation_id"] != preparation_id or question is None \
+                or preparation["prepared_revision"] > value["revision"] \
+                or preparation["source_scope_sha256"] != calculated_scope:
+            raise WorkspaceError(f"preparation reference is invalid: {preparation_id}")
+    for explanation_id, explanation in explanations.items():
+        root = questions.get(explanation["root_question_id"])
+        if explanation["explanation_id"] != explanation_id or root is None \
+                or threads[root["thread_id"]]["root_question_id"] != root["question_id"]:
+            raise WorkspaceError(f"explanation root ownership is invalid: {explanation_id}")
+        if str(explanation["current_revision"]) not in explanation["revisions"]:
+            raise WorkspaceError(f"explanation current revision is missing: {explanation_id}")
+        for revision_key, revision in explanation["revisions"].items():
+            if revision["revision"] != int(revision_key) or revision["object_sha256"] not in value["objects"] \
+                    or revision["logical_path"] != _logical_object_path(revision["object_sha256"]):
+                raise WorkspaceError(f"explanation revision is not completely reachable: {explanation_id}/{revision_key}")
+            for question_id, section_ids in revision["section_map"].items():
+                if question_id not in questions or questions[question_id]["thread_id"] != root["thread_id"] or not section_ids:
+                    raise WorkspaceError(f"explanation section map crosses thread ownership: {question_id}")
+    for question_id, question in questions.items():
+        for ref in question["explanation_refs"]:
+            explanation = explanations.get(ref["explanation_id"])
+            revision = explanation and explanation["revisions"].get(str(ref["explanation_revision"]))
+            if revision is None or ref["section_id"] not in revision["section_map"].get(question_id, []) \
+                    or ref["object_sha256"] != revision["object_sha256"] \
+                    or ref["logical_path"] != revision["logical_path"]:
+                raise WorkspaceError(f"question explanation locator is invalid: {question_id}")
 
 
 def _load(config: WorkspaceConfig) -> dict[str, Any]:
@@ -89,10 +153,7 @@ def _load(config: WorkspaceConfig) -> dict[str, Any]:
         path = _object_path(config, digest)
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest or path.stat().st_size != item["size"]:
             raise WorkspaceError(f"learning snapshot object is missing or corrupt: {digest}")
-    for explanation in value["record"]["explanations"].values():
-        for revision in explanation["revisions"].values():
-            if revision["object_sha256"] not in value["objects"]:
-                raise WorkspaceError("explanation revision is not reachable through learning snapshot objects")
+    _deep_validate(value)
     return value
 
 
@@ -113,6 +174,7 @@ def _publish(config: WorkspaceConfig, previous: dict[str, Any], record: dict[str
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     value["commit_id"] = "learning-commit-" + hashlib.sha256(encoded).hexdigest()
     _validate("learning-snapshot-v2.schema.json", value)
+    _deep_validate(value)
     body = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n"
     commits.mkdir(parents=True, exist_ok=True)
     manifest = commits / f'{value["commit_id"]}.json'
@@ -141,6 +203,13 @@ def _revision_conflict(config: WorkspaceConfig, snapshot: dict[str, Any], expect
     atomic_write_json(path, {"schema_version": 2, "operation": operation,
                              "expected_revision": expected, "observed_revision": snapshot["revision"],
                              "proposal": proposal})
+    try:
+        if os.environ.get("VIDEO_EXTRACT_LEARNING_TEST_FAULT") == "candidate_sync":
+            raise OSError("injected candidate directory sync failure")
+        _sync_directory(candidates)
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
     return response(status="awaiting_user", workspace=str(config.config_path), result={
         "candidate": str(path), "observed_revision": snapshot["revision"]},
         validation={"expected_revision": "conflict"},
@@ -181,14 +250,42 @@ def backup_entries(config: WorkspaceConfig) -> dict[str, Any]:
                         *[str(objects / digest[:2] / digest) for digest in sorted(snapshot["objects"])]]}
 
 
+def _source_context(config: WorkspaceConfig, source_refs: list[dict[str, str]]) -> tuple[list[dict[str, Any]], list[str]]:
+    context: list[dict[str, Any]] = []; errors: list[str] = []
+    for ref in source_refs:
+        try:
+            checked = verify_source(config, ref["source_id"], ref["source_version"])
+        except (OSError, ValueError, WorkspaceError) as exc:
+            errors.append(f'{ref["source_id"]}@{ref["source_version"]}: {exc}'); continue
+        if checked["status"] != "completed":
+            errors.extend(checked.get("diagnostics") or [f'cannot verify {ref["source_id"]}']); continue
+        item = {**ref, "kind": checked["result"]["kind"], "title": checked["result"]["title"],
+                "content": checked["result"].get("content"), "location": checked["result"].get("location"),
+                "availability": checked["result"].get("availability"),
+                "version_basis": checked["result"]["version_basis"]}
+        context.append(item)
+        if item["availability"] not in {"available_from_results", "available_at_location"}:
+            errors.append(f'{ref["source_id"]}@{ref["source_version"]}: {item["availability"]}')
+    return context, errors
+
+
+def _sources_blocked(config: WorkspaceConfig, question: dict[str, Any] | None,
+                     context: list[dict[str, Any]], errors: list[str]) -> dict[str, Any]:
+    return response(status="missing_input", workspace=str(config.config_path), result={
+        "question": question, "source_context": context, "blocked_source_errors": errors},
+        validation={"learning_record": "passed", "sources": "failed"},
+        diagnostics=["required source scope is missing, corrupt, or version-mismatched", *errors],
+        next_action={"type": "user", "reason": "restore or relocate only the source versions required by this module"})
+
+
 def create_module(config: WorkspaceConfig, goal: str, scope: str, source_id: str,
                   source_version: str, expected_revision: int | None = None) -> dict[str, Any]:
     if not goal.strip() or not scope.strip():
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=["confirmed module goal and scope must be non-empty"])
-    checked = verify_source(config, source_id, source_version)
-    if checked["status"] != "completed":
-        return checked
+    context, source_errors = _source_context(config, [{"source_id": source_id, "source_version": source_version}])
+    if source_errors:
+        return _sources_blocked(config, None, context, source_errors)
     module_id = "module-" + str(uuid.uuid4())
     with package_lock(_roots(config)[2].parent):
         snapshot = _load(config)
@@ -224,15 +321,9 @@ def recommend_roots(config: WorkspaceConfig, module_id: str) -> dict[str, Any]:
     if module is None:
         return response(status="missing_input", workspace=str(config.config_path),
                         diagnostics=[f"unknown module_id: {module_id}"])
-    context = []
-    for ref in module["source_refs"]:
-        checked = verify_source(config, ref["source_id"], ref["source_version"])
-        if checked["status"] == "completed":
-            context.append({**ref, "kind": checked["result"]["kind"],
-                            "title": checked["result"]["title"],
-                            "content": checked["result"].get("content"),
-                            "location": checked["result"].get("location"),
-                            "availability": checked["result"].get("availability")})
+    context, errors = _source_context(config, module["source_refs"])
+    if errors:
+        return _sources_blocked(config, None, context, errors)
     return response(status="awaiting_model", workspace=str(config.config_path), result={
         "module": module, "source_context": context, "persisted": False,
     }, validation={"learning_record": "passed", "sources": "passed"}, next_action={
@@ -331,8 +422,10 @@ def locate(config: WorkspaceConfig, question_id: str) -> dict[str, Any]:
         return response(status="awaiting_model", workspace=str(config.config_path), result={
             "question": question, "explanation_state": "pending"},
             next_action={"type": "model", "action": "prepare_explanation"})
+    locations = [{**ref, "document_path": str(config.results / ref["logical_path"])}
+                 for ref in question["explanation_refs"]]
     return response(status="completed", workspace=str(config.config_path), result={
-        "question": question, "explanation_state": "available", "locations": question["explanation_refs"]})
+        "question": question, "explanation_state": "available", "locations": locations})
 
 
 PROFILES = {
@@ -350,24 +443,25 @@ def prepare_explanation(config: WorkspaceConfig, question_id: str, profile: str)
     if question is None:
         return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
     thread = record["threads"][question["thread_id"]]; module = record["modules"][thread["module_id"]]
-    context = []
-    for ref in module["source_refs"]:
-        checked = verify_source(config, ref["source_id"], ref["source_version"])
-        if checked["status"] == "completed":
-            context.append({**ref, "kind": checked["result"]["kind"], "title": checked["result"]["title"],
-                            "content": checked["result"].get("content"),
-                            "location": checked["result"].get("location"),
-                            "availability": checked["result"].get("availability"),
-                            "version_basis": checked["result"]["version_basis"]})
-    unavailable = [item for item in context if item["availability"] not in {"available_from_results", "available_at_location"}]
-    if unavailable:
-        return response(status="missing_input", workspace=str(config.config_path), result={
-            "question": question, "blocked_source_refs": unavailable},
-            diagnostics=["required source version is unavailable for this question"],
-            next_action={"type": "user", "reason": "relocate or restore the required source version"})
-    section_id = "section-" + str(uuid.uuid4())
+    context, errors = _source_context(config, module["source_refs"])
+    if errors:
+        return _sources_blocked(config, question, context, errors)
+    section_id = "section-" + str(uuid.uuid4()); preparation_id = "preparation-" + str(uuid.uuid4())
+    source_scope = hashlib.sha256(json.dumps(module["source_refs"], sort_keys=True).encode()).hexdigest()
+    with package_lock(_roots(config)[2].parent):
+        snapshot = _load(config); record = snapshot["record"]
+        current_question = record["questions"].get(question_id)
+        if current_question is None:
+            return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
+        preparation = {"preparation_id": preparation_id, "question_id": question_id, "profile": profile,
+                       "section_id": section_id, "prepared_revision": snapshot["revision"] + 1,
+                       "source_refs": module["source_refs"], "source_scope_sha256": source_scope,
+                       "created_at": _now(), "consumed_at": None}
+        updated = {**record, "preparations": {**record["preparations"], preparation_id: preparation}}
+        published = _publish(config, snapshot, updated)
     return response(status="awaiting_model", workspace=str(config.config_path), result={
-        "question": question, "profile": profile, "section_id": section_id,
+        "question": question, "profile": profile, "section_id": section_id, "preparation_id": preparation_id,
+        "prepared_revision": published["revision"],
         "required_marker": f"<!-- section-id: {section_id} -->", "source_context": context,
         "claim_types": ["course_fact", "current_code", "supplemental_source", "inference"],
     }, validation={"learning_record": "passed", "sources": "passed"}, next_action={
@@ -402,7 +496,8 @@ def _quality_errors(text: str, profile: str, review: dict[str, Any]) -> list[str
 
 
 def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, evidence_path: Path,
-                       review_path: Path, profile: str, expected_revision: int | None = None) -> dict[str, Any]:
+                       review_path: Path, profile: str, preparation_id: str,
+                       expected_revision: int | None = None) -> dict[str, Any]:
     text = draft.read_text(encoding="utf-8")
     evidence = json.loads(evidence_path.read_text(encoding="utf-8")); review = json.loads(review_path.read_text(encoding="utf-8"))
     if profile not in PROFILES or not isinstance(evidence, list) or not evidence:
@@ -410,14 +505,6 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
     markers = re.findall(r"<!--\s*section-id:\s*(section-[0-9a-f-]{36})\s*-->", text)
     errors = [] if len(markers) == 1 else ["draft must contain exactly one stable section-id marker"]
     errors.extend(_quality_errors(text, profile, review if isinstance(review, dict) else {}))
-    for item in evidence:
-        if (not isinstance(item, dict)
-                or item.get("claim_type") not in {"course_fact", "current_code", "supplemental_source", "inference"}
-                or not item.get("source_id") or not item.get("source_version")
-                or not item.get("locator") or not item.get("claim")):
-            errors.append("each evidence reference needs source identity, locator, claim, and claim_type"); continue
-        checked = verify_source(config, item.get("source_id", ""), item.get("source_version"))
-        if checked["status"] != "completed": errors.append("evidence source version is unavailable")
     if errors:
         return response(status="failed", workspace=str(config.config_path), validation={"teaching_quality": "failed"}, diagnostics=errors)
     body = text.encode(); digest = hashlib.sha256(body).hexdigest()
@@ -428,7 +515,37 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
             if conflict: return conflict
         if question is None:
             return response(status="missing_input", workspace=str(config.config_path), diagnostics=[f"unknown question_id: {question_id}"])
-        thread = record["threads"][question["thread_id"]]; root_id = thread["root_question_id"]
+        thread = record["threads"][question["thread_id"]]; module = record["modules"][thread["module_id"]]
+        preparation = record["preparations"].get(preparation_id)
+        scope_digest = hashlib.sha256(json.dumps(module["source_refs"], sort_keys=True).encode()).hexdigest()
+        if preparation is None or preparation["question_id"] != question_id or preparation["profile"] != profile \
+                or preparation["consumed_at"] is not None or preparation["source_refs"] != module["source_refs"] \
+                or preparation["prepared_revision"] != snapshot["revision"] \
+                or preparation["source_scope_sha256"] != scope_digest or markers != [preparation["section_id"]]:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"preparation": "failed"},
+                            diagnostics=["preparation token is missing, stale, consumed, cross-question, or marker-mismatched"])
+        allowed_refs = {(item["source_id"], item["source_version"]) for item in module["source_refs"]}
+        evidence_errors: list[str] = []
+        for item in evidence:
+            if (not isinstance(item, dict)
+                    or item.get("claim_type") not in {"course_fact", "current_code", "supplemental_source", "inference"}
+                    or not item.get("source_id") or not item.get("source_version")
+                    or not item.get("locator") or not item.get("claim")):
+                evidence_errors.append("each evidence reference needs source identity, locator, claim, and claim_type"); continue
+            identity = (item["source_id"], item["source_version"])
+            if identity not in allowed_refs:
+                evidence_errors.append("evidence source is outside the question module's confirmed source scope"); continue
+            context, source_errors = _source_context(config, [{"source_id": identity[0], "source_version": identity[1]}])
+            if source_errors:
+                evidence_errors.extend(source_errors); continue
+            expected_type = "current_code" if context[0]["kind"] == "code" else "course_fact"
+            if item["claim_type"] not in {expected_type, "inference"}:
+                evidence_errors.append(f"claim_type {item['claim_type']} does not match source kind {context[0]['kind']}")
+        if evidence_errors:
+            return response(status="failed", workspace=str(config.config_path),
+                            validation={"source_scope": "failed"}, diagnostics=evidence_errors)
+        root_id = thread["root_question_id"]
         existing = next((item for item in record["explanations"].values() if item["root_question_id"] == root_id), None)
         explanation_id = existing["explanation_id"] if existing else "explanation-" + str(uuid.uuid4())
         revision = existing["current_revision"] + 1 if existing else 1
@@ -438,16 +555,18 @@ def commit_explanation(config: WorkspaceConfig, question_id: str, draft: Path, e
             with object_path.open("xb") as stream:
                 stream.write(body); stream.flush(); os.fsync(stream.fileno())
         _sync_directory(object_path.parent); _sync_directory(object_root)
-        revision_value = {"revision": revision, "object_sha256": digest, "created_at": _now(),
+        logical_path = _logical_object_path(digest)
+        revision_value = {"revision": revision, "object_sha256": digest, "logical_path": logical_path, "created_at": _now(),
                           "profile": profile, "evidence_refs": evidence, "teaching_review": review,
                           "section_map": {question_id: markers}, "change_reason": "initial" if not existing else "revised"}
         explanation = {"explanation_id": explanation_id, "root_question_id": root_id,
                        "current_revision": revision,
                        "revisions": {**(existing or {}).get("revisions", {}), str(revision): revision_value}}
         ref = {"explanation_id": explanation_id, "explanation_revision": revision,
-               "section_id": markers[0], "document_path": str(object_path)}
+               "section_id": markers[0], "object_sha256": digest, "logical_path": logical_path}
         updated_question = {**question, "explanation_refs": [ref]}
         updated = {**record, "questions": {**record["questions"], question_id: updated_question},
+                   "preparations": {**record["preparations"], preparation_id: {**preparation, "consumed_at": _now()}},
                    "explanations": {**record["explanations"], explanation_id: explanation}}
         published = _publish(config, snapshot, updated, {digest: {"kind": "explanation_markdown", "size": len(body)}})
     public = {"explanation_id": explanation_id, "root_question_id": root_id, "revision": revision,

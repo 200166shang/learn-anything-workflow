@@ -253,7 +253,8 @@ def cmd_explanation(args: argparse.Namespace) -> int:
         result = (prepare_explanation(workspace, args.question_id, args.profile)
                   if args.explanation_action == "prepare" else
                   commit_explanation(workspace, args.question_id, args.draft, args.evidence,
-                                     args.teaching_review, args.profile, args.expected_revision))
+                                     args.teaching_review, args.profile, args.preparation_id,
+                                     args.expected_revision))
     except LearningPublishError as exc:
         result = publish_failure_response(workspace, exc)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError, WorkspaceError) as exc:
@@ -641,7 +642,7 @@ def parser() -> argparse.ArgumentParser:
     explanation = commands.add_parser("explanation", help="prepare and commit versioned teaching explanations")
     explanation_actions = explanation.add_subparsers(dest="explanation_action", required=True)
     explanation_prepare = explanation_actions.add_parser("prepare"); explanation_prepare.add_argument("--question-id", required=True); explanation_prepare.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_prepare.add_argument("--workspace", type=Path); explanation_prepare.add_argument("--json", action="store_true"); explanation_prepare.set_defaults(func=cmd_explanation)
-    explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
+    explanation_commit = explanation_actions.add_parser("commit"); explanation_commit.add_argument("--question-id", required=True); explanation_commit.add_argument("--draft", type=Path, required=True); explanation_commit.add_argument("--evidence", type=Path, required=True); explanation_commit.add_argument("--teaching-review", type=Path, required=True); explanation_commit.add_argument("--profile", choices=("linear_transform", "recognition_to_action", "frame_pipeline"), required=True); explanation_commit.add_argument("--preparation-id", required=True); explanation_commit.add_argument("--expected-revision", type=int); explanation_commit.add_argument("--workspace", type=Path); explanation_commit.add_argument("--json", action="store_true"); explanation_commit.set_defaults(func=cmd_explanation)
     install = commands.add_parser("install", help="plan, apply, or check project-owned host integrations")
     install_actions = install.add_subparsers(dest="install_action", required=True)
     for action in ("plan", "apply", "check"):

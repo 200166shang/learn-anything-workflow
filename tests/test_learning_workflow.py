@@ -153,6 +153,7 @@ def test_prepare_and_commit_versioned_source_grounded_linear_transform_explanati
     assert code == 3
     assert prepared["status"] == "awaiting_model"
     section_id = prepared["result"]["section_id"]
+    preparation_id = prepared["result"]["preparation_id"]
     assert section_id.startswith("section-")
     assert prepared["result"]["required_marker"] == f"<!-- section-id: {section_id} -->"
     assert prepared["result"]["source_context"][0]["source_version"] == source["source_version"]
@@ -178,7 +179,8 @@ def test_prepare_and_commit_versioned_source_grounded_linear_transform_explanati
 
     code, committed = cli("explanation", "commit", "--question-id", question_id,
                           "--draft", draft, "--evidence", evidence, "--teaching-review", review,
-                          "--profile", "linear_transform", "--workspace", config, "--json")
+                          "--profile", "linear_transform", "--preparation-id", preparation_id,
+                          "--workspace", config, "--json")
     assert code == 0
     explanation = committed["result"]["explanation"]
     assert explanation["explanation_id"].startswith("explanation-")
@@ -186,27 +188,42 @@ def test_prepare_and_commit_versioned_source_grounded_linear_transform_explanati
     assert explanation["evidence_refs"][0]["source_version"] == source["source_version"]
     assert explanation["section_map"][question_id] == [section_id]
 
+    code, replayed = cli("explanation", "commit", "--question-id", question_id,
+                         "--draft", draft, "--evidence", evidence, "--teaching-review", review,
+                         "--profile", "linear_transform", "--preparation-id", preparation_id,
+                         "--workspace", config, "--json")
+    assert code == 1
+    assert replayed["validation"]["preparation"] == "failed"
+
     code, located = cli("learning", "locate", question_id, "--workspace", config, "--json")
     assert code == 0
     assert located["result"]["locations"][0]["section_id"] == section_id
     assert located["result"]["locations"][0]["explanation_revision"] == 1
     assert Path(located["result"]["locations"][0]["document_path"]).read_text(encoding="utf-8") == draft.read_text(encoding="utf-8")
 
+    _, prepared_update = cli("explanation", "prepare", "--question-id", question_id,
+                             "--profile", "linear_transform", "--workspace", config, "--json")
+    update_token = prepared_update["result"]["preparation_id"]
+    update_marker = prepared_update["result"]["required_marker"]
     bad = tmp_path / "bad.md"; bad.write_text("# Thin answer\n", encoding="utf-8")
     code, rejected = cli("explanation", "commit", "--question-id", question_id,
                          "--draft", bad, "--evidence", evidence, "--teaching-review", review,
-                         "--profile", "linear_transform", "--workspace", config, "--json")
+                         "--profile", "linear_transform", "--preparation-id", update_token,
+                         "--workspace", config, "--json")
     assert code == 1
     assert rejected["status"] == "failed"
     _, still_located = cli("learning", "locate", question_id, "--workspace", config, "--json")
     assert still_located["result"]["locations"][0]["explanation_revision"] == 1
 
     first_path = Path(still_located["result"]["locations"][0]["document_path"])
-    revised = draft.read_text(encoding="utf-8") + "\n补充边界：非线性函数不能由固定矩阵表示。\n"
+    revised = draft.read_text(encoding="utf-8").replace(
+        f"<!-- section-id: {section_id} -->", update_marker
+    ) + "\n补充边界：非线性函数不能由固定矩阵表示。\n"
     draft.write_text(revised, encoding="utf-8")
     code, updated = cli("explanation", "commit", "--question-id", question_id,
                         "--draft", draft, "--evidence", evidence, "--teaching-review", review,
-                        "--profile", "linear_transform", "--workspace", config, "--json")
+                        "--profile", "linear_transform", "--preparation-id", update_token,
+                        "--workspace", config, "--json")
     assert code == 0
     assert updated["result"]["explanation"]["explanation_id"] == explanation["explanation_id"]
     assert updated["result"]["explanation"]["revision"] == 2
@@ -247,11 +264,12 @@ def test_source_grounded_teaching_profiles_have_executable_semantic_checks(
     _, prepared = cli("explanation", "prepare", "--question-id", question_id,
                       "--profile", profile, "--workspace", config, "--json")
     marker = prepared["result"]["required_marker"]
+    preparation_id = prepared["result"]["preparation_id"]
     draft = tmp_path / f"{profile}.md"; draft.write_text(f"# Explanation\n{marker}\n{text}\n", encoding="utf-8")
     evidence = tmp_path / "evidence.json"; evidence.write_text(json.dumps([{
         "source_id": source["source_id"], "source_version": source["source_version"],
         "locator": {"kind": "heading", "value": "Implementation"},
-        "claim_type": "current_code", "claim": "Observed implementation fact"}]), encoding="utf-8")
+        "claim_type": "course_fact", "claim": "Observed source fact"}]), encoding="utf-8")
     profile_review = ({"actual_code_separated": True, "stale_input_handling": True}
                       if profile == "recognition_to_action" else
                       {"actual_entry_verified": True, "concurrency_verified": True,
@@ -262,7 +280,8 @@ def test_source_grounded_teaching_profiles_have_executable_semantic_checks(
 
     code, committed = cli("explanation", "commit", "--question-id", question_id,
                           "--draft", draft, "--evidence", evidence, "--teaching-review", review,
-                          "--profile", profile, "--workspace", config, "--json")
+                          "--profile", profile, "--preparation-id", preparation_id,
+                          "--workspace", config, "--json")
 
     assert code == 0
     assert committed["validation"]["teaching_quality"] == "passed"
@@ -342,4 +361,163 @@ def test_learning_capability_contract_checks_and_runs_the_same_public_workflow(t
     assert code == 0
     assert result["status"] == "completed"
     assert result["provenance"]["capability_id"] == "learning.learn"
-    assert result["result"]["result"]["module"]["goal"] == "理解资料"
+    assert result["result"]["module"]["goal"] == "理解资料"
+
+
+def test_deep_validation_rejects_cross_owned_thread_even_when_json_schema_is_valid(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source = register_source(tmp_path, config)
+    thread_id, _ = create_root(tmp_path, config, source, "根问题")
+    results = config.parent / "results"; pointer_path = results / "learning/current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = results / "learning/commits" / f'{pointer["commit_id"]}.json'
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["record"]["threads"][thread_id]["module_id"] = "module-22222222-2222-4222-8222-222222222222"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    code, rejected = cli("learning", "thread", "show", thread_id, "--workspace", config, "--json")
+
+    assert code == 1
+    assert rejected["status"] == "failed"
+    assert "ownership" in rejected["diagnostics"][0] or "module reference" in rejected["diagnostics"][0]
+
+
+def test_missing_code_source_blocks_only_its_module_with_failed_source_validation(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    code_root = tmp_path / "code"; code_root.mkdir(); (code_root / "main.py").write_text("x = 1\n")
+    _, registered = cli("source", "register", code_root, "--workspace", config, "--json")
+    source = registered["result"]
+    _, module = cli("learning", "module", "create", "--goal", "读代码", "--scope", "main",
+                    "--source-id", source["source_id"], "--source-version", source["source_version"],
+                    "--workspace", config, "--json")
+    module_id = module["result"]["module"]["module_id"]
+    _, rooted = cli("learning", "thread", "create", "--module-id", module_id,
+                    "--root-question", "它如何工作？", "--workspace", config, "--json")
+    question_id = rooted["result"]["question"]["question_id"]
+    code_root.rename(tmp_path / "gone")
+
+    for arguments in (("learning", "recommend", "--module-id", module_id),
+                      ("explanation", "prepare", "--question-id", question_id, "--profile", "frame_pipeline")):
+        code, blocked = cli(*arguments, "--workspace", config, "--json")
+        assert code == 3
+        assert blocked["status"] == "missing_input"
+        assert blocked["validation"]["sources"] == "failed"
+        assert blocked["result"]["blocked_source_errors"]
+    _, still = cli("learning", "thread", "show", rooted["result"]["thread"]["thread_id"],
+                   "--workspace", config, "--json")
+    assert still["status"] == "completed"
+
+
+def test_capability_forwards_expected_revision_and_normalizes_publish_recovery(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    _, first = cli("learning", "module", "create", "--goal", "一", "--scope", "一",
+                   "--source-id", source["source_id"], "--source-version", source["source_version"],
+                   "--workspace", config, "--json")
+    request = tmp_path / "stale.json"; request.write_text(json.dumps({
+        "contract_version": 1, "action": "module.create", "workspace": str(config),
+        "goal": "二", "scope": "二", "source_id": source["source_id"],
+        "source_version": source["source_version"], "expected_revision": 0}), encoding="utf-8")
+    code, conflict = cli("capability", "run", "learning.learn", "--request", request, "--json")
+    assert code == 3 and conflict["status"] == "awaiting_user"
+    assert Path(conflict["result"]["candidate"]).is_file()
+
+    recovery = tmp_path / "recovery.json"; recovery.write_text(json.dumps({
+        "contract_version": 1, "action": "module.create", "workspace": str(config),
+        "goal": "三", "scope": "三", "source_id": source["source_id"],
+        "source_version": source["source_version"], "expected_revision": first["result"]["revision"]}), encoding="utf-8")
+    code, uncertain = cli("capability", "run", "learning.learn", "--request", recovery, "--json",
+                          env={"VIDEO_EXTRACT_LEARNING_TEST_FAULT": "after_publish"})
+    assert code == 1 and uncertain["status"] == "recoverable_failure"
+    assert uncertain["next_action"]["type"] == "reconcile"
+    assert uncertain["operation_id"].startswith("operation-")
+
+
+def test_candidate_sync_failure_does_not_claim_a_preserved_candidate(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace"); source = register_source(tmp_path, config)
+    thread_id, root_id = create_root(tmp_path, config, source, "根")
+    code, failed = cli("learning", "pursue", "--thread-id", thread_id,
+                       "--from-question-id", root_id, "--relation", "deepens", "--question", "追问",
+                       "--expected-revision", 0, "--workspace", config, "--json",
+                       env={"VIDEO_EXTRACT_LEARNING_TEST_FAULT": "candidate_sync"})
+    assert code == 1 and failed["status"] == "failed"
+    assert "candidate directory sync failure" in failed["diagnostics"][0]
+    candidates = config.parent / "results/learning/candidates"
+    assert not list(candidates.glob("candidate-*.json"))
+
+
+def _linear_inputs(tmp_path: Path, source: dict, marker: str) -> tuple[Path, Path, Path]:
+    draft = tmp_path / f"draft-{__import__('uuid').uuid4()}.md"
+    draft.write_text(f"# 解释\n{marker}\n直觉和因果机制：基向量决定矩阵列。例子 (1,2) 变 (2,6)。条件边界：平移需要仿射或齐次坐标。\n")
+    evidence = tmp_path / f"evidence-{__import__('uuid').uuid4()}.json"
+    evidence.write_text(json.dumps([{"source_id": source["source_id"], "source_version": source["source_version"],
+                                     "locator": {"kind": "heading", "value": "Vectors"},
+                                     "claim_type": "course_fact", "claim": "source claim"}]))
+    review = tmp_path / f"review-{__import__('uuid').uuid4()}.json"
+    review.write_text(json.dumps({"intuition": True, "causality": True, "mechanism": True,
+                                  "worked_example": True, "conditions": True, "source_alignment": True,
+                                  "basis_coordinate_reasoning": True, "affine_boundary": True}))
+    return draft, evidence, review
+
+
+def test_preparation_token_is_bound_to_question_and_confirmed_source_scope(tmp_path: Path) -> None:
+    config = write_workspace(tmp_path / "workspace")
+    source_one = register_source(tmp_path, config, "# Vectors\nOne\n")
+    second_path = tmp_path / "second.md"; second_path.write_text("# Other\nTwo\n")
+    _, second_registered = cli("source", "register", second_path, "--workspace", config, "--json")
+    source_two = second_registered["result"]
+    thread_id, first_question = create_root(tmp_path, config, source_one, "第一个问题")
+    _, pursued = cli("learning", "pursue", "--thread-id", thread_id, "--from-question-id", first_question,
+                     "--relation", "deepens", "--question", "第二个问题", "--workspace", config, "--json")
+    second_question = pursued["result"]["question"]["question_id"]
+    _, prepared = cli("explanation", "prepare", "--question-id", first_question,
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    draft, evidence, review = _linear_inputs(tmp_path, source_one, prepared["result"]["required_marker"])
+
+    code, cross_question = cli("explanation", "commit", "--question-id", second_question,
+                               "--draft", draft, "--evidence", evidence, "--teaching-review", review,
+                               "--profile", "linear_transform", "--preparation-id", prepared["result"]["preparation_id"],
+                               "--workspace", config, "--json")
+    assert code == 1 and cross_question["validation"]["preparation"] == "failed"
+
+    evidence.write_text(json.dumps([{"source_id": source_two["source_id"], "source_version": source_two["source_version"],
+                                     "locator": {"kind": "heading", "value": "Other"},
+                                     "claim_type": "course_fact", "claim": "out of scope"}]))
+    code, cross_scope = cli("explanation", "commit", "--question-id", first_question,
+                            "--draft", draft, "--evidence", evidence, "--teaching-review", review,
+                            "--profile", "linear_transform", "--preparation-id", prepared["result"]["preparation_id"],
+                            "--workspace", config, "--json")
+    assert code == 1 and cross_scope["validation"]["source_scope"] == "failed"
+
+    cli("learning", "module", "create", "--goal", "并发模块", "--scope", "并发范围",
+        "--source-id", source_one["source_id"], "--source-version", source_one["source_version"],
+        "--workspace", config, "--json")
+    _, correct_evidence, _ = _linear_inputs(tmp_path, source_one, prepared["result"]["required_marker"])
+    code, expired = cli("explanation", "commit", "--question-id", first_question,
+                        "--draft", draft, "--evidence", correct_evidence, "--teaching-review", review,
+                        "--profile", "linear_transform", "--preparation-id", prepared["result"]["preparation_id"],
+                        "--workspace", config, "--json")
+    assert code == 1 and expired["validation"]["preparation"] == "failed"
+
+
+def test_locator_resolves_from_digest_after_results_root_moves(tmp_path: Path) -> None:
+    first_root = tmp_path / "first"; config = write_workspace(first_root)
+    source = register_source(tmp_path, config); _, question_id = create_root(tmp_path, config, source, "为什么？")
+    _, prepared = cli("explanation", "prepare", "--question-id", question_id,
+                      "--profile", "linear_transform", "--workspace", config, "--json")
+    draft, evidence, review = _linear_inputs(tmp_path, source, prepared["result"]["required_marker"])
+    code, _ = cli("explanation", "commit", "--question-id", question_id, "--draft", draft,
+                  "--evidence", evidence, "--teaching-review", review, "--profile", "linear_transform",
+                  "--preparation-id", prepared["result"]["preparation_id"], "--workspace", config, "--json")
+    assert code == 0
+    manifest_text = next((first_root / "results/learning/commits").glob("*.json")).read_text()
+    assert str(first_root) not in manifest_text
+    second_root = tmp_path / "moved"; first_root.rename(second_root); moved_config = second_root / "workspace.toml"
+
+    code, located = cli("learning", "locate", question_id, "--workspace", moved_config, "--json")
+    assert code == 0
+    location = located["result"]["locations"][0]
+    assert location["logical_path"].startswith("learning/objects/")
+    assert Path(location["document_path"]).is_file()
+    assert str(second_root / "results") in location["document_path"]
